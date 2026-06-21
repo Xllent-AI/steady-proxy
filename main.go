@@ -100,6 +100,7 @@ var (
 )
 
 func main() {
+	log.SetFlags(log.LstdFlags) // timestamp every line at second resolution: date + HH:MM:SS
 	cfg = loadConfig()
 	breaker = newCircuitBreaker()
 	ledger = newEpisodeLedger(cfg.episodeWindow)

@@ -135,8 +135,9 @@ The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only add
 extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 
 ```text
-OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
-OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
+2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
+2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
+   (timestamp prefix elided on the lines below for readability)
 RETRY claude-sonnet-4-6/main  truncated_stream (502)  [transient=true episode=1]  0.9s
 RETRY claude-haiku-4-5/main   http_529 (529)  [transient=true episode=2]  0.2s  attempt=1
 FAIL  claude-sonnet-4-6/main  permanent_4xx (400)  [transient=false episode=1]  0.3s
@@ -144,6 +145,9 @@ DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries nati
 BLOCK claude-sonnet-4-6/main  circuit open (12s left) -> auto-retry
 OK    /v1/messages/count_tokens  200  730B  2ms
 ```
+
+Every line is prefixed by the logger with the date and time at second resolution
+(`2026/06/21 16:34:29`).
 
 Reading a line:
 - **First column** = outcome — `OK` served · `RETRY` converted to an automatic

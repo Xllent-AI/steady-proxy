@@ -368,12 +368,14 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 func scrapeUsage(ev event, st *captureStats) {
 	switch ev.name {
 	case "message_start":
+		// input_tokens + the resolved model. NOTE: output_tokens here is a
+		// non-authoritative placeholder (usually 1) — the real count arrives in
+		// message_delta, so we deliberately do NOT read it here.
 		var m struct {
 			Message struct {
 				Model string `json:"model"`
 				Usage struct {
-					Input  int `json:"input_tokens"`
-					Output int `json:"output_tokens"`
+					Input int `json:"input_tokens"`
 				} `json:"usage"`
 			} `json:"message"`
 		}
@@ -383,9 +385,6 @@ func scrapeUsage(ev event, st *captureStats) {
 			}
 			if m.Message.Usage.Input > 0 {
 				st.inTok = m.Message.Usage.Input
-			}
-			if m.Message.Usage.Output > 0 {
-				st.outTok = m.Message.Usage.Output
 			}
 		}
 	case "message_delta":
