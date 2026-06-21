@@ -79,7 +79,7 @@ func loadConfig() config {
 		maxRequestBytes:  envInt64("PROXY_MAX_REQUEST_BYTES", 64<<20),      // 64 MiB request cap
 		respHeaderTO:     envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
 		upstreamByteIdle: envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
-		keepaliveMs:      envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES the client's CLAUDE_CODE_CONNECT_TIMEOUT_MS to exceed it (set ~660000). 0 = pure transactional.
+		keepaliveMs:      envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
 		deadlineMargin:   envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
 		maxRequestDur:    envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
 		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 8)),          // stop converting past this many SDK retries

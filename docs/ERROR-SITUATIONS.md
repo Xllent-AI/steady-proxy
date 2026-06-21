@@ -103,12 +103,16 @@ abort-loop). So the **client** ceiling, not the proxy, caps the transactional
 window — the two must move together.
 
 How the proxy handles it (**tuned default: ~600 s**):
-- It stays fully transactional up to `PROXY_KEEPALIVE_MS` (default **600 000 ms**),
-  paired with **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** on the client (must
-  exceed the keepalive window). Any turn that finishes — *or fails* — within the
-  window is still uncommitted, so a late truncation / `JSON Parse error` converts
-  to a clean automatic retry. **This is the case worth calling out: a 350 s turn
-  that dies at ~340 s is fully recovered.**
+- It stays fully transactional up to `PROXY_KEEPALIVE_MS` (default **600 000 ms**).
+  **Both** client-side abort timers must exceed that window, because the proxy
+  sends no response headers during the hold: set
+  **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** (TTFB ceiling, default ~60 s) **and
+  `API_TIMEOUT_MS=720000`** (hard per-attempt timeout, default 600 000 — equal to
+  the window is a boundary race). Keep `API_FORCE_IDLE_TIMEOUT=0` (ON arms the
+  no-bytes idle watchdog, which would kill the hold). Any turn that finishes — *or
+  fails* — within the window is still uncommitted, so a late truncation /
+  `JSON Parse error` converts to a clean automatic retry. **This is the case worth
+  calling out: a 350 s turn that dies at ~340 s is fully recovered.**
 - Only if a turn *exceeds* the window does the proxy **commit** (`200` + the
   buffered prefix) and stream the rest **live** with `: keepalive` pings, so the
   client survives indefinitely. A drop after commit can't be cleanly converted —
@@ -116,8 +120,10 @@ How the proxy handles it (**tuned default: ~600 s**):
 - A genuinely **silent** upstream gap beyond `PROXY_UPSTREAM_BYTE_IDLE_MS`
   (default **600 000 ms**) is a wedged upstream → abort + convert (uncommitted) or
   end the stream (committed).
-- Want a different ceiling? Move `PROXY_KEEPALIVE_MS` and the client's
-  `CLAUDE_CODE_CONNECT_TIMEOUT_MS` together (keep the client ~10% higher).
+- Want a different ceiling? Move `PROXY_KEEPALIVE_MS` and **both** client timers
+  (`CLAUDE_CODE_CONNECT_TIMEOUT_MS`, `API_TIMEOUT_MS`) together, keeping the client
+  values above the window. (`CLAUDE_API_TIMEOUT` is *not* a real Claude Code var —
+  it is ignored.)
 
 Tested by `TestLongGenerationSlowDrip` (idle-reset), `TestKeepaliveCommitThenLive`
 (commit→live path), and the live `long-gen` (>300 s) scenario.

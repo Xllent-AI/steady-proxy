@@ -30,14 +30,22 @@ Claude Code (+ subagents)  ──HTTP──▶  cc-retry-proxy (loopback)  ─�
   (`CLAUDE_CODE_CONNECT_TIMEOUT_MS`, measured; `API_FORCE_IDLE_TIMEOUT=0` does
   *not* affect this pre-headers wait). To keep the stream **fully transactional**
   (so a late failure is still cleanly retryable) for long turns, this proxy
-  defaults `PROXY_KEEPALIVE_MS` to **600 000** and you raise the client ceiling to
-  match: set **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** (it must exceed the
-  keepalive window). Now a turn that runs for minutes and fails near the end —
-  e.g. a truncated stream / `JSON Parse error` — is still uncommitted, so it
-  converts to an automatic retry. Only if a turn *exceeds* the window does the
+  defaults `PROXY_KEEPALIVE_MS` to **600 000** and you raise the **two client-side
+  abort timers** above it — both matter because the proxy sends *no response
+  headers* during the hold: **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** (the TTFB /
+  no-response-headers ceiling, default ~60 s) **and `API_TIMEOUT_MS=720000`** (the
+  hard per-attempt request timeout, default 600 000 — left at 600 000 it *ties* the
+  window and can abort at the boundary). Keep `API_FORCE_IDLE_TIMEOUT=0` (turning it
+  on arms a no-bytes idle watchdog that would kill the transactional hold; note
+  `CLAUDE_API_TIMEOUT` is not a real Claude Code var and is ignored). Now a turn
+  that runs for minutes and fails near the end — e.g. a truncated stream /
+  `JSON Parse error` — is still uncommitted, so it converts to an automatic retry.
+  Only if a turn *exceeds* the window does the
   proxy **commit** the buffered prefix and switch to **live streaming with
   keepalive pings** (a post-commit drop then falls back to Claude's native
-  dropped-stream retry). Want a different ceiling? Move both numbers together.
+  dropped-stream retry). Want a different ceiling? Move all three together —
+  `PROXY_KEEPALIVE_MS` and the two client timers — keeping the client values above
+  the window.
 
 The full situation catalog — derived from real session transcripts — and how each
 is handled is in [docs/ERROR-SITUATIONS.md](docs/ERROR-SITUATIONS.md).
@@ -107,11 +115,13 @@ headers unchanged):
 "env": {
   "ANTHROPIC_BASE_URL": "http://127.0.0.1:8789",   // was: your real gateway URL
   "ANTHROPIC_AUTH_TOKEN": "…unchanged…",
-  // keep your timeouts; they still govern the client↔proxy hop:
-  "API_FORCE_IDLE_TIMEOUT": "0",
-  "API_TIMEOUT_MS": "600000",
-  // REQUIRED for the 600s transactional window — must exceed PROXY_KEEPALIVE_MS:
-  "CLAUDE_CODE_CONNECT_TIMEOUT_MS": "660000"
+  // Every client-side abort timer must EXCEED PROXY_KEEPALIVE_MS (600000): the
+  // proxy sends no response headers during the transactional hold, so a timer
+  // <= the window aborts the turn mid-hold.
+  "CLAUDE_CODE_CONNECT_TIMEOUT_MS": "660000", // TTFB / "no response headers" ceiling (default ~60s)
+  "API_TIMEOUT_MS": "720000",                 // hard per-attempt request timeout (default 600000)
+  "API_FORCE_IDLE_TIMEOUT": "0"               // keep OFF; ON arms a no-bytes idle watchdog that kills the hold
+  // (CLAUDE_API_TIMEOUT is NOT read by Claude Code — don't bother setting it.)
 }
 // and run the proxy with PROXY_UPSTREAM_URL set to your real gateway (via .env)
 ```
