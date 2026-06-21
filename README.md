@@ -200,8 +200,8 @@ stream, or a permanent 4xx. Set `PROXY_REQUEST_LOG_DIR` to a directory and the
 proxy writes **one human-readable file per request** into it:
 
 ```
-PROXY_REQUEST_LOG_DIR=./requests PROXY_UPSTREAM_URL=… ./cc-retry-proxy
-# ./requests/v1-messages-20260621t143005-000001.log
+PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./cc-retry-proxy
+# ./logs/v1-messages-20260621t143005-000001.log
 ```
 
 Each file has a `=== REQUEST ===` section (method, path, headers, body) and a
@@ -214,7 +214,7 @@ captured SSE events — or the body for non-streaming routes). Notes:
   huge stream can't exhaust RAM or disk; truncation is marked inline.
 - **Prompts are written verbatim.** The request body (your conversation) lands on
   disk unencrypted — point the dir at a tmpfs or a path you control, and keep it out
-  of version control (`.gitignore` already excludes `/requests/`).
+  of version control (`.gitignore` already excludes `/logs/`).
 - For failures *before* the stream starts (e.g. a pre-stream HTTP error), the file
   records the request and the outcome/code; the upstream error body itself is not
   separately captured.

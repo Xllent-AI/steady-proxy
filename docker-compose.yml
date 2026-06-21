@@ -9,13 +9,21 @@ services:
   proxy:
     build: .
     image: cc-retry-proxy:latest
+    # Run as the host user so PROXY_REQUEST_LOG_DIR dumps are owned by you, not
+    # root (readable without sudo). Falls back to 1000:1000; override by exporting
+    # UID/GID or setting them in .env if your host user differs.
+    user: "${UID:-1000}:${GID:-1000}"
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"
       PROXY_UPSTREAM_URL: "${PROXY_UPSTREAM_URL:-https://your-gateway.example.com}"
       PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-8}"
       PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
       PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
+      PROXY_REQUEST_LOG_DIR: "${PROXY_REQUEST_LOG_DIR:-}"
+      PROXY_REQUEST_LOG_MAX_BYTES: "${PROXY_REQUEST_LOG_MAX_BYTES:-10485760}"
       PROXY_VERBOSE: "${PROXY_VERBOSE:-1}"
+    volumes:
+      - ./logs:/logs
     ports:
       - "127.0.0.1:8789:8789" # loopback only — never expose publicly
     restart: unless-stopped

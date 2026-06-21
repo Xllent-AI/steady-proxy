@@ -3,7 +3,11 @@
 *.test
 # logs from the live harness
 test/*.log
-# saved request/response dumps (PROXY_REQUEST_LOG_DIR) — may contain prompts
-/requests/
+# saved request/response dumps (PROXY_REQUEST_LOG_DIR) — may contain prompts.
+# Keep the dir itself (tracked .gitkeep) so a fresh `docker compose up` finds it
+# pre-created and host-user-owned, instead of Docker making it root-owned (which
+# the non-root container then can't write to). Ignore the dumps themselves.
+/logs/*
+!/logs/.gitkeep
 # local env with the real gateway URL — never commit
 .env
