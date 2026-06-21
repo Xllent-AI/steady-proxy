@@ -129,12 +129,36 @@ headers unchanged):
 If Claude Code refuses a plain `http://` base URL, serve the proxy over TLS with a
 local cert and set `NODE_EXTRA_CA_CERTS` — but loopback `http` is normally fine.
 
-## Verify
+## Verify — reading the log
 
-Watch the log (`PROXY_VERBOSE=1`, on by default in compose): each healed failure
-prints a `[fail] … -> x-should-retry=true` line. Successful replies carry
-`X-CC-Retry-Proxy-Mode` (`buffered` or `live`); synthesized errors carry
-`X-CC-Retry-Proxy-Reason`.
+The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only adds
+extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
+
+```text
+OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
+OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
+RETRY claude-sonnet-4-6/main  truncated_stream (502)  [transient=true episode=1]  0.9s
+RETRY claude-haiku-4-5/main   http_529 (529)  [transient=true episode=2]  0.2s  attempt=1
+FAIL  claude-sonnet-4-6/main  permanent_4xx (400)  [transient=false episode=1]  0.3s
+DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
+BLOCK claude-sonnet-4-6/main  circuit open (12s left) -> auto-retry
+OK    /v1/messages/count_tokens  200  730B  2ms
+```
+
+Reading a line:
+- **First column** = outcome — `OK` served · `RETRY` converted to an automatic
+  retry (`x-should-retry: true`, the SDK re-sends) · `FAIL` surfaced to you
+  (permanent, or retry budget spent) · `DROP` failed *after* committing a long
+  turn, so Claude's native dropped-stream retry takes over · `BLOCK` circuit
+  breaker is open.
+- **`model/agent`** — the model called, and whether the caller is the `main` agent
+  or a spawned `sub`agent.
+- Then only what varies: **`in=/out=` tokens**, **stop reason**, **`buffered`/`live`**
+  capture mode, and **duration**. Failures add the upstream **code (status)** plus a
+  `[transient=… episode=…]` diagnostic; **`attempt=N`** shows only after a retry.
+
+Responses also carry headers: `X-CC-Retry-Proxy-Mode` (`buffered`/`live`) on
+success, `X-CC-Retry-Proxy-Reason` on a synthesized error.
 
 Live smoke test (sends one real request through the proxy to your gateway):
 

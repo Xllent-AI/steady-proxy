@@ -35,6 +35,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -131,12 +132,13 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy listening on http://%s -> %s (transactional, sdkRetryCap=%d)",
-		cfg.listenAddr, cfg.upstream, cfg.sdkRetryCap)
+	log.Printf("cc-retry-proxy listening on http://%s -> %s  (transactional, keepalive=%s, sdkRetryCap=%d; one log line per request)",
+		cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.sdkRetryCap)
 	log.Fatal(srv.ListenAndServe())
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
+	reqStart := time.Now()
 	// Only POST /v1/messages gets the full transactional treatment. Everything
 	// else (e.g. /v1/messages/count_tokens, model listing) is forwarded with a
 	// single attempt; transport errors there are still converted to retryable.
@@ -166,7 +168,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	if remaining, open := breaker.isOpen(route); open {
 		n := ledger.bump(key, "circuit_open")
 		canRetry := budgetLeft() && n.convertedCount <= cfg.sdkRetryCap
-		log.Printf("[breaker-open] route=%s remaining=%s canRetry=%v", route, remaining, canRetry)
+		decision := "surfaced"
+		if canRetry {
+			decision = "auto-retry"
+		}
+		log.Printf("BLOCK %s  circuit open (%s left) -> %s%s",
+			who(r, body), remaining.Round(time.Second), decision, att(retryCount))
 		writeAnthropicError(w, canRetry, http.StatusServiceUnavailable, "overloaded_error",
 			"cc-retry-proxy: upstream circuit open", int(remaining.Seconds())+1, "circuit_open")
 		return
@@ -210,18 +217,22 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 		// CAPTURE: buffer+validate (transactional), or commit+stream live past the
 		// keepalive grace. captureSSE writes the downstream response itself.
-		wrote, fail := captureSSE(ctx, cancel, w, resp.Header, resp.Body)
+		var st captureStats
+		wrote, fail := captureSSE(ctx, cancel, w, resp.Header, resp.Body, &st)
 		resp.Body.Close()
 		if fail == nil {
 			breaker.recordSuccess(route)
 			ledger.clear(key)
+			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s",
+				who(r, body), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount))
 			return
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
 			if fail.transient {
 				breaker.recordFailure(route)
 			}
-			log.Printf("[committed-fail] route=%s code=%s (already streaming, no retry signal possible)", route, fail.code)
+			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s",
+				who(r, body), fail.code, htok(st.outTok), since(reqStart), att(retryCount))
 			return
 		}
 		last = *fail
@@ -235,8 +246,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	n := ledger.bump(key, last.code)
 	canRetry := last.transient && budgetLeft() &&
 		n.convertedCount <= cfg.sdkRetryCap && n.sameFaultCount <= 3
-	log.Printf("[fail] route=%s code=%s status=%d transient=%v sdkRetry=%d episodeN=%d -> x-should-retry=%v",
-		route, last.code, last.status, last.transient, retryCount, n.convertedCount, canRetry)
+	tag := "RETRY" // converted to x-should-retry=true; the SDK will re-send
+	if !canRetry {
+		tag = "FAIL" // surfaced to the user (permanent, or retry budget exhausted)
+	}
+	log.Printf("%-5s %s  %s (%d)  [transient=%v episode=%d]  %s%s",
+		tag, who(r, body), last.code, statusFor(last), last.transient, n.convertedCount, since(reqStart), att(retryCount))
 	writeAnthropicError(w, canRetry, statusFor(last), last.atype, msgFor(last), last.retryAfter, last.code)
 }
 
@@ -253,11 +268,13 @@ func readBody(r *http.Request) (body []byte, tooBig bool, err error) {
 
 // proxyOnce is a plain single-shot reverse proxy for non-transactional routes.
 func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte) {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
 	defer cancel()
 	resp, _, err := roundTrip(ctx, r, body)
 	if err != nil {
 		f := classifyTransport(err, ctx)
+		log.Printf("FAIL  %s  %d (%s)  %s", r.URL.Path, statusFor(f), f.code, since(start))
 		writeAnthropicError(w, f.transient, statusFor(f), f.atype, msgFor(f), 0, f.code)
 		return
 	}
@@ -266,7 +283,8 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	n, _ := io.Copy(w, resp.Body)
+	log.Printf("OK    %s  %d  %s  %s", r.URL.Path, resp.StatusCode, hbytes(n), since(start))
 }
 
 // roundTrip issues one upstream request from the exact buffered body.
@@ -380,6 +398,71 @@ func deriveDuration(stainlessTimeout string) time.Duration {
 }
 
 func isEventStream(ct string) bool { return strings.Contains(strings.ToLower(ct), "text/event-stream") }
+
+// ---------------------------------------------------- friendly access log ---
+// One line per request, optimized for a live `docker logs -f` viewer: a 5-char
+// outcome tag, then who it's for (model/agent), then only the fields that vary.
+// The method/path/gateway are static for the transactional route, so omitted.
+
+func who(r *http.Request, body []byte) string {
+	return modelOf(body) + "/" + agentKind(r)
+}
+
+// att renders the SDK attempt number only when it's non-zero (i.e. a retry), so
+// the happy path stays uncluttered.
+func att(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("  attempt=%d", n)
+}
+
+func modelOf(body []byte) string {
+	var b struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &b)
+	if b.Model == "" {
+		return "?"
+	}
+	return b.Model
+}
+
+// agentKind reports "sub" when the request carries a parent-agent header (i.e. it
+// came from a spawned subagent) and "main" otherwise.
+func agentKind(r *http.Request) string {
+	if r.Header.Get("X-Claude-Code-Parent-Agent-Id") != "" {
+		return "sub"
+	}
+	return "main"
+}
+
+func htok(n int) string {
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return strconv.Itoa(n)
+}
+
+func hbytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+func since(t time.Time) string { return time.Since(t).Round(time.Millisecond).String() }
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
 
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {

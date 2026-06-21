@@ -105,7 +105,7 @@ func TestLongGenerationSlowDrip(t *testing.T) {
 	defer cancel()
 	rec := httptest.NewRecorder()
 	r := &gapReader{ctx: ctx, chunks: eventsOf(goodStream), gap: 50 * time.Millisecond}
-	_, f := captureSSE(ctx, cancel, rec, http.Header{}, r)
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, r, nil)
 	if f != nil {
 		t.Fatalf("slow-drip should complete, got failure %+v", *f)
 	}
@@ -122,7 +122,7 @@ func TestKeepaliveCommitThenLive(t *testing.T) {
 	defer cancel()
 	rec := httptest.NewRecorder()
 	r := &gapReader{ctx: ctx, chunks: eventsOf(goodStream), gap: 120 * time.Millisecond}
-	wrote, f := captureSSE(ctx, cancel, rec, http.Header{}, r)
+	wrote, f := captureSSE(ctx, cancel, rec, http.Header{}, r, nil)
 	if f != nil || !wrote {
 		t.Fatalf("want committed live success, got wrote=%v fail=%+v", wrote, f)
 	}
@@ -150,7 +150,7 @@ func TestSilentGapAborts(t *testing.T) {
 		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 	}, gap: 600 * time.Millisecond}
-	_, f := captureSSE(ctx, cancel, rec, http.Header{}, r)
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, r, nil)
 	if f == nil || !f.transient || f.code != "upstream_idle" {
 		t.Fatalf("want transient upstream_idle, got %+v", f)
 	}

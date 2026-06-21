@@ -186,6 +186,17 @@ func (v *streamValidator) accept(ev event) {
 
 func (v *streamValidator) terminal() bool { return v.sawStart && v.sawStop && v.open == 0 && !v.invalid }
 
+// captureStats collects human-friendly facts about a streamed response so the
+// caller can log one access-log line per request. All fields are best-effort.
+type captureStats struct {
+	mode   string // "buffered" | "live" | "" (never committed any bytes)
+	bytes  int64  // SSE bytes of the response
+	inTok  int    // usage.input_tokens (from message_start)
+	outTok int    // usage.output_tokens (from message_delta)
+	stop   string // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
+	model  string // resolved model echoed back by the upstream
+}
+
 // ------------------------------------------------------------- captureSSE ---
 // captureSSE consumes the upstream SSE stream and writes the downstream
 // response itself. It stays TRANSACTIONAL (buffers, validates, then replays on a
@@ -197,7 +208,7 @@ func (v *streamValidator) terminal() bool { return v.sawStart && v.sawStop && v.
 //   - wrote=true,  fail=nil   -> a full, valid response was sent (buffered or live)
 //   - wrote=true,  fail!=nil  -> failed AFTER committing; can't convert, caller logs
 //   - wrote=false, fail!=nil  -> failed BEFORE committing; caller converts to a retry
-func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader) (bool, *failure) {
+func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats) (bool, *failure) {
 	sp := newSpool()
 	parser := &sseParser{}
 	val := &streamValidator{}
@@ -218,6 +229,9 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("X-CC-Retry-Proxy-Mode", mode)
+		if st != nil {
+			st.mode = mode
+		}
 		w.WriteHeader(http.StatusOK)
 		headerWritten = true
 	}
@@ -260,7 +274,7 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 		case r := <-ch:
 			if len(r.data) > 0 {
 				idleTimer.Reset(cfg.upstreamByteIdle)
-				wrote, fail, ret := process(r.data, sp, parser, val, w, &committed, writeHead, flush)
+				wrote, fail, ret := process(r.data, sp, parser, val, w, &committed, writeHead, flush, st)
 				if ret {
 					return wrote, fail
 				}
@@ -304,8 +318,12 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 
 // process handles one chunk. ret=true means captureSSE should return (wrote,fail).
 func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w http.ResponseWriter,
-	committed *bool, writeHead func(string), flush func()) (bool, *failure, bool) {
+	committed *bool, writeHead func(string), flush func(), st *captureStats) (bool, *failure, bool) {
 	for _, ev := range parser.feed(data) {
+		if st != nil {
+			st.bytes += int64(len(ev.raw))
+			scrapeUsage(ev, st)
+		}
 		if *committed {
 			w.Write(ev.raw)
 			flush()
@@ -342,6 +360,52 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 		}
 	}
 	return false, nil, false
+}
+
+// scrapeUsage pulls the friendly numbers out of the two events that carry them.
+// Best-effort: any parse failure is silently ignored (logging must never break a
+// stream). Data here is already JSON-validated on the uncommitted path.
+func scrapeUsage(ev event, st *captureStats) {
+	switch ev.name {
+	case "message_start":
+		var m struct {
+			Message struct {
+				Model string `json:"model"`
+				Usage struct {
+					Input  int `json:"input_tokens"`
+					Output int `json:"output_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+		}
+		if json.Unmarshal([]byte(ev.data), &m) == nil {
+			if m.Message.Model != "" {
+				st.model = m.Message.Model
+			}
+			if m.Message.Usage.Input > 0 {
+				st.inTok = m.Message.Usage.Input
+			}
+			if m.Message.Usage.Output > 0 {
+				st.outTok = m.Message.Usage.Output
+			}
+		}
+	case "message_delta":
+		var d struct {
+			Usage struct {
+				Output int `json:"output_tokens"`
+			} `json:"usage"`
+			Delta struct {
+				Stop string `json:"stop_reason"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal([]byte(ev.data), &d) == nil {
+			if d.Usage.Output > 0 {
+				st.outTok = d.Usage.Output
+			}
+			if d.Delta.Stop != "" {
+				st.stop = d.Delta.Stop
+			}
+		}
+	}
 }
 
 func onReadErr(err error, ctx context.Context, committed bool, flush func()) (bool, *failure) {

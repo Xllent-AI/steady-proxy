@@ -36,7 +36,7 @@ func capture(t *testing.T, s string) (*httptest.ResponseRecorder, *failure) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rec := httptest.NewRecorder()
-	_, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(s))
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(s), nil)
 	return rec, f
 }
 
@@ -58,12 +58,57 @@ func TestCaptureSuccessChunked(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rec := httptest.NewRecorder()
-	_, f := captureSSE(ctx, cancel, rec, http.Header{}, iotest1byte(goodStream))
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, iotest1byte(goodStream), nil)
 	if f != nil {
 		t.Fatalf("expected success on byte-chunked stream, got %+v", *f)
 	}
 	if !strings.Contains(rec.Body.String(), "message_stop") {
 		t.Fatalf("missing terminal event in replay")
+	}
+}
+
+// TestCaptureStats covers the model/token/stop scraping that feeds the access log.
+func TestCaptureStats(t *testing.T) {
+	const stream = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":1234,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	var st captureStats
+	if _, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(stream), &st); f != nil {
+		t.Fatalf("expected success, got %+v", *f)
+	}
+	if st.model != "claude-sonnet-4-6" {
+		t.Errorf("model = %q, want claude-sonnet-4-6", st.model)
+	}
+	if st.inTok != 1234 || st.outTok != 42 {
+		t.Errorf("tokens in/out = %d/%d, want 1234/42", st.inTok, st.outTok)
+	}
+	if st.stop != "end_turn" {
+		t.Errorf("stop = %q, want end_turn", st.stop)
+	}
+	if st.mode != "buffered" {
+		t.Errorf("mode = %q, want buffered", st.mode)
+	}
+	if st.bytes == 0 {
+		t.Errorf("bytes = 0, want >0")
 	}
 }
 
