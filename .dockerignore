@@ -1,6 +1,19 @@
-cc-retry-proxy
-*.test
-.git
-docs
-*.md
-test/*.log
+# Deny everything by default; the image build only needs the Go sources.
+# This keeps secrets (.env), per-request dumps and the 700 MB+ harness output
+# (logs/), compiled binaries, tests, and docs out of the build context — and
+# guards against future files accidentally leaking into the image.
+*
+
+# Allow only what's required to compile the two binaries: the root Go sources
+# and the single testupstream source. Re-include the directory so Docker
+# descends into it, then re-exclude its contents and allow only main.go — so a
+# future file dropped under testupstream/ can't silently enter the context.
+!go.mod
+!*.go
+!testupstream/
+testupstream/*
+!testupstream/main.go
+
+# ...but still drop test sources that slipped through the *.go allow above
+# (go build ignores them anyway; no reason to send them to the daemon).
+*_test.go
