@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand"
 	"net/http"
 	"strings"
 )
@@ -35,28 +36,38 @@ func msgFor(f failure) string {
 	return "cc-retry-proxy: " + f.message
 }
 
-// Substrings that mark an error as PERMANENT (never auto-retry — would loop).
-// Derived from real Claude Code session transcripts; see docs/ERROR-SITUATIONS.md.
-var permanentSigs = []string{
+// Substrings that mark an error as REQUEST-SHAPE: the request itself can never
+// succeed as written, so retrying it would loop forever. These are the ONLY
+// errors we surface immediately — everything else is retried (see the design
+// principle in main.go). Derived from real Claude Code transcripts; see
+// docs/ERROR-SITUATIONS.md.
+//
+// Deliberately excluded (so they ARE retried): auth, billing, policy, rate
+// limits, capacity, and unknown errors — a temporary block or outage should be
+// ridden out, not surfaced. The upstream gateway owns retry intelligence; this
+// proxy only keeps the client alive.
+//
+// Each entry must be specific enough that it cannot match a transient/auth/policy
+// message — there is no transient fallback anymore, so a false positive here
+// surfaces something that should have been retried. (E.g. a bare "is required"
+// would match "authentication is required"; "too long" would match "took too
+// long".) Prefer anchored phrases over generic fragments.
+var requestShapeSigs = []string{
 	// request too large / context
-	"context_length", "maximum context", "prompt is too long", "too long",
+	"context_length", "context length", "maximum context", "prompt is too long",
 	// malformed conversation / tool blocks
-	"invalid_request_error", "tool_use", "tool_result", "tool use concurrency",
+	"tool_use", "tool_result", "tool use concurrency",
 	"missing tool result", "duplicate tool_use", "unexpected tool_use_id",
 	"thinking blocks", "thinking.budget_tokens", "max_tokens must be",
-	// schema / header mismatches (often shim translation bugs — deterministic)
-	"extra inputs are not permitted", "not permitted", "unexpected value",
+	// schema / header mismatches (often shim translation bugs — deterministic).
+	// Note: no bare "must be"/"unsupported"/"is required" — those match transient
+	// or auth messages ("token must be provided", "unsupported region") that the
+	// policy wants to retry. model_not_found stays a code match only: a plain
+	// "model not found" on a routing gateway often means "no provider has it now"
+	// (transient), so we don't surface that.
+	"extra inputs are not permitted", "unexpected value",
 	"anthropic-beta", "context_management", "input_examples", "image dimensions",
-	"must be", "is required", "unsupported", "model_not_found",
-	// auth / billing / policy
-	"invalid api key", "authentication", "permission", "organization has been disabled",
-	"billing", "usage credits", "usage policy", "usage limit",
-}
-
-// Substrings that suggest a 4xx is actually a transient downstream hiccup.
-var transientSigs = []string{
-	"upstream", "gateway", "timeout", "timed out", "temporar",
-	"unavailable", "overload", "capacity", "connection reset", "connection error",
+	"model_not_found",
 }
 
 func anyContains(s string, subs []string) bool {
@@ -123,14 +134,15 @@ func classifyHTTPError(resp *http.Response) failure {
 	case st >= 500:
 		return failure{transient: true, fastRetry: st == 502 || st == 503, status: st, atype: typeFor5xx(st), code: "http_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
 	default: // 4xx other than 408/409/429
-		if anyContains(body, permanentSigs) {
-			return failure{transient: false, status: st, atype: atype, code: "permanent_4xx", message: ae.Error.Message}
+		// Surface ONLY a deterministic request-shape error (it can never succeed,
+		// so retrying would loop). Everything else — auth, billing, policy,
+		// unknown — is treated as a transient hiccup and retried: a temporary
+		// block should be ridden out, not surfaced. Normalize to 502 so the SDK
+		// always honors the retry (it may refuse to retry some 4xx by status).
+		if anyContains(body, requestShapeSigs) {
+			return failure{transient: false, status: st, atype: atype, code: "request_shape", message: ae.Error.Message}
 		}
-		if anyContains(body, transientSigs) {
-			return failure{transient: true, status: 502, atype: "api_error", code: "transient_4xx", message: ae.Error.Message, retryAfter: ra}
-		}
-		// Unknown 4xx: do not guess — surface it.
-		return failure{transient: false, status: st, atype: atype, code: "unknown_4xx", message: ae.Error.Message}
+		return failure{transient: true, status: 502, atype: "api_error", code: "retryable_4xx", message: ae.Error.Message, retryAfter: ra}
 	}
 }
 
@@ -147,9 +159,29 @@ func classifySSEError(data string) *failure {
 		return &failure{transient: true, status: 429, atype: "rate_limit_error", code: "sse_rate_limit", message: e.Error.Message}
 	case "api_error", "timeout_error", "":
 		return &failure{transient: true, status: 502, atype: "api_error", code: "sse_api_error", message: e.Error.Message}
-	default: // invalid_request_error, authentication_error, permission_error, not_found_error, ...
-		return &failure{transient: false, status: 400, atype: e.Error.Type, code: "sse_permanent", message: e.Error.Message}
+	case "invalid_request_error": // request-shape: can never succeed, surface it
+		return &failure{transient: false, status: 400, atype: e.Error.Type, code: "sse_request_shape", message: e.Error.Message}
+	default: // authentication_error, permission_error, not_found_error, unknown -> retry
+		return &failure{transient: true, status: 502, atype: "api_error", code: "sse_retryable", message: e.Error.Message}
 	}
+}
+
+// retryAfterFor computes a backoff (in seconds) for the Nth client retry when
+// the upstream did not supply its own Retry-After. Exponential from 1s, doubling
+// each attempt, capped at 30s, with light jitter so a wave of subagents doesn't
+// re-send in lockstep. Always >= 1 so the client actually waits before retrying.
+func retryAfterFor(retryCount int) int {
+	if retryCount < 0 {
+		retryCount = 0
+	}
+	secs := 1
+	for i := 0; i < retryCount && secs < 30; i++ {
+		secs *= 2
+	}
+	if secs > 30 {
+		secs = 30
+	}
+	return secs + rand.Intn(2) // +0..1s jitter
 }
 
 func mapTransientStatus(st int) int {

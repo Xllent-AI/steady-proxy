@@ -5,10 +5,19 @@ machine (1916 sessions under `~/.claude/projects`). Each row lists how the error
 surfaces, its root cause, whether a blind retry can fix it, and what
 `cc-retry-proxy` does. The Go tests in `*_test.go` target every row.
 
+**Design principle (blind stabilizer):** the upstream gateway owns retry
+intelligence; this proxy only keeps the client alive. The policy is one rule —
+*retry every failure (with a `Retry-After` backoff) except a deterministic
+**request-shape** error that can never succeed as written.* So auth, billing,
+policy, rate limits, capacity, and unknown `4xx` are all **retried**, not
+surfaced (see the principle in `main.go`).
+
 Legend for "Proxy action":
-- **convert** → stamp `x-should-retry: true` so Claude Code's SDK re-sends.
+- **convert** → stamp `x-should-retry: true` (+ `Retry-After` backoff) so Claude
+  Code's SDK re-sends.
 - **pass-retryable** → upstream is already a retryable status; forward + stamp.
-- **pass-permanent** → forward unchanged with `x-should-retry: false` (surfaces).
+- **surface** → forward with `x-should-retry: false` (request-shape only — it can
+  never succeed, so we don't loop).
 
 ## 1. Truncation / dropped stream  → convert (the primary target)
 
@@ -44,7 +53,7 @@ JSON of every data event (toggle: `PROXY_VALIDATE_JSON=0` to disable).
 ## 3. Transient server errors  → pass-retryable / convert
 
 Already-retryable upstream conditions. The proxy forwards them and (re)stamps
-`x-should-retry` so they keep retrying until the budget/breaker stops them.
+`x-should-retry` so they keep retrying until the client's retry budget is spent.
 
 | Real message | Status | Proxy action |
 |---|---|---|
@@ -52,35 +61,51 @@ Already-retryable upstream conditions. The proxy forwards them and (re)stamps
 | `API Error: N Internal server error` | 500 | **pass-retryable** |
 | `API Error: Server is temporarily limiting requests … Rate limited` | 429 | **pass-retryable**, preserve `Retry-After` |
 | `API Error: Request rejected (N) · temporary capacity issue` | 5xx | **pass-retryable** |
+| `cc-retry-proxy: No available providers` and similar capacity 5xx | 5xx | **pass-retryable** (the case this rewrite targets) |
 | mid-stream `event: error` with `overloaded_error` / `rate_limit_error` | after 200 | **convert** (mapped to pre-stream 529/429) |
 
-## 4. Permanent / client errors  → pass-permanent (never loop)
+## 4. Request-shape errors  → surface (the ONLY things we don't retry)
 
-Deterministically broken requests; retrying the identical request cannot help.
-The proxy sets `x-should-retry: false` (explicit — this also stops the SDK's
-default 5xx retry behavior) and surfaces the real error.
+The request itself can never succeed as written, so retrying the identical
+request would loop forever. These are matched by `requestShapeSigs` in
+`classify.go`; the proxy sets `x-should-retry: false` and surfaces the real error.
 
 | Real message | Class | Proxy action |
 |---|---|---|
-| `API Error: N Invalid API key` | 401 auth | **pass-permanent** |
-| `… authentication_error` / `This organization has been disabled.` | 401/403 | **pass-permanent** |
-| `API Error: Missing Tool Result Block` | malformed conversation | **pass-permanent** |
-| `… duplicate tool_use ID in conversation history` | malformed conversation | **pass-permanent** |
-| `… unexpected tool_use_id found in tool_result blocks` | malformed conversation | **pass-permanent** |
-| `… N due to tool use concurrency issues. Run /rewind …` | conversation state | **pass-permanent** |
-| `… Extra inputs are not permitted … context_management` / `input_examples` | schema mismatch (shim) | **pass-permanent** |
-| `… Unexpected value(s) for the anthropic-beta header` | header/beta mismatch | **pass-permanent** |
-| `… max_tokens must be greater than thinking.budget_tokens` | invalid request | **pass-permanent** |
-| `… thinking blocks … cannot be modified` | invalid request | **pass-permanent** |
-| `… image dimensions exceed max allowed size` | invalid request | **pass-permanent** |
-| `… prompt is too long` / context length exceeded | too large | **pass-permanent** |
-| `API Error: Usage credits required for 1M context` | billing | **pass-permanent** |
-| `… violate our Usage Policy` | content policy | **pass-permanent** |
+| `API Error: Missing Tool Result Block` | malformed conversation | **surface** |
+| `… duplicate tool_use ID in conversation history` | malformed conversation | **surface** |
+| `… unexpected tool_use_id found in tool_result blocks` | malformed conversation | **surface** |
+| `… N due to tool use concurrency issues. Run /rewind …` | conversation state | **surface** |
+| `… Extra inputs are not permitted … context_management` / `input_examples` | schema mismatch (shim) | **surface** |
+| `… Unexpected value(s) for the anthropic-beta header` | header/beta mismatch | **surface** |
+| `… max_tokens must be greater than thinking.budget_tokens` | invalid request | **surface** |
+| `… thinking blocks … cannot be modified` | invalid request | **surface** |
+| `… image dimensions exceed max allowed size` | invalid request | **surface** |
+| `… prompt is too long` / context length exceeded | too large | **surface** |
 
-A `400/422/4xx` with **no** permanent signature and **no** transient signature
-defaults to **pass-permanent** ("don't guess"). If the in-house shim emits
-`x-gateway-retryable: true|false`, that authoritative header overrides all
-heuristics.
+Any other `4xx` — including a bare `invalid_request_error` with no recognized
+request-shape signature — **defaults to retry** (normalized to `502` +
+`x-should-retry: true`), because "retry might work" and the upstream owns the
+real verdict. An explicit `x-gateway-retryable: true|false` (or `x-should-retry`)
+from the shim still overrides everything.
+
+## 4b. Auth / billing / policy  → retry (was permanent, now ridden out)
+
+These used to surface immediately. Under the blind-stabilizer policy they are
+**retried** instead, because they are often *temporary* (a transient auth block,
+a brief org disable, a rate/usage limit that resets). The trade-off: a genuinely
+bad key or exhausted balance surfaces **late**, only after the retry budget is
+spent.
+
+| Real message | Class | Proxy action |
+|---|---|---|
+| `API Error: N Invalid API key` | 401 auth | **retry** |
+| `… authentication_error` / `This organization has been disabled.` | 401/403 | **retry** |
+| `API Error: Usage credits required for 1M context` | billing | **retry** |
+| `… violate our Usage Policy` | content policy | **retry** |
+
+If you'd rather these fail fast, add their signatures back to `requestShapeSigs`
+in `classify.go`.
 
 ## 5. Normal situations  → pass through untouched
 

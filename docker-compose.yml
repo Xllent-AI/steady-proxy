@@ -16,7 +16,7 @@ services:
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"
       PROXY_UPSTREAM_URL: "${PROXY_UPSTREAM_URL:-https://your-gateway.example.com}"
-      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-8}"
+      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-100}" # backstop only; client maxRetries is the real ceiling
       PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
       PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
       PROXY_REQUEST_LOG_DIR: "${PROXY_REQUEST_LOG_DIR:-}"

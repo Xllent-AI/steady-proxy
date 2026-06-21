@@ -8,23 +8,45 @@ no terminal automation, and subagents are covered automatically.
 Claude Code (+ subagents)  ──HTTP──▶  cc-retry-proxy (loopback)  ──HTTPS──▶  your gateway
 ```
 
+## Design principle: a blind stabilizer
+
+This proxy is **not** a smart retry brain — your gateway already owns retry
+intelligence (routing, provider selection, backoff). The proxy's only job is to
+keep the client alive through outages, so the whole policy is one rule:
+
+> **Buffer the full response. On *any* failure, tell the client to wait and retry.
+> Only give up on a request that can never succeed as written.**
+
+"Can never succeed" = a deterministic **request-shape** error: context too long,
+malformed tool blocks, schema/validation, model-not-found. *Everything else is
+retried on purpose* — network outages, `5xx`, rate limits, capacity ("no
+available providers"), auth blocks, billing, and unknown `4xx`. A temporary block
+is ridden out, not surfaced.
+
+> Trade-off: a genuinely bad API key / exhausted billing now surfaces **late**
+> (after the retry budget) instead of failing fast. That's the accepted cost of
+> maximum steadiness. The effective retry ceiling is your **client's**
+> `maxRetries` (e.g. `API_MAX_RETRIES=30`); `PROXY_SDK_RETRY_CAP` is only a
+> backstop.
+
 ## What it does
 
 - For `POST /v1/messages` it runs in **transactional mode**: it buffers and
   validates the *entire* Anthropic SSE stream and only writes `200 OK` +
   replays it once a complete, valid `message_stop` is captured.
 - Any failure **before** that commit point — connection error, 5xx, a stalled or
-  truncated stream, a mid-stream `error` event — is converted into a *retryable*
-  response by stamping **`x-should-retry: true`** (the Anthropic SDK then
-  transparently re-sends, using Claude Code's own retry loop). Pre-stream `5xx`/
-  `429` are passed through (already retryable); `4xx` translation hiccups are
-  normalized to `502` + `x-should-retry: true`.
-- **Permanent** errors (bad request, context-length, missing `tool_result`,
-  auth) pass through unchanged with **`x-should-retry: false`** so they surface
-  instead of looping forever.
-- A **retry budget** (driven by the SDK's own `X-Stainless-Retry-Count`, capped
-  at `PROXY_SDK_RETRY_CAP`) and a per-route **circuit breaker** bound cost during
-  a real outage.
+  truncated stream, a mid-stream `error` event, any retryable status — is
+  converted into a *retryable* response by stamping **`x-should-retry: true`**
+  plus a **`Retry-After` backoff** (exponential, capped ~30 s; the SDK waits then
+  re-sends using Claude Code's own retry loop). Retryable `4xx` are normalized to
+  `502` so the SDK always honors the retry.
+- **Request-shape** errors pass through with **`x-should-retry: false`** so they
+  surface instead of looping forever.
+- The **retry budget** is driven by the SDK's own `X-Stainless-Retry-Count`; the
+  client's `maxRetries` is the real ceiling and `PROXY_SDK_RETRY_CAP` is a
+  backstop (`0` disables conversion entirely). There is **no circuit breaker** —
+  a blind stabilizer never blocks the client; the `Retry-After` backoff is what
+  prevents a tight hammer loop.
 - **Long generations (tuned for turns up to ~600 s):** Claude aborts any request
   that reaches its response-header ceiling with no bytes — **default 60 s**
   (`CLAUDE_CODE_CONNECT_TIMEOUT_MS`, measured; `API_FORCE_IDLE_TIMEOUT=0` does
@@ -138,11 +160,10 @@ extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
    (timestamp prefix elided on the lines below for readability)
-RETRY claude-sonnet-4-6/main  truncated_stream (502)  [transient=true episode=1]  0.9s
-RETRY claude-haiku-4-5/main   http_529 (529)  [transient=true episode=2]  0.2s  attempt=1
-FAIL  claude-sonnet-4-6/main  permanent_4xx (400)  [transient=false episode=1]  0.3s
+RETRY claude-sonnet-4-6/main  truncated_stream (502)  [transient=true retry-after=2s]  0.9s
+RETRY claude-haiku-4-5/main   http_529 (529)  [transient=true retry-after=4s]  0.2s  attempt=1
+FAIL  claude-sonnet-4-6/main  request_shape (400)  [transient=false retry-after=0s]  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
-BLOCK claude-sonnet-4-6/main  circuit open (12s left) -> auto-retry
 OK    /v1/messages/count_tokens  200  730B  2ms
 ```
 
@@ -151,15 +172,15 @@ Every line is prefixed by the logger with the date and time at second resolution
 
 Reading a line:
 - **First column** = outcome — `OK` served · `RETRY` converted to an automatic
-  retry (`x-should-retry: true`, the SDK re-sends) · `FAIL` surfaced to you
-  (permanent, or retry budget spent) · `DROP` failed *after* committing a long
-  turn, so Claude's native dropped-stream retry takes over · `BLOCK` circuit
-  breaker is open.
+  retry (`x-should-retry: true` + `Retry-After` backoff, the SDK re-sends) ·
+  `FAIL` surfaced to you (request-shape error, or retry backstop hit) · `DROP`
+  failed *after* committing a long turn, so Claude's native dropped-stream retry
+  takes over.
 - **`model/agent`** — the model called, and whether the caller is the `main` agent
   or a spawned `sub`agent.
 - Then only what varies: **`in=/out=` tokens**, **stop reason**, **`buffered`/`live`**
   capture mode, and **duration**. Failures add the upstream **code (status)** plus a
-  `[transient=… episode=…]` diagnostic; **`attempt=N`** shows only after a retry.
+  `[transient=… retry-after=…]` diagnostic; **`attempt=N`** shows only after a retry.
 
 Responses also carry headers: `X-CC-Retry-Proxy-Mode` (`buffered`/`live`) on
 success, `X-CC-Retry-Proxy-Reason` on a synthesized error.
@@ -179,7 +200,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 |---|---|---|
 | `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
 | `PROXY_UPSTREAM_URL` | `https://your-gateway.example.com` | the real gateway (set via `.env`) |
-| `PROXY_SDK_RETRY_CAP` | `8` | stop converting once the SDK has retried this many times (`0` disables conversion entirely) |
+| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). Your client's `maxRetries` is the real ceiling; raise that, not this |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON validation (catches malformed `data:` events); `0` to disable |
@@ -196,7 +217,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 
 The one-line access log tells you *what happened*; sometimes you need to see
 *exactly what was sent and returned* — to debug a converted retry, a malformed
-stream, or a permanent 4xx. Set `PROXY_REQUEST_LOG_DIR` to a directory and the
+stream, or a surfaced request-shape 4xx. Set `PROXY_REQUEST_LOG_DIR` to a directory and the
 proxy writes **one human-readable file per request** into it:
 
 ```

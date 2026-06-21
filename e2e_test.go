@@ -18,9 +18,6 @@ func setupForTest(upURL string) {
 	}
 	cfg.upstreamHost = h
 	cfg.upstreamByteIdle = 3 * time.Second
-	breaker = newCircuitBreaker()
-	ledger = newEpisodeLedger(cfg.episodeWindow)
-	hmacKey = []byte("test-key-0123456789")
 	client = &http.Client{Transport: &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Second}}
 }
 
@@ -101,6 +98,7 @@ func TestE2ESDKRetryCapStopsConverting(t *testing.T) {
 	}))
 	defer up.Close()
 	setupForTest(up.URL)
+	cfg.sdkRetryCap = 8 // pin the backstop so the test is independent of the default
 
 	// Simulate the SDK already having retried past the cap.
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"model":"m"}`))
@@ -109,5 +107,40 @@ func TestE2ESDKRetryCapStopsConverting(t *testing.T) {
 	handle(rec, req)
 	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
 		t.Fatalf("past SDK retry cap must stop converting; want false, got %q", got)
+	}
+}
+
+// Blind-stabilizer policy: a transient failure must be retried AND carry a
+// Retry-After backoff so the client waits before re-sending. Covers a 5xx and an
+// auth 4xx (which now retries instead of surfacing).
+func TestE2ERetryableCarriesBackoff(t *testing.T) {
+	cases := []struct {
+		name, body string
+		status     int
+	}{
+		{"503", `{"error":{"type":"api_error","message":"upstream unavailable"}}`, 503},
+		{"401", `{"error":{"type":"authentication_error","message":"Invalid API key"}}`, 401},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(c.status)
+				io.WriteString(w, c.body)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"model":"m"}`))
+			req.Header.Set("X-Stainless-Retry-Count", "1")
+			rec := httptest.NewRecorder()
+			handle(rec, req)
+
+			if got := rec.Header().Get("X-Should-Retry"); got != "true" {
+				t.Fatalf("want x-should-retry true, got %q (code %d body %s)", got, rec.Code, rec.Body.String())
+			}
+			if ra := atoiSafe(rec.Header().Get("Retry-After")); ra < 1 {
+				t.Fatalf("want a Retry-After backoff >= 1s, got %q", rec.Header().Get("Retry-After"))
+			}
+		})
 	}
 }

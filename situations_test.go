@@ -22,12 +22,11 @@ func TestMalformedJSONEventConverts(t *testing.T) {
 	}
 }
 
-// §4: every permanent real-world message must NOT be retried.
-// §3: every transient real-world status must be retried.
+// §4: only request-shape errors must surface (never retried) — they can never
+// succeed as written. §3: everything else is retried, including auth/billing and
+// transient statuses (blind-stabilizer policy).
 func TestClassifyRealMessages(t *testing.T) {
 	perm := []struct{ status int; body string }{
-		{401, `{"error":{"type":"authentication_error","message":"Invalid API key"}}`},
-		{403, `{"error":{"type":"permission_error","message":"This organization has been disabled."}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"Missing Tool Result Block"}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"duplicate tool_use ID in conversation history"}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"unexpected tool_use_id found in tool_result blocks"}}`},
@@ -37,12 +36,12 @@ func TestClassifyRealMessages(t *testing.T) {
 		{400, `{"error":{"type":"invalid_request_error","message":"max_tokens must be greater than thinking.budget_tokens"}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"image dimensions exceed max allowed size"}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"prompt is too long for the context window"}}`},
-		{402, `{"error":{"type":"billing_error","message":"Usage credits required for 1M context"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"context length exceeded: 250000 > 200000"}}`},
 	}
 	for _, c := range perm {
 		f := classifyHTTPError(mkResp(c.status, c.body))
 		if f.transient {
-			t.Errorf("status %d %q: want PERMANENT, got transient %+v", c.status, c.body, f)
+			t.Errorf("status %d %q: want REQUEST-SHAPE (surface), got transient %+v", c.status, c.body, f)
 		}
 	}
 
@@ -51,11 +50,26 @@ func TestClassifyRealMessages(t *testing.T) {
 		{500, `{"error":{"type":"api_error","message":"Internal server error"}}`},
 		{429, `{"error":{"type":"rate_limit_error","message":"Server is temporarily limiting requests"}}`},
 		{503, `{"error":{"type":"api_error","message":"temporary capacity issue"}}`},
+		// auth / billing / policy now RIDE OUT instead of surfacing (might be a temporary block).
+		{401, `{"error":{"type":"authentication_error","message":"Invalid API key"}}`},
+		{403, `{"error":{"type":"permission_error","message":"This organization has been disabled."}}`},
+		{402, `{"error":{"type":"billing_error","message":"Usage credits required for 1M context"}}`},
+		// guards against re-adding broad sigs: these contain "must be"/"unsupported"
+		// but are auth/routing → must still retry, not surface.
+		{401, `{"error":{"type":"authentication_error","message":"authentication token must be provided"}}`},
+		{403, `{"error":{"type":"permission_error","message":"unsupported region for this account"}}`},
+		// unknown 4xx: don't guess, retry.
+		{418, `{"error":{"type":"api_error","message":"teapot"}}`},
 	}
 	for _, c := range trans {
 		f := classifyHTTPError(mkResp(c.status, c.body))
 		if !f.transient {
-			t.Errorf("status %d %q: want TRANSIENT, got %+v", c.status, c.body, f)
+			t.Errorf("status %d %q: want TRANSIENT (retry), got %+v", c.status, c.body, f)
+		}
+		// A retryable 4xx (other than 429) MUST be normalized to 502 — the SDK may
+		// refuse to retry a raw 4xx by status, regardless of x-should-retry.
+		if c.status >= 400 && c.status < 500 && c.status != 429 && f.status != 502 {
+			t.Errorf("status %d %q: retryable 4xx must normalize to 502, got %d", c.status, c.body, f.status)
 		}
 	}
 }

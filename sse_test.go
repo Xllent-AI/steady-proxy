@@ -152,7 +152,7 @@ func TestClassifyHTTP(t *testing.T) {
 		{"429", mkResp(429, `{"error":{"type":"rate_limit_error"}}`), true},
 		{"400-invalid", mkResp(400, `{"error":{"type":"invalid_request_error","message":"messages.0: tool_use ids must..."}}`), false},
 		{"400-gateway", mkResp(400, `{"error":{"type":"api_error","message":"upstream gateway timeout"}}`), true},
-		{"401", mkResp(401, `{"error":{"type":"authentication_error","message":"invalid api key"}}`), false},
+		{"401", mkResp(401, `{"error":{"type":"authentication_error","message":"invalid api key"}}`), true}, // auth now rides out (may be a temporary block)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

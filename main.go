@@ -5,19 +5,36 @@
 // It makes the agent's API calls survive transient gateway failures WITHOUT the
 // user ever typing "continue", and without any terminal automation.
 //
+// ── DESIGN PRINCIPLE: a blind stabilizer ─────────────────────────────────────
+//
+// This proxy is intentionally NOT a smart retry brain — your upstream gateway
+// already owns retry intelligence (routing, provider selection, backoff). The
+// proxy's only job is to keep the client alive through outages. So the whole
+// policy is one rule:
+//
+//	Buffer the full response. On ANY failure, tell the client to wait and retry.
+//	Only give up on a request that can never succeed as written.
+//
+// "Can never succeed" = a deterministic request-shape error (context too long,
+// malformed tool blocks, schema/validation, model-not-found — see
+// requestShapeSigs in classify.go). EVERYTHING else is retried, on purpose:
+// network outages, 5xx, rate limits, capacity ("no available providers"), auth
+// blocks, billing, and unknown 4xx. A temporary block is ridden out, not
+// surfaced. The cost: a genuinely bad key/credential surfaces late (after the
+// retry budget) rather than fast — an accepted trade for steadiness.
+//
 // How it works (transactional mode):
 //   - For POST /v1/messages it withholds ALL downstream bytes until it has
 //     captured a complete, valid Anthropic SSE stream ending in `message_stop`.
 //     Only then does it write `200 OK` and replay the buffered stream.
-//   - Any failure that happens before that commit point (connection error,
-//     5xx, stalled/truncated stream, mid-stream `error` event) is turned into a
-//     *retryable* HTTP response: it stamps `x-should-retry: true` so Claude
-//     Code's own SDK retry loop transparently re-sends the request.
-//   - Genuinely permanent errors (bad request, context-length, missing
-//     tool_result, auth) are passed through unchanged with `x-should-retry:
-//     false`, so they surface instead of looping forever.
-//   - A retry budget (driven by the SDK's own X-Stainless-Retry-Count) and a
-//     per-route circuit breaker bound cost during a real outage.
+//   - Any failure before that commit point (connection error, 5xx, stalled or
+//     truncated stream, mid-stream `error` event, or a retryable status) is
+//     turned into a *retryable* response: it stamps `x-should-retry: true` plus a
+//     `Retry-After` backoff, so Claude Code's own SDK retry loop waits and
+//     transparently re-sends. The client's maxRetries is the effective ceiling;
+//     PROXY_SDK_RETRY_CAP is only a backstop.
+//   - Request-shape errors are passed through with `x-should-retry: false`, so
+//     they surface instead of looping forever.
 //
 // Re-issuing /v1/messages is safe here because the client never saw a partial
 // response, and Claude Code executes tools only after a COMPLETE response — so a
@@ -30,10 +47,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,7 +72,6 @@ type config struct {
 	deadlineMargin   time.Duration
 	maxRequestDur    time.Duration
 	sdkRetryCap      int
-	episodeWindow    time.Duration
 	spoolDir         string
 	requestLogDir    string // when non-empty, save each request/response to a file here
 	requestLogMax    int64  // per-section cap (request body, response body) written per file
@@ -85,8 +97,7 @@ func loadConfig() config {
 		keepaliveMs:      envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
 		deadlineMargin:   envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
 		maxRequestDur:    envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
-		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 8)),          // stop converting past this many SDK retries
-		episodeWindow:    envDur("PROXY_EPISODE_WINDOW_MS", 900000),        // 15m logical-failure window
+		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; the client's own maxRetries is the real ceiling
 		spoolDir:         env("PROXY_SPOOL_DIR", os.TempDir()),
 		requestLogDir:    env("PROXY_REQUEST_LOG_DIR", ""),                // "" = disabled; set a dir to save each request/response
 		requestLogMax:    envInt64("PROXY_REQUEST_LOG_MAX_BYTES", 10<<20), // 10 MiB per section, then truncate (bounds RAM/disk)
@@ -96,22 +107,13 @@ func loadConfig() config {
 }
 
 var (
-	cfg     config
-	breaker *circuitBreaker
-	ledger  *episodeLedger
-	hmacKey []byte
-	client  *http.Client
+	cfg    config
+	client *http.Client
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags) // timestamp every line at second resolution: date + HH:MM:SS
 	cfg = loadConfig()
-	breaker = newCircuitBreaker()
-	ledger = newEpisodeLedger(cfg.episodeWindow)
-	hmacKey = make([]byte, 32)
-	if _, err := rand.Read(hmacKey); err != nil {
-		log.Fatalf("rand: %v", err)
-	}
 
 	client = &http.Client{
 		Transport: &http.Transport{
@@ -173,24 +175,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
-	key := logicalKey(r, body)
-	route := routeKey(r, body)
 	budgetLeft := func() bool { return retryCount < cfg.sdkRetryCap }
-
-	if remaining, open := breaker.isOpen(route); open {
-		n := ledger.bump(key, "circuit_open")
-		canRetry := budgetLeft() && n.convertedCount <= cfg.sdkRetryCap
-		decision := "surfaced"
-		if canRetry {
-			decision = "auto-retry"
-		}
-		log.Printf("BLOCK %s  circuit open (%s left) -> %s%s",
-			who(r, body), remaining.Round(time.Second), decision, att(retryCount))
-		rec.note("BLOCK", http.StatusServiceUnavailable, "circuit_open")
-		writeAnthropicError(w, canRetry, http.StatusServiceUnavailable, "overloaded_error",
-			"cc-retry-proxy: upstream circuit open", int(remaining.Seconds())+1, "circuit_open")
-		return
-	}
 
 	ctx, cancel := context.WithDeadline(r.Context(), time.Now().Add(deriveDuration(r.Header.Get("X-Stainless-Timeout"))))
 	defer cancel()
@@ -239,17 +224,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		wrote, fail := captureSSE(ctx, cancel, w, resp.Header, resp.Body, &st)
 		resp.Body.Close()
 		if fail == nil {
-			breaker.recordSuccess(route)
-			ledger.clear(key)
 			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s",
 				who(r, body), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount))
 			rec.note("OK", http.StatusOK, "")
 			return
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
-			if fail.transient {
-				breaker.recordFailure(route)
-			}
 			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s",
 				who(r, body), fail.code, htok(st.outTok), since(reqStart), att(retryCount))
 			rec.note("DROP", http.StatusOK, fail.code)
@@ -259,21 +239,22 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		break // do not nest local retries around an expensive capture
 	}
 
-	// FAILED before committing: decide whether to hand back to the SDK retry loop.
-	if last.transient {
-		breaker.recordFailure(route)
+	// FAILED before committing. One rule: retry unless it's a request-shape error
+	// (or we've hit the backstop). On retry, supply a Retry-After backoff so the
+	// client waits before re-sending.
+	canRetry := last.transient && budgetLeft()
+	retryAfter := last.retryAfter
+	if canRetry && retryAfter == 0 {
+		retryAfter = retryAfterFor(retryCount)
 	}
-	n := ledger.bump(key, last.code)
-	canRetry := last.transient && budgetLeft() &&
-		n.convertedCount <= cfg.sdkRetryCap && n.sameFaultCount <= 3
 	tag := "RETRY" // converted to x-should-retry=true; the SDK will re-send
 	if !canRetry {
-		tag = "FAIL" // surfaced to the user (permanent, or retry budget exhausted)
+		tag = "FAIL" // surfaced to the user (request-shape, or retry backstop hit)
 	}
-	log.Printf("%-5s %s  %s (%d)  [transient=%v episode=%d]  %s%s",
-		tag, who(r, body), last.code, statusFor(last), last.transient, n.convertedCount, since(reqStart), att(retryCount))
+	log.Printf("%-5s %s  %s (%d)  [transient=%v retry-after=%ds]  %s%s",
+		tag, who(r, body), last.code, statusFor(last), last.transient, retryAfter, since(reqStart), att(retryCount))
 	rec.note(tag, statusFor(last), last.code)
-	writeAnthropicError(w, canRetry, statusFor(last), last.atype, msgFor(last), last.retryAfter, last.code)
+	writeAnthropicError(w, canRetry, statusFor(last), last.atype, msgFor(last), retryAfter, last.code)
 }
 
 // readBody reads the request body with a hard cap, reporting overflow rather
@@ -295,9 +276,18 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	resp, _, err := roundTrip(ctx, r, body)
 	if err != nil {
 		f := classifyTransport(err, ctx)
-		log.Printf("FAIL  %s  %d (%s)  %s", r.URL.Path, statusFor(f), f.code, since(start))
-		rec.note("FAIL", statusFor(f), f.code)
-		writeAnthropicError(w, f.transient, statusFor(f), f.atype, msgFor(f), 0, f.code)
+		// Same one rule as the transactional path: retry transient faults within
+		// the backstop, with a Retry-After backoff so the client waits.
+		retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
+		canRetry := f.transient && retryCount < cfg.sdkRetryCap
+		retryAfter := 0
+		tag := "FAIL"
+		if canRetry {
+			tag, retryAfter = "RETRY", retryAfterFor(retryCount)
+		}
+		log.Printf("%-5s %s  %d (%s)  %s%s", tag, r.URL.Path, statusFor(f), f.code, since(start), att(retryCount))
+		rec.note(tag, statusFor(f), f.code)
+		writeAnthropicError(w, canRetry, statusFor(f), f.atype, msgFor(f), retryAfter, f.code)
 		return
 	}
 	defer resp.Body.Close()
@@ -393,25 +383,6 @@ func requestWantsStream(body []byte) bool {
 	}
 	_ = json.Unmarshal(body, &b)
 	return b.Stream
-}
-
-func routeKey(r *http.Request, body []byte) string {
-	var b struct {
-		Model string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &b)
-	return cfg.upstreamHost + "|" + b.Model
-}
-
-func logicalKey(r *http.Request, body []byte) string {
-	mac := hmac.New(sha256.New, hmacKey)
-	io.WriteString(mac, r.Method+"\n"+r.URL.Path+"\n")
-	io.WriteString(mac, r.Header.Get("Authorization")+"\n")
-	io.WriteString(mac, r.Header.Get("X-Claude-Code-Session-Id")+"\n")
-	io.WriteString(mac, r.Header.Get("X-Claude-Code-Agent-Id")+"\n")
-	io.WriteString(mac, r.Header.Get("X-Claude-Code-Parent-Agent-Id")+"\n")
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))[:24]
 }
 
 // deriveDuration picks an attempt deadline below the client's own timeout.

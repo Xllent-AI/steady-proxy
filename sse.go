@@ -353,7 +353,10 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 		}
 		if err := sp.write(ev.raw); err != nil {
 			sp.discard()
-			return false, &failure{status: 500, atype: "api_error", code: "response_too_large", message: "response exceeded proxy buffer cap"}, true
+			// transient:false is intentional — the same request will always
+			// overflow PROXY_MAX_RESPONSE_BYTES, so retrying cannot help. 502
+			// (not 500) signals an upstream-shaped condition, not a proxy fault.
+			return false, &failure{status: http.StatusBadGateway, atype: "api_error", code: "response_too_large", message: "response exceeded proxy buffer cap"}, true
 		}
 		if val.terminal() {
 			writeHead("buffered")
