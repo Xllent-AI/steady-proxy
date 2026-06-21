@@ -1,0 +1,6 @@
+cc-retry-proxy
+*.test
+.git
+docs
+*.md
+test/*.log

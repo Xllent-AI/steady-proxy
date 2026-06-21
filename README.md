@@ -1,0 +1,167 @@
+# cc-retry-proxy
+
+A tiny, transactional, self-healing reverse proxy that sits between **Claude Code**
+and your **gateway**, so transient gateway failures never stop a turn — no tmux,
+no terminal automation, and subagents are covered automatically.
+
+```
+Claude Code (+ subagents)  ──HTTP──▶  cc-retry-proxy (loopback)  ──HTTPS──▶  your gateway
+```
+
+## What it does
+
+- For `POST /v1/messages` it runs in **transactional mode**: it buffers and
+  validates the *entire* Anthropic SSE stream and only writes `200 OK` +
+  replays it once a complete, valid `message_stop` is captured.
+- Any failure **before** that commit point — connection error, 5xx, a stalled or
+  truncated stream, a mid-stream `error` event — is converted into a *retryable*
+  response by stamping **`x-should-retry: true`** (the Anthropic SDK then
+  transparently re-sends, using Claude Code's own retry loop). Pre-stream `5xx`/
+  `429` are passed through (already retryable); `4xx` translation hiccups are
+  normalized to `502` + `x-should-retry: true`.
+- **Permanent** errors (bad request, context-length, missing `tool_result`,
+  auth) pass through unchanged with **`x-should-retry: false`** so they surface
+  instead of looping forever.
+- A **retry budget** (driven by the SDK's own `X-Stainless-Retry-Count`, capped
+  at `PROXY_SDK_RETRY_CAP`) and a per-route **circuit breaker** bound cost during
+  a real outage.
+- **Long generations (tuned for turns up to ~600 s):** Claude aborts any request
+  that reaches its response-header ceiling with no bytes — **default 60 s**
+  (`CLAUDE_CODE_CONNECT_TIMEOUT_MS`, measured; `API_FORCE_IDLE_TIMEOUT=0` does
+  *not* affect this pre-headers wait). To keep the stream **fully transactional**
+  (so a late failure is still cleanly retryable) for long turns, this proxy
+  defaults `PROXY_KEEPALIVE_MS` to **600 000** and you raise the client ceiling to
+  match: set **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** (it must exceed the
+  keepalive window). Now a turn that runs for minutes and fails near the end —
+  e.g. a truncated stream / `JSON Parse error` — is still uncommitted, so it
+  converts to an automatic retry. Only if a turn *exceeds* the window does the
+  proxy **commit** the buffered prefix and switch to **live streaming with
+  keepalive pings** (a post-commit drop then falls back to Claude's native
+  dropped-stream retry). Want a different ceiling? Move both numbers together.
+
+The full situation catalog — derived from real session transcripts — and how each
+is handled is in [docs/ERROR-SITUATIONS.md](docs/ERROR-SITUATIONS.md).
+
+Trade-off of transactional mode: you lose live token-by-token streaming for turns
+that complete within the grace window — the reply appears in a burst, then
+completes. In exchange you get "complete reply or automatic retry, never a stuck
+half-reply."
+
+## Run (docker compose — recommended)
+
+```bash
+cp .env.example .env                  # set PROXY_UPSTREAM_URL to your real gateway
+docker compose up -d --build          # proxy on 127.0.0.1:8789 -> your gateway
+# or override inline instead of using .env:
+PROXY_UPSTREAM_URL=https://your-gateway.example.com docker compose up -d --build
+```
+
+Then point Claude Code at it (next section). Logs: `docker compose logs -f proxy`.
+
+## Build / test from source
+
+```bash
+cd cc-retry-proxy
+go build -o cc-retry-proxy .
+go test -race ./...          # unit + integration tests
+./test/live.sh               # live: real `claude -p` -> proxy -> mock + real gateway
+```
+
+Run the binary directly instead of compose:
+
+```bash
+PROXY_UPSTREAM_URL=https://your-gateway.example.com PROXY_LISTEN_ADDR=127.0.0.1:8789 ./cc-retry-proxy
+```
+
+Background / persistent (systemd user unit, survives logout):
+
+```ini
+# ~/.config/systemd/user/cc-retry-proxy.service
+[Unit]
+Description=cc-retry-proxy for Claude Code
+After=network-online.target
+
+[Service]
+ExecStart=/opt/cc-retry-proxy/cc-retry-proxy
+Environment=PROXY_UPSTREAM_URL=https://your-gateway.example.com
+Environment=PROXY_KEEPALIVE_MS=600000
+Environment=PROXY_LISTEN_ADDR=127.0.0.1:8789
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now cc-retry-proxy
+```
+
+## Wire Claude Code to it
+
+In `~/.claude/settings.json`, point the base URL at the proxy and let the proxy
+hold the real upstream (the proxy forwards your `Authorization`/`anthropic-*`
+headers unchanged):
+
+```jsonc
+"env": {
+  "ANTHROPIC_BASE_URL": "http://127.0.0.1:8789",   // was: your real gateway URL
+  "ANTHROPIC_AUTH_TOKEN": "…unchanged…",
+  // keep your timeouts; they still govern the client↔proxy hop:
+  "API_FORCE_IDLE_TIMEOUT": "0",
+  "API_TIMEOUT_MS": "600000",
+  // REQUIRED for the 600s transactional window — must exceed PROXY_KEEPALIVE_MS:
+  "CLAUDE_CODE_CONNECT_TIMEOUT_MS": "660000"
+}
+// and run the proxy with PROXY_UPSTREAM_URL set to your real gateway (via .env)
+```
+
+If Claude Code refuses a plain `http://` base URL, serve the proxy over TLS with a
+local cert and set `NODE_EXTRA_CA_CERTS` — but loopback `http` is normally fine.
+
+## Verify
+
+Watch the log (`PROXY_VERBOSE=1`, on by default in compose): each healed failure
+prints a `[fail] … -> x-should-retry=true` line. Successful replies carry
+`X-CC-Retry-Proxy-Mode` (`buffered` or `live`); synthesized errors carry
+`X-CC-Retry-Proxy-Reason`.
+
+Live smoke test (sends one real request through the proxy to your gateway):
+
+```bash
+curl -sS http://127.0.0.1:8789/v1/messages \
+  -H "authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+  -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
+  -d '{"model":"<your-model>","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"say hi"}]}'
+```
+
+## Config (env)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
+| `PROXY_UPSTREAM_URL` | `https://your-gateway.example.com` | the real gateway (set via `.env`) |
+| `PROXY_SDK_RETRY_CAP` | `8` | stop converting once the SDK has retried this many times (`0` disables conversion entirely) |
+| `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
+| `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
+| `PROXY_VALIDATE_JSON` | `1` | per-event JSON validation (catches malformed `data:` events); `0` to disable |
+| `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
+| `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
+| `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a single buffered response |
+| `PROXY_DEADLINE_MARGIN_MS` | `25000` | finish before the client's own timeout |
+| `PROXY_SPOOL_DIR` | `$TMPDIR` | where large responses spill (use tmpfs for sensitive prompts) |
+| `PROXY_VERBOSE` | off | set `1` for per-decision logs |
+
+## Caveats
+
+- **Server-side / remote MCP tools:** re-issuing a request is safe for
+  *client-local* tool execution (Claude runs tools only after a complete reply),
+  but it is **not** provider-level idempotency. If you enable server-side or
+  remote side-effecting tools without their own idempotency keys, set
+  `PROXY_SDK_RETRY_CAP=0` to disable conversion, or don't proxy those.
+- **Live streaming is lost** for turns that finish within the grace window (by
+  design). Turns longer than `PROXY_KEEPALIVE_MS` commit early and stream live but
+  then can't cleanly convert a late drop. To keep live streaming *and* full
+  robustness for long turns, add resumable responses in your in-house shim
+  (OpenAI/Azure `background:true` + `starting_after=<sequence>`).
+- Bind to loopback only; this is an unauthenticated local proxy.

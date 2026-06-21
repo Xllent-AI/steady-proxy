@@ -1,0 +1,157 @@
+package main
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+// §2: a fully-framed event with broken JSON must become a retry, not reach the
+// client as "JSON Parse error: Unexpected identifier".
+func TestMalformedJSONEventConverts(t *testing.T) {
+	s := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+		"event: content_block_delta\ndata: {oops not json\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	_, f := capture(t, s)
+	if f == nil || !f.transient || f.code != "malformed_sse" {
+		t.Fatalf("want transient malformed_sse, got %+v", f)
+	}
+}
+
+// §4: every permanent real-world message must NOT be retried.
+// §3: every transient real-world status must be retried.
+func TestClassifyRealMessages(t *testing.T) {
+	perm := []struct{ status int; body string }{
+		{401, `{"error":{"type":"authentication_error","message":"Invalid API key"}}`},
+		{403, `{"error":{"type":"permission_error","message":"This organization has been disabled."}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"Missing Tool Result Block"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"duplicate tool_use ID in conversation history"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"unexpected tool_use_id found in tool_result blocks"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"due to tool use concurrency issues. Run /rewind"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"Extra inputs are not permitted: context_management"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"Unexpected value(s) for the anthropic-beta header"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"max_tokens must be greater than thinking.budget_tokens"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"image dimensions exceed max allowed size"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"prompt is too long for the context window"}}`},
+		{402, `{"error":{"type":"billing_error","message":"Usage credits required for 1M context"}}`},
+	}
+	for _, c := range perm {
+		f := classifyHTTPError(mkResp(c.status, c.body))
+		if f.transient {
+			t.Errorf("status %d %q: want PERMANENT, got transient %+v", c.status, c.body, f)
+		}
+	}
+
+	trans := []struct{ status int; body string }{
+		{529, `{"error":{"type":"overloaded_error","message":"Overloaded"}}`},
+		{500, `{"error":{"type":"api_error","message":"Internal server error"}}`},
+		{429, `{"error":{"type":"rate_limit_error","message":"Server is temporarily limiting requests"}}`},
+		{503, `{"error":{"type":"api_error","message":"temporary capacity issue"}}`},
+	}
+	for _, c := range trans {
+		f := classifyHTTPError(mkResp(c.status, c.body))
+		if !f.transient {
+			t.Errorf("status %d %q: want TRANSIENT, got %+v", c.status, c.body, f)
+		}
+	}
+}
+
+// gapReader yields chunks with a delay before each, and aborts (returns the
+// context error) if the context is cancelled during a gap — mimicking the
+// transport closing when the proxy's idle watchdog fires.
+type gapReader struct {
+	ctx    context.Context
+	chunks []string
+	gap    time.Duration
+	i      int
+}
+
+func (g *gapReader) Read(p []byte) (int, error) {
+	if g.i >= len(g.chunks) {
+		return 0, io.EOF
+	}
+	if g.i > 0 && g.gap > 0 {
+		select {
+		case <-time.After(g.gap):
+		case <-g.ctx.Done():
+			return 0, g.ctx.Err()
+		}
+	}
+	n := copy(p, g.chunks[g.i])
+	g.i++
+	return n, nil
+}
+
+func eventsOf(s string) []string {
+	parts := strings.SplitAfter(s, "\n\n")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// §6: a slow but progressing stream (gaps < byte-idle) is held to completion.
+func TestLongGenerationSlowDrip(t *testing.T) {
+	cfg = loadConfig()
+	cfg.upstreamByteIdle = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r := &gapReader{ctx: ctx, chunks: eventsOf(goodStream), gap: 50 * time.Millisecond}
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, r)
+	if f != nil {
+		t.Fatalf("slow-drip should complete, got failure %+v", *f)
+	}
+}
+
+// §6: past the keepalive grace the proxy commits and streams live (so a >300s
+// turn survives the client's no-bytes ceiling). Real >300s wall-clock is the
+// live docker `long-gen` scenario; here we shrink the grace to prove the path.
+func TestKeepaliveCommitThenLive(t *testing.T) {
+	cfg = loadConfig()
+	cfg.keepaliveMs = 80 * time.Millisecond
+	cfg.upstreamByteIdle = 3 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r := &gapReader{ctx: ctx, chunks: eventsOf(goodStream), gap: 120 * time.Millisecond}
+	wrote, f := captureSSE(ctx, cancel, rec, http.Header{}, r)
+	if f != nil || !wrote {
+		t.Fatalf("want committed live success, got wrote=%v fail=%+v", wrote, f)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, ": keepalive") {
+		t.Fatalf("expected a keepalive ping in live mode: %q", body)
+	}
+	if !strings.Contains(body, "message_stop") || !strings.Contains(body, "Hi") {
+		t.Fatalf("missing streamed content: %q", body)
+	}
+	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "live" {
+		t.Fatalf("want live mode header, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	}
+}
+
+// §6: a silent gap beyond byte-idle is a wedged upstream -> retryable.
+func TestSilentGapAborts(t *testing.T) {
+	cfg = loadConfig()
+	cfg.upstreamByteIdle = 150 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	// message_start, then a long gap before the next chunk.
+	r := &gapReader{ctx: ctx, chunks: []string{
+		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}, gap: 600 * time.Millisecond}
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, r)
+	if f == nil || !f.transient || f.code != "upstream_idle" {
+		t.Fatalf("want transient upstream_idle, got %+v", f)
+	}
+}

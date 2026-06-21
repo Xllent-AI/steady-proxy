@@ -1,0 +1,7 @@
+# compiled binary
+/cc-retry-proxy
+*.test
+# logs from the live harness
+test/*.log
+# local env with the real gateway URL — never commit
+.env

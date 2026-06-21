@@ -1,0 +1,21 @@
+# Production: start the self-healing proxy in front of your real gateway.
+#
+#   cp .env.example .env   # set PROXY_UPSTREAM_URL to your real gateway (untracked)
+#   docker compose up -d --build
+#   # then set ANTHROPIC_BASE_URL=http://127.0.0.1:8789 in ~/.claude/settings.json,
+#   # and CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000 (must exceed PROXY_KEEPALIVE_MS).
+#
+services:
+  proxy:
+    build: .
+    image: cc-retry-proxy:latest
+    environment:
+      PROXY_LISTEN_ADDR: "0.0.0.0:8789"
+      PROXY_UPSTREAM_URL: "${PROXY_UPSTREAM_URL:-https://your-gateway.example.com}"
+      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-8}"
+      PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
+      PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
+      PROXY_VERBOSE: "${PROXY_VERBOSE:-1}"
+    ports:
+      - "127.0.0.1:8789:8789" # loopback only — never expose publicly
+    restart: unless-stopped

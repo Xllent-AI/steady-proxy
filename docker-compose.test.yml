@@ -1,0 +1,26 @@
+# Test stack: proxy in front of the fault-injecting mock upstream.
+#   docker compose -f docker-compose.test.yml up -d --build
+# Then drive `claude -p` (or the in-repo runner) at http://127.0.0.1:8789.
+services:
+  mock:
+    build: .
+    image: cc-retry-proxy:latest
+    entrypoint: ["/testupstream"]
+    environment:
+      MOCK_ADDR: "0.0.0.0:9099"
+    ports:
+      - "127.0.0.1:9099:9099" # for /__stats and /__reset
+
+  proxy:
+    build: .
+    image: cc-retry-proxy:latest
+    environment:
+      PROXY_LISTEN_ADDR: "0.0.0.0:8789"
+      PROXY_UPSTREAM_URL: "http://mock:9099"
+      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-8}"
+      PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
+      PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
+      PROXY_VERBOSE: "1"
+    ports:
+      - "127.0.0.1:8789:8789"
+    depends_on: [mock]
