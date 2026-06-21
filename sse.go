@@ -189,12 +189,13 @@ func (v *streamValidator) terminal() bool { return v.sawStart && v.sawStop && v.
 // captureStats collects human-friendly facts about a streamed response so the
 // caller can log one access-log line per request. All fields are best-effort.
 type captureStats struct {
-	mode   string // "buffered" | "live" | "" (never committed any bytes)
-	bytes  int64  // SSE bytes of the response
-	inTok  int    // usage.input_tokens (from message_start)
-	outTok int    // usage.output_tokens (from message_delta)
-	stop   string // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
-	model  string // resolved model echoed back by the upstream
+	mode    string    // "buffered" | "live" | "" (never committed any bytes)
+	bytes   int64     // SSE bytes of the response
+	inTok   int       // usage.input_tokens (from message_start)
+	outTok  int       // usage.output_tokens (from message_delta)
+	stop    string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
+	model   string    // resolved model echoed back by the upstream
+	respTee io.Writer // optional: when set, every raw response event is teed here (request-log)
 }
 
 // ------------------------------------------------------------- captureSSE ---
@@ -323,6 +324,9 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 		if st != nil {
 			st.bytes += int64(len(ev.raw))
 			scrapeUsage(ev, st)
+			if st.respTee != nil { // capture the full stream, incl. a mid-stream error
+				st.respTee.Write(ev.raw)
+			}
 		}
 		if *committed {
 			w.Write(ev.raw)

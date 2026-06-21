@@ -3,5 +3,7 @@
 *.test
 # logs from the live harness
 test/*.log
+# saved request/response dumps (PROXY_REQUEST_LOG_DIR) — may contain prompts
+/requests/
 # local env with the real gateway URL — never commit
 .env

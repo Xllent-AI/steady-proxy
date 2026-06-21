@@ -61,6 +61,8 @@ type config struct {
 	sdkRetryCap      int
 	episodeWindow    time.Duration
 	spoolDir         string
+	requestLogDir    string // when non-empty, save each request/response to a file here
+	requestLogMax    int64  // per-section cap (request body, response body) written per file
 	validateJSON     bool
 	verbose          bool
 }
@@ -86,7 +88,9 @@ func loadConfig() config {
 		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 8)),          // stop converting past this many SDK retries
 		episodeWindow:    envDur("PROXY_EPISODE_WINDOW_MS", 900000),        // 15m logical-failure window
 		spoolDir:         env("PROXY_SPOOL_DIR", os.TempDir()),
-		validateJSON:     os.Getenv("PROXY_VALIDATE_JSON") != "0", // default on
+		requestLogDir:    env("PROXY_REQUEST_LOG_DIR", ""),                // "" = disabled; set a dir to save each request/response
+		requestLogMax:    envInt64("PROXY_REQUEST_LOG_MAX_BYTES", 10<<20), // 10 MiB per section, then truncate (bounds RAM/disk)
+		validateJSON:     os.Getenv("PROXY_VALIDATE_JSON") != "0",         // default on
 		verbose:          os.Getenv("PROXY_VERBOSE") == "1",
 	}
 }
@@ -154,10 +158,17 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional: capture this request/response to a file (best-effort, never fatal).
+	var rec *reqRecorder
+	if requestLogEnabled() {
+		rec = newReqRecorder(reqStart, r, body)
+		defer rec.finish()
+	}
+
 	transactional := r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/messages") &&
 		!strings.Contains(r.URL.Path, "count_tokens") && requestWantsStream(body)
 	if !transactional {
-		proxyOnce(w, r, body)
+		proxyOnce(w, r, body, rec)
 		return
 	}
 
@@ -175,6 +186,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("BLOCK %s  circuit open (%s left) -> %s%s",
 			who(r, body), remaining.Round(time.Second), decision, att(retryCount))
+		rec.note("BLOCK", http.StatusServiceUnavailable, "circuit_open")
 		writeAnthropicError(w, canRetry, http.StatusServiceUnavailable, "overloaded_error",
 			"cc-retry-proxy: upstream circuit open", int(remaining.Seconds())+1, "circuit_open")
 		return
@@ -219,6 +231,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// CAPTURE: buffer+validate (transactional), or commit+stream live past the
 		// keepalive grace. captureSSE writes the downstream response itself.
 		var st captureStats
+		st.respTee = rec.respWriter() // nil when request-log disabled
+		if rec != nil {
+			rec.respHeaders = resp.Header
+			rec.stats = &st
+		}
 		wrote, fail := captureSSE(ctx, cancel, w, resp.Header, resp.Body, &st)
 		resp.Body.Close()
 		if fail == nil {
@@ -226,6 +243,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			ledger.clear(key)
 			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s",
 				who(r, body), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount))
+			rec.note("OK", http.StatusOK, "")
 			return
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
@@ -234,6 +252,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s",
 				who(r, body), fail.code, htok(st.outTok), since(reqStart), att(retryCount))
+			rec.note("DROP", http.StatusOK, fail.code)
 			return
 		}
 		last = *fail
@@ -253,6 +272,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("%-5s %s  %s (%d)  [transient=%v episode=%d]  %s%s",
 		tag, who(r, body), last.code, statusFor(last), last.transient, n.convertedCount, since(reqStart), att(retryCount))
+	rec.note(tag, statusFor(last), last.code)
 	writeAnthropicError(w, canRetry, statusFor(last), last.atype, msgFor(last), last.retryAfter, last.code)
 }
 
@@ -268,7 +288,7 @@ func readBody(r *http.Request) (body []byte, tooBig bool, err error) {
 }
 
 // proxyOnce is a plain single-shot reverse proxy for non-transactional routes.
-func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte) {
+func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqRecorder) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
 	defer cancel()
@@ -276,6 +296,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte) {
 	if err != nil {
 		f := classifyTransport(err, ctx)
 		log.Printf("FAIL  %s  %d (%s)  %s", r.URL.Path, statusFor(f), f.code, since(start))
+		rec.note("FAIL", statusFor(f), f.code)
 		writeAnthropicError(w, f.transient, statusFor(f), f.atype, msgFor(f), 0, f.code)
 		return
 	}
@@ -284,8 +305,15 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, resp.Body)
+	// Tee the body into the recorder when request-log is on (capped sink).
+	var dst io.Writer = w
+	if sink := rec.respWriter(); sink != nil {
+		rec.respHeaders = resp.Header
+		dst = io.MultiWriter(w, sink)
+	}
+	n, _ := io.Copy(dst, resp.Body)
 	log.Printf("OK    %s  %d  %s  %s", r.URL.Path, resp.StatusCode, hbytes(n), since(start))
+	rec.note("OK", resp.StatusCode, "")
 }
 
 // roundTrip issues one upstream request from the exact buffered body.
