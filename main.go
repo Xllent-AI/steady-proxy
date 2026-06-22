@@ -319,7 +319,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 			tag = "RETRY"
 		}
 		sStatus, sType := surface(f)
-		log.Printf("%-5s %s  %s %s%s  %s%s", tag, r.URL.Path, f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount))
+		log.Printf("%-5s %s  %s %s%s  %s%s", tag, who(r, body), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount))
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
 		writeAnthropicError(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
@@ -336,7 +336,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		dst = io.MultiWriter(w, sink)
 	}
 	n, _ := io.Copy(dst, resp.Body)
-	log.Printf("OK    %s  %d  %s  %s", r.URL.Path, resp.StatusCode, hbytes(n), since(start))
+	log.Printf("OK    %s  %d  %s  %s", who(r, body), resp.StatusCode, hbytes(n), since(start))
 	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
 }
 
@@ -471,10 +471,16 @@ func modelOf(body []byte) string {
 	return b.Model
 }
 
-// agentKind reports "sub" when the request carries a parent-agent header (i.e. it
-// came from a spawned subagent) and "main" otherwise.
+// agentKind reports "sub" for any spawned/SDK-driven agent and "main" for the
+// interactive CLI. Two signals mark a non-main request: a parent-agent header
+// (a nested subagent spawned by another agent) OR an Agent-SDK User-Agent
+// (".../sdk-cli" — workflow agents and top-level SDK agents, which carry no
+// parent id). The UA is the broader signal: every parent-header request is also
+// sdk-cli, but ~25% of sdk-cli traffic has no parent and would otherwise be
+// misreported as "main".
 func agentKind(r *http.Request) string {
-	if r.Header.Get("X-Claude-Code-Parent-Agent-Id") != "" {
+	if r.Header.Get("X-Claude-Code-Parent-Agent-Id") != "" ||
+		strings.Contains(r.Header.Get("User-Agent"), "sdk-cli") {
 		return "sub"
 	}
 	return "main"
