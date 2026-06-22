@@ -166,9 +166,9 @@ extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
    (timestamp prefix elided on the lines below for readability)
-RETRY claude-sonnet-4-6/main  truncated_stream (503)  [transient=true retry-after=2s]  0.9s
-RETRY claude-haiku-4-5/main   sse_overloaded (503)  [transient=true retry-after=4s]  0.2s  attempt=1
-FAIL  claude-sonnet-4-6/main  request_shape (400)  [transient=false retry-after=0s]  0.3s
+RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
+RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
+FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
 OK    /v1/messages/count_tokens  200  730B  2ms
 ```
@@ -185,12 +185,14 @@ Reading a line:
 - **`model/agent`** — the model called, and whether the caller is the `main` agent
   or a spawned `sub`agent.
 - Then only what varies: **`in=/out=` tokens**, **stop reason**, **`buffered`/`live`**
-  capture mode, and **duration**. Failures add the **`code` (status)** plus a
-  `[transient=… retry-after=…]` diagnostic; **`attempt=N`** shows only after a retry.
-  The **`code`** is the true cause (`sse_overloaded`, `http_529`, `truncated_stream`);
-  the **`(status)`** is what the client receives — always `503` for a retry (every
-  transient cause is masked to a generic `503`; see [normalization](#what-it-does)),
-  the real status only for a surfaced `FAIL`.
+  capture mode, and **duration**. Failures add the **`code`** and **`status`**, plus
+  **`retry-after=Ns`** on a RETRY and **`attempt=N`** after a retry. The **`code`** is
+  the true cause (`sse_overloaded`, `truncated_stream`, …). The **`status`** is the
+  real upstream status; when it was masked it reads **`orig->surfaced`**
+  (e.g. `529->503`) — left of the arrow is what the upstream returned, right is what
+  the client receives (every transient cause is masked to a generic `503`; see
+  [normalization](#what-it-does)). A single number means it was not masked (a `503`
+  that was already `503`, or a surfaced `FAIL` like `request_shape 400`).
 
 Responses also carry headers: `X-CC-Retry-Proxy-Mode` (`buffered`/`live`) on
 success, `X-CC-Retry-Proxy-Reason` on a synthesized error.

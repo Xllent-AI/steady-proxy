@@ -233,13 +233,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if fail == nil {
 			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s",
 				who(r, body), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount))
-			rec.note("OK", http.StatusOK, "")
+			rec.note("OK", http.StatusOK, http.StatusOK, "")
 			return
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
 			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s",
 				who(r, body), fail.code, htok(st.outTok), since(reqStart), att(retryCount))
-			rec.note("DROP", http.StatusOK, fail.code)
+			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
 			return
 		}
 		last = *fail
@@ -260,12 +260,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 	// surface() collapses every retryable failure to a generic 503+api_error so
 	// Claude Code can't recognize it as overloaded/rate-limit/timeout and bypass
-	// its x-should-retry loop. The log shows the surfaced status (what CC sees);
-	// last.code carries the true cause (e.g. sse_overloaded).
+	// its x-should-retry loop. The log shows the true upstream status arrowed to
+	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
 	sStatus, sType := surface(last)
-	log.Printf("%-5s %s  %s (%d)  [transient=%v retry-after=%ds]  %s%s",
-		tag, who(r, body), last.code, sStatus, last.transient, retryAfter, since(reqStart), att(retryCount))
-	rec.note(tag, sStatus, last.code)
+	log.Printf("%-5s %s  %s %s%s  %s%s",
+		tag, who(r, body), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount))
+	rec.note(tag, origStatusOf(last), sStatus, last.code)
 	writeAnthropicError(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
 }
 
@@ -319,8 +319,8 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 			tag = "RETRY"
 		}
 		sStatus, sType := surface(f)
-		log.Printf("%-5s %s  %d (%s)  %s%s", tag, r.URL.Path, sStatus, f.code, since(start), att(retryCount))
-		rec.note(tag, sStatus, f.code)
+		log.Printf("%-5s %s  %s %s%s  %s%s", tag, r.URL.Path, f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount))
+		rec.note(tag, origStatusOf(f), sStatus, f.code)
 		writeAnthropicError(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
 	}
@@ -337,7 +337,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	}
 	n, _ := io.Copy(dst, resp.Body)
 	log.Printf("OK    %s  %d  %s  %s", r.URL.Path, resp.StatusCode, hbytes(n), since(start))
-	rec.note("OK", resp.StatusCode, "")
+	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
 }
 
 // roundTrip issues one upstream request from the exact buffered body.
@@ -449,6 +449,15 @@ func att(n int) string {
 		return ""
 	}
 	return fmt.Sprintf("  attempt=%d", n)
+}
+
+// retryField prints the backoff only when one was actually handed back (a RETRY);
+// a surfaced FAIL gets no Retry-After, so it shows nothing rather than "0s".
+func retryField(secs int) string {
+	if secs <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("  retry-after=%ds", secs)
 }
 
 func modelOf(body []byte) string {

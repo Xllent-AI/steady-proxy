@@ -69,9 +69,10 @@ type reqRecorder struct {
 	stats       *captureStats // optional: token/stop/mode summary for the SSE path
 
 	// outcome, set once at the terminal log site via note().
-	outcome string
-	status  int
-	code    string
+	outcome    string
+	origStatus int // true upstream status (e.g. 529)
+	status     int // status surfaced to the client (e.g. masked 503)
+	code       string
 }
 
 func newReqRecorder(start time.Time, r *http.Request, body []byte) *reqRecorder {
@@ -95,12 +96,14 @@ func (rec *reqRecorder) respWriter() io.Writer {
 	return &rec.resp
 }
 
-// note records the final outcome (mirrors the one-line access log).
-func (rec *reqRecorder) note(outcome string, status int, code string) {
+// note records the final outcome (mirrors the one-line access log). orig is the
+// true upstream status; surfaced is what the client received (the two differ when
+// a transient cause was masked to a generic 503).
+func (rec *reqRecorder) note(outcome string, orig, surfaced int, code string) {
 	if rec == nil {
 		return
 	}
-	rec.outcome, rec.status, rec.code = outcome, status, code
+	rec.outcome, rec.origStatus, rec.status, rec.code = outcome, orig, surfaced, code
 }
 
 // finish writes the captured request/response to a file. Best-effort: any error
@@ -150,7 +153,7 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	writeCapped(w, rec.reqBody, requestLogCap())
 
 	fmt.Fprintln(w, "\n=== RESPONSE ===")
-	fmt.Fprintf(w, "Outcome: %s   status=%d   code=%s\n", dash(rec.outcome), rec.status, dash(rec.code))
+	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s\n", dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code))
 	if st := rec.stats; st != nil {
 		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   dur=%s\n",
 			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), since(rec.when))

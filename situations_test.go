@@ -71,6 +71,33 @@ func TestClassifyRealMessages(t *testing.T) {
 		if c.status >= 400 && c.status < 500 && c.status != 429 && f.status != 502 {
 			t.Errorf("status %d %q: retryable 4xx must normalize to 502, got %d", c.status, c.body, f.status)
 		}
+		// ...but the RAW upstream status must still be preserved for the logs, so a
+		// retryable 401 reads as 401->503, not the misleading 502->503.
+		if f.origStatus != c.status {
+			t.Errorf("status %d %q: origStatus must keep raw status, got %d", c.status, c.body, f.origStatus)
+		}
+		if got := origStatusOf(f); got != c.status {
+			t.Errorf("status %d %q: origStatusOf=%d, want raw %d", c.status, c.body, got, c.status)
+		}
+	}
+}
+
+// statusField shows one number when nothing was masked, and orig->surfaced when a
+// transient cause was collapsed to the generic 503. origStatusOf falls back to the
+// classified status for faults that never had an HTTP status of their own.
+func TestStatusFieldAndOrigStatus(t *testing.T) {
+	if got := statusField(503, 503); got != "503" {
+		t.Errorf("equal: want 503, got %s", got)
+	}
+	if got := statusField(529, 503); got != "529->503" {
+		t.Errorf("masked: want 529->503, got %s", got)
+	}
+	if got := statusField(400, 0); got != "400" {
+		t.Errorf("no surface: want 400, got %s", got)
+	}
+	// transport/SSE faults carry no raw HTTP status; origStatusOf uses the classified one.
+	if got := origStatusOf(failure{status: 504, code: "deadline"}); got != 504 {
+		t.Errorf("synthetic fault: want 504, got %d", got)
 	}
 }
 

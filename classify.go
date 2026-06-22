@@ -17,6 +17,7 @@ type failure struct {
 	transient  bool   // true => eligible to convert into an SDK retry
 	fastRetry  bool   // true => one cheap proxy-local re-issue is OK
 	status     int    // HTTP status to surface downstream
+	origStatus int    // raw upstream HTTP status; 0 when no HTTP response (transport/SSE fault)
 	atype      string // Anthropic error type
 	code       string // short internal code (for logs / episode keying)
 	message    string
@@ -34,6 +35,29 @@ func msgFor(f failure) string {
 		return "cc-retry-proxy: upstream failure"
 	}
 	return "cc-retry-proxy: " + f.message
+}
+
+// statusField renders the upstream status for the logs, annotating the
+// client-facing surface status only when it differs. Every transient cause is
+// masked to a generic 503 (see surface), so "529->503" shows BOTH the true
+// upstream status and what Claude Code was actually told; an unmasked outcome
+// (e.g. a request-shape 400, or a 503 that was already 503) shows one number.
+func statusField(orig, surfaced int) string {
+	if surfaced == 0 || orig == surfaced {
+		return itoa(orig)
+	}
+	return itoa(orig) + "->" + itoa(surfaced)
+}
+
+// origStatusOf is the true upstream status for display: the raw HTTP status when
+// the upstream actually responded, else the classified status. A transient 4xx is
+// normalized to 502 in failure.status (so the SDK honors the retry), so reading
+// origStatus here is what keeps e.g. a retryable 401 logged as 401, not 502.
+func origStatusOf(f failure) int {
+	if f.origStatus != 0 {
+		return f.origStatus
+	}
+	return statusFor(f)
 }
 
 // Substrings that mark an error as REQUEST-SHAPE: the request itself can never
@@ -95,9 +119,18 @@ func classifyTransport(err error, ctx context.Context) failure {
 	}
 }
 
-// classifyHTTPError inspects a non-2xx upstream response. It reads (and drains)
-// a bounded prefix of the body; the caller still closes resp.Body.
+// classifyHTTPError inspects a non-2xx upstream response, tagging it with the raw
+// upstream status so logs keep the true status even when classifyHTTPErrorBody
+// normalizes failure.status (e.g. a retryable 4xx surfaced as 502).
 func classifyHTTPError(resp *http.Response) failure {
+	f := classifyHTTPErrorBody(resp)
+	f.origStatus = resp.StatusCode
+	return f
+}
+
+// classifyHTTPErrorBody is the body/header inspection; it reads (and drains) a
+// bounded prefix of the body; the caller still closes resp.Body.
+func classifyHTTPErrorBody(resp *http.Response) failure {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	body := strings.ToLower(string(b))
 	st := resp.StatusCode
