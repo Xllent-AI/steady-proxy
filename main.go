@@ -31,8 +31,14 @@
 //     truncated stream, mid-stream `error` event, or a retryable status) is
 //     turned into a *retryable* response: it stamps `x-should-retry: true` plus a
 //     `Retry-After` backoff, so Claude Code's own SDK retry loop waits and
-//     transparently re-sends. The client's maxRetries is the effective ceiling;
-//     PROXY_SDK_RETRY_CAP is only a backstop.
+//     transparently re-sends. The client's maxRetries is the effective ceiling
+//     (raise it with API_MAX_RETRIES); PROXY_SDK_RETRY_CAP is only a backstop.
+//   - Every retryable failure is surfaced as ONE generic shape — a plain `503`
+//     + `api_error` (see surface() in classify.go) — never its real identity
+//     like `overloaded_error`/529 or `rate_limit_error`/429. Claude Code handles
+//     those specific shapes on dedicated paths that ignore `x-should-retry` and
+//     give up after ~3 tries (e.g. "Repeated 529 Overloaded errors"); masking
+//     them as a generic 503 keeps every retry inside the SDK loop above.
 //   - Request-shape errors are passed through with `x-should-retry: false`, so
 //     they surface instead of looping forever.
 //
@@ -148,7 +154,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	reqStart := time.Now()
 	// Only POST /v1/messages gets the full transactional treatment. Everything
 	// else (e.g. /v1/messages/count_tokens, model listing) is forwarded with a
-	// single attempt; transport errors there are still converted to retryable.
+	// single attempt; transport errors AND upstream HTTP errors there are still
+	// converted to retryable and masked to a generic 503 (see proxyOnce).
 	body, tooBig, err := readBody(r)
 	if tooBig {
 		writeAnthropicError(w, false, http.StatusRequestEntityTooLarge, "invalid_request_error",
@@ -251,10 +258,15 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	if !canRetry {
 		tag = "FAIL" // surfaced to the user (request-shape, or retry backstop hit)
 	}
+	// surface() collapses every retryable failure to a generic 503+api_error so
+	// Claude Code can't recognize it as overloaded/rate-limit/timeout and bypass
+	// its x-should-retry loop. The log shows the surfaced status (what CC sees);
+	// last.code carries the true cause (e.g. sse_overloaded).
+	sStatus, sType := surface(last)
 	log.Printf("%-5s %s  %s (%d)  [transient=%v retry-after=%ds]  %s%s",
-		tag, who(r, body), last.code, statusFor(last), last.transient, retryAfter, since(reqStart), att(retryCount))
-	rec.note(tag, statusFor(last), last.code)
-	writeAnthropicError(w, canRetry, statusFor(last), last.atype, msgFor(last), retryAfter, last.code)
+		tag, who(r, body), last.code, sStatus, last.transient, retryAfter, since(reqStart), att(retryCount))
+	rec.note(tag, sStatus, last.code)
+	writeAnthropicError(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
 }
 
 // readBody reads the request body with a hard cap, reporting overflow rather
@@ -274,20 +286,42 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
 	defer cancel()
 	resp, _, err := roundTrip(ctx, r, body)
-	if err != nil {
-		f := classifyTransport(err, ctx)
+
+	// Surface transport faults AND upstream HTTP errors through the same
+	// retry-normalizing path the transactional route uses — so a non-transactional
+	// route (count_tokens, non-streaming /v1/messages, model listing) can't leak a
+	// recognizable overloaded_error/529 or rate_limit_error/429 that Claude Code
+	// would route into its give-up handler either. A 2xx still streams through below.
+	var f failure
+	failed := true
+	switch {
+	case err != nil:
+		f = classifyTransport(err, ctx)
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+		f = classifyHTTPError(resp)
+		resp.Body.Close()
+	default:
+		failed = false
+	}
+	if failed {
 		// Same one rule as the transactional path: retry transient faults within
 		// the backstop, with a Retry-After backoff so the client waits.
 		retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 		canRetry := f.transient && retryCount < cfg.sdkRetryCap
 		retryAfter := 0
+		if canRetry {
+			if retryAfter = f.retryAfter; retryAfter == 0 { // honor upstream Retry-After (e.g. 429)
+				retryAfter = retryAfterFor(retryCount)
+			}
+		}
 		tag := "FAIL"
 		if canRetry {
-			tag, retryAfter = "RETRY", retryAfterFor(retryCount)
+			tag = "RETRY"
 		}
-		log.Printf("%-5s %s  %d (%s)  %s%s", tag, r.URL.Path, statusFor(f), f.code, since(start), att(retryCount))
-		rec.note(tag, statusFor(f), f.code)
-		writeAnthropicError(w, canRetry, statusFor(f), f.atype, msgFor(f), retryAfter, f.code)
+		sStatus, sType := surface(f)
+		log.Printf("%-5s %s  %d (%s)  %s%s", tag, r.URL.Path, sStatus, f.code, since(start), att(retryCount))
+		rec.note(tag, sStatus, f.code)
+		writeAnthropicError(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
 	}
 	defer resp.Body.Close()

@@ -329,6 +329,14 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 			}
 		}
 		if *committed {
+			// Live mode: headers are already sent, so we can't convert to a
+			// retryable status — but never forward the raw special identity
+			// (overloaded_error / rate_limit_error). End the stream as a DROP so
+			// Claude Code's native truncated-stream retry takes over, and the
+			// access log keeps the true cause instead of a generic truncation.
+			if ev.name == "error" {
+				return true, classifySSEError(ev.data), true
+			}
 			w.Write(ev.raw)
 			flush()
 			val.accept(ev)

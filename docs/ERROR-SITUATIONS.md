@@ -15,9 +15,18 @@ surfaced (see the principle in `main.go`).
 Legend for "Proxy action":
 - **convert** → stamp `x-should-retry: true` (+ `Retry-After` backoff) so Claude
   Code's SDK re-sends.
-- **pass-retryable** → upstream is already a retryable status; forward + stamp.
 - **surface** → forward with `x-should-retry: false` (request-shape only — it can
   never succeed, so we don't loop).
+
+**Every retryable response is normalized to one generic shape — `503` +
+`api_error`** (`surface()` in `classify.go`) — *never* its real identity like
+`overloaded_error`/`529` or `rate_limit_error`/`429`. Claude Code handles those
+specific shapes on dedicated paths that **ignore `x-should-retry`** and give up
+after ~3 tries (e.g. `API Error: Repeated 529 Overloaded errors`, which never
+increments `X-Stainless-Retry-Count`). Masking them as a plain `503` keeps every
+retry inside the SDK loop the proxy drives — bounded by the client's own
+`maxRetries` (raise it with `API_MAX_RETRIES`). The true cause is preserved in
+the access-log `code` field (e.g. `sse_overloaded`), not the surfaced status.
 
 ## 1. Truncation / dropped stream  → convert (the primary target)
 
@@ -50,19 +59,22 @@ payload is invalid JSON — a gateway/shim serialization bug, not a cut.
 This is the edge case plain truncation-detection misses; the proxy validates the
 JSON of every data event (toggle: `PROXY_VALIDATE_JSON=0` to disable).
 
-## 3. Transient server errors  → pass-retryable / convert
+## 3. Transient server errors  → convert (normalized to a generic 503)
 
-Already-retryable upstream conditions. The proxy forwards them and (re)stamps
-`x-should-retry` so they keep retrying until the client's retry budget is spent.
+Already-retryable upstream conditions. The proxy stamps `x-should-retry` and
+surfaces them all as a generic `503` + `api_error` (never their real status/type),
+so they keep retrying inside Claude Code's SDK loop until the client's retry
+budget is spent. The `Status seen by upstream` column is what we classify and log
+via `code`; the client always sees `503`.
 
-| Real message | Status | Proxy action |
+| Real message | Status seen by upstream | Proxy action |
 |---|---|---|
-| `API Error: Repeated N Overloaded errors` / `The API is at capacity` | 529 | **pass-retryable** (`overloaded_error`) |
-| `API Error: N Internal server error` | 500 | **pass-retryable** |
-| `API Error: Server is temporarily limiting requests … Rate limited` | 429 | **pass-retryable**, preserve `Retry-After` |
-| `API Error: Request rejected (N) · temporary capacity issue` | 5xx | **pass-retryable** |
-| `cc-retry-proxy: No available providers` and similar capacity 5xx | 5xx | **pass-retryable** (the case this rewrite targets) |
-| mid-stream `event: error` with `overloaded_error` / `rate_limit_error` | after 200 | **convert** (mapped to pre-stream 529/429) |
+| `API Error: Repeated N Overloaded errors` / `The API is at capacity` | 529 | **convert** → `503` (was surfacing `overloaded_error`/529, which tripped CC's give-up path after ~3) |
+| `API Error: N Internal server error` | 500 | **convert** → `503` |
+| `API Error: Server is temporarily limiting requests … Rate limited` | 429 | **convert** → `503`, preserve `Retry-After` |
+| `API Error: Request rejected (N) · temporary capacity issue` | 5xx | **convert** → `503` |
+| `cc-retry-proxy: No available providers` and similar capacity 5xx | 5xx | **convert** → `503` |
+| mid-stream `event: error` with `overloaded_error` / `rate_limit_error` | after 200 | **convert** → `503` (classified 529/429 for logs, masked on the wire) |
 
 ## 4. Request-shape errors  → surface (the ONLY things we don't retry)
 

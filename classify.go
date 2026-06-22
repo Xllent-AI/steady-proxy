@@ -115,7 +115,7 @@ func classifyHTTPError(resp *http.Response) failure {
 	// Trust explicit signals first.
 	switch strings.ToLower(resp.Header.Get("x-gateway-retryable")) {
 	case "true":
-		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "gateway_retryable", message: ae.Error.Message, retryAfter: ra}
+		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "gateway_retryable_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
 	case "false":
 		return failure{transient: false, status: st, atype: atype, code: "gateway_permanent", message: ae.Error.Message, retryAfter: ra}
 	}
@@ -123,7 +123,7 @@ func classifyHTTPError(resp *http.Response) failure {
 	case "false":
 		return failure{transient: false, status: st, atype: atype, code: "upstream_no_retry", message: ae.Error.Message}
 	case "true":
-		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "upstream_retry", message: ae.Error.Message, retryAfter: ra}
+		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "upstream_retry_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
 	}
 
 	switch {
@@ -142,7 +142,7 @@ func classifyHTTPError(resp *http.Response) failure {
 		if anyContains(body, requestShapeSigs) {
 			return failure{transient: false, status: st, atype: atype, code: "request_shape", message: ae.Error.Message}
 		}
-		return failure{transient: true, status: 502, atype: "api_error", code: "retryable_4xx", message: ae.Error.Message, retryAfter: ra}
+		return failure{transient: true, status: 502, atype: "api_error", code: "retryable_4xx_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
 	}
 }
 
@@ -199,6 +199,31 @@ func typeFor5xx(st int) string {
 	default:
 		return "api_error"
 	}
+}
+
+// surface decides what status + error type the CLIENT sees — distinct from what
+// we classify and log. EVERY retryable failure is collapsed to one generic shape
+// (503 + api_error) so Claude Code cannot recognize a specific error identity and
+// route it into a status-specific handler that bypasses the x-should-retry SDK
+// loop and gives up after a few tries. The canonical case is overloaded_error/529:
+// Claude Code counts repeated overloaded responses on its own small fixed budget
+// (~3) and surfaces "Repeated 529 Overloaded errors" — ignoring x-should-retry and
+// never incrementing X-Stainless-Retry-Count. rate_limit_error/429 and
+// timeout_error/504 are the same hazard. A plain 503 + api_error + x-should-retry:true
+// + Retry-After looks like an ordinary retryable server error, so it goes through
+// Claude Code's normal SDK retry loop, whose ceiling is the client's own maxRetries
+// (raise it with API_MAX_RETRIES). The diagnostic cause is never lost — it stays in
+// failure.code (e.g. "sse_overloaded", "rate_limit") for the access log.
+//
+// Request-shape and other non-transient failures keep their real status + type, so
+// they surface accurately with x-should-retry:false instead of looping forever.
+const retryableSurfaceStatus = http.StatusServiceUnavailable // 503
+
+func surface(f failure) (status int, atype string) {
+	if f.transient {
+		return retryableSurfaceStatus, "api_error"
+	}
+	return statusFor(f), f.atype
 }
 
 // writeAnthropicError emits a clean Anthropic-shaped error with the retry signal.

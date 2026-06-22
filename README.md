@@ -38,8 +38,14 @@ is ridden out, not surfaced.
   truncated stream, a mid-stream `error` event, any retryable status — is
   converted into a *retryable* response by stamping **`x-should-retry: true`**
   plus a **`Retry-After` backoff** (exponential, capped ~30 s; the SDK waits then
-  re-sends using Claude Code's own retry loop). Retryable `4xx` are normalized to
-  `502` so the SDK always honors the retry.
+  re-sends using Claude Code's own retry loop).
+- Every retryable response is **normalized to one generic shape — `503` +
+  `api_error`** — never its real identity like `overloaded_error`/`529` or
+  `rate_limit_error`/`429`. Claude Code handles those specific shapes on dedicated
+  paths that **ignore `x-should-retry`** and give up after ~3 tries (e.g.
+  `Repeated 529 Overloaded errors`, which never increments the retry counter);
+  masking them as a plain `503` keeps every retry inside the SDK loop above. The
+  true cause is preserved in the access-log `code` (e.g. `sse_overloaded`).
 - **Request-shape** errors pass through with **`x-should-retry: false`** so they
   surface instead of looping forever.
 - The **retry budget** is driven by the SDK's own `X-Stainless-Retry-Count`; the
@@ -160,8 +166,8 @@ extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
    (timestamp prefix elided on the lines below for readability)
-RETRY claude-sonnet-4-6/main  truncated_stream (502)  [transient=true retry-after=2s]  0.9s
-RETRY claude-haiku-4-5/main   http_529 (529)  [transient=true retry-after=4s]  0.2s  attempt=1
+RETRY claude-sonnet-4-6/main  truncated_stream (503)  [transient=true retry-after=2s]  0.9s
+RETRY claude-haiku-4-5/main   sse_overloaded (503)  [transient=true retry-after=4s]  0.2s  attempt=1
 FAIL  claude-sonnet-4-6/main  request_shape (400)  [transient=false retry-after=0s]  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
 OK    /v1/messages/count_tokens  200  730B  2ms
@@ -179,8 +185,12 @@ Reading a line:
 - **`model/agent`** — the model called, and whether the caller is the `main` agent
   or a spawned `sub`agent.
 - Then only what varies: **`in=/out=` tokens**, **stop reason**, **`buffered`/`live`**
-  capture mode, and **duration**. Failures add the upstream **code (status)** plus a
+  capture mode, and **duration**. Failures add the **`code` (status)** plus a
   `[transient=… retry-after=…]` diagnostic; **`attempt=N`** shows only after a retry.
+  The **`code`** is the true cause (`sse_overloaded`, `http_529`, `truncated_stream`);
+  the **`(status)`** is what the client receives — always `503` for a retry (every
+  transient cause is masked to a generic `503`; see [normalization](#what-it-does)),
+  the real status only for a surfaced `FAIL`.
 
 Responses also carry headers: `X-CC-Retry-Proxy-Mode` (`buffered`/`live`) on
 success, `X-CC-Retry-Proxy-Reason` on a synthesized error.

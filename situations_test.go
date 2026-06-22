@@ -74,6 +74,35 @@ func TestClassifyRealMessages(t *testing.T) {
 	}
 }
 
+// §3: every retryable failure must reach Claude Code as ONE generic shape (503 +
+// api_error), never a recognizable identity like overloaded_error/529 or
+// rate_limit_error/429 that CC routes into a status-specific give-up path (e.g.
+// "Repeated 529 Overloaded errors"). The diagnostic cause stays in .code.
+func TestSurfaceNormalizesTransient(t *testing.T) {
+	transient := []failure{
+		{transient: true, status: 529, atype: "overloaded_error", code: "sse_overloaded"},
+		{transient: true, status: 429, atype: "rate_limit_error", code: "rate_limit"},
+		{transient: true, status: 504, atype: "timeout_error", code: "deadline"},
+		{transient: true, status: 502, atype: "api_error", code: "transport_error"},
+		{transient: true, status: 500, atype: "api_error", code: "http_500"},
+	}
+	for _, f := range transient {
+		if st, at := surface(f); st != 503 || at != "api_error" {
+			t.Errorf("surface(%s/%d) = (%d,%q), want (503,\"api_error\")", f.code, f.status, st, at)
+		}
+	}
+	// Request-shape (non-transient) keeps its real status + type so it surfaces.
+	shape := failure{status: 400, atype: "invalid_request_error", code: "request_shape"}
+	if st, at := surface(shape); st != 400 || at != "invalid_request_error" {
+		t.Errorf("surface(shape) = (%d,%q), want (400,\"invalid_request_error\")", st, at)
+	}
+	// client_gone stays 499 (non-transient) so the access log keeps that signal.
+	gone := failure{status: 499, atype: "api_error", code: "client_gone"}
+	if st, _ := surface(gone); st != 499 {
+		t.Errorf("surface(client_gone) status = %d, want 499", st)
+	}
+}
+
 // gapReader yields chunks with a delay before each, and aborts (returns the
 // context error) if the context is cancelled during a gap — mimicking the
 // transport closing when the proxy's idle watchdog fires.
@@ -149,6 +178,34 @@ func TestKeepaliveCommitThenLive(t *testing.T) {
 	}
 	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "live" {
 		t.Fatalf("want live mode header, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	}
+}
+
+// §6: once committed to live mode, a late mid-stream overloaded_error must NOT be
+// forwarded raw (it would re-introduce the very identity CC gives up on). The
+// proxy ends the stream as a DROP so CC's native truncated-stream retry kicks in,
+// and the access log keeps the true cause.
+func TestLiveModeErrorNotForwardedRaw(t *testing.T) {
+	cfg = loadConfig()
+	cfg.keepaliveMs = 60 * time.Millisecond
+	cfg.upstreamByteIdle = 3 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	// message_start commits on the keepalive tick; the error arrives after, in live mode.
+	r := &gapReader{ctx: ctx, chunks: []string{
+		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+	}, gap: 120 * time.Millisecond}
+	wrote, f := captureSSE(ctx, cancel, rec, http.Header{}, r, nil)
+	if !wrote {
+		t.Fatalf("expected commit (live) before the error; wrote=false fail=%+v", f)
+	}
+	if f == nil || f.code != "sse_overloaded" {
+		t.Fatalf("want post-commit failure sse_overloaded, got %+v", f)
+	}
+	if strings.Contains(rec.Body.String(), "overloaded_error") {
+		t.Fatalf("raw overloaded_error must not be forwarded in live mode: %q", rec.Body.String())
 	}
 }
 
