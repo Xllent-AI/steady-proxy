@@ -26,7 +26,10 @@ func TestMalformedJSONEventConverts(t *testing.T) {
 // succeed as written. §3: everything else is retried, including auth/billing and
 // transient statuses (blind-stabilizer policy).
 func TestClassifyRealMessages(t *testing.T) {
-	perm := []struct{ status int; body string }{
+	perm := []struct {
+		status int
+		body   string
+	}{
 		{400, `{"error":{"type":"invalid_request_error","message":"Missing Tool Result Block"}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"duplicate tool_use ID in conversation history"}}`},
 		{400, `{"error":{"type":"invalid_request_error","message":"unexpected tool_use_id found in tool_result blocks"}}`},
@@ -45,7 +48,10 @@ func TestClassifyRealMessages(t *testing.T) {
 		}
 	}
 
-	trans := []struct{ status int; body string }{
+	trans := []struct {
+		status int
+		body   string
+	}{
 		{529, `{"error":{"type":"overloaded_error","message":"Overloaded"}}`},
 		{500, `{"error":{"type":"api_error","message":"Internal server error"}}`},
 		{429, `{"error":{"type":"rate_limit_error","message":"Server is temporarily limiting requests"}}`},

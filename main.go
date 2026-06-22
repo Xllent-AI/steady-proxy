@@ -34,7 +34,7 @@
 //     transparently re-sends. The client's maxRetries is the effective ceiling
 //     (raise it with API_MAX_RETRIES); PROXY_SDK_RETRY_CAP is only a backstop.
 //   - Every retryable failure is surfaced as ONE generic shape — a plain `503`
-//     + `api_error` (see surface() in classify.go) — never its real identity
+//     with `api_error` (see surface() in classify.go) — never its real identity
 //     like `overloaded_error`/529 or `rate_limit_error`/429. Claude Code handles
 //     those specific shapes on dedicated paths that ignore `x-should-retry` and
 //     give up after ~3 tries (e.g. "Repeated 529 Overloaded errors"); masking

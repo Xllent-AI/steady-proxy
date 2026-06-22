@@ -184,7 +184,9 @@ func (v *streamValidator) accept(ev event) {
 	}
 }
 
-func (v *streamValidator) terminal() bool { return v.sawStart && v.sawStop && v.open == 0 && !v.invalid }
+func (v *streamValidator) terminal() bool {
+	return v.sawStart && v.sawStop && v.open == 0 && !v.invalid
+}
 
 // captureStats collects human-friendly facts about a streamed response so the
 // caller can log one access-log line per request. All fields are best-effort.
