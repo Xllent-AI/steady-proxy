@@ -112,6 +112,44 @@ data: {"type":"message_stop"}
 	}
 }
 
+func TestCaptureStatsGPTUsageFromMessageDelta(t *testing.T) {
+	const stream = `event: message_start
+data: {"type":"message_start","message":{"id":"resp_1","model":"gpt-5.5","usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":574,"cache_creation_input_tokens":10,"cache_read_input_tokens":24576,"output_tokens":12376}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	var st captureStats
+	if _, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(stream), &st); f != nil {
+		t.Fatalf("expected success, got %+v", *f)
+	}
+	if st.model != "gpt-5.5" {
+		t.Errorf("model = %q, want gpt-5.5", st.model)
+	}
+	if st.inTok != 25160 || st.outTok != 12376 {
+		t.Errorf("tokens in/out = %d/%d, want 25160/12376", st.inTok, st.outTok)
+	}
+	if st.stop != "end_turn" {
+		t.Errorf("stop = %q, want end_turn", st.stop)
+	}
+}
+
 func TestCaptureTruncated(t *testing.T) {
 	trunc := goodStream[:strings.Index(goodStream, "content_block_stop")]
 	_, f := capture(t, trunc)

@@ -184,8 +184,9 @@ Reading a line:
   takes over.
 - **`model/agent`** — the model called, and whether the caller is the `main` agent
   or a spawned `sub`agent.
-- Then only what varies: **`in=/out=` tokens**, **stop reason**, **`buffered`/`live`**
-  capture mode, and **duration**. Failures add the **`code`** and **`status`**, plus
+- Then only what varies: **`in=/out=` tokens** (`in` includes cache read/create
+  input tokens), **stop reason**, **`buffered`/`live`** capture mode, and
+  **duration**. Failures add the **`code`** and **`status`**, plus
   **`retry-after=Ns`** on a RETRY and **`attempt=N`** after a retry. The **`code`** is
   the true cause (`sse_overloaded`, `truncated_stream`, …). The **`status`** is the
   real upstream status; when it was masked it reads **`orig->surfaced`**

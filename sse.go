@@ -193,7 +193,7 @@ func (v *streamValidator) terminal() bool {
 type captureStats struct {
 	mode    string    // "buffered" | "live" | "" (never committed any bytes)
 	bytes   int64     // SSE bytes of the response
-	inTok   int       // usage.input_tokens (from message_start)
+	inTok   int       // total input tokens incl. cache read/create (latest usage event)
 	outTok  int       // usage.output_tokens (from message_delta)
 	stop    string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
 	model   string    // resolved model echoed back by the upstream
@@ -379,20 +379,22 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 	return false, nil, false
 }
 
-// scrapeUsage pulls the friendly numbers out of the two events that carry them.
+// scrapeUsage pulls the friendly numbers out of the events that carry them.
 // Best-effort: any parse failure is silently ignored (logging must never break a
 // stream). Data here is already JSON-validated on the uncommitted path.
 func scrapeUsage(ev event, st *captureStats) {
 	switch ev.name {
 	case "message_start":
-		// input_tokens + the resolved model. NOTE: output_tokens here is a
+		// input tokens + the resolved model. NOTE: output_tokens here is a
 		// non-authoritative placeholder (usually 1) — the real count arrives in
 		// message_delta, so we deliberately do NOT read it here.
 		var m struct {
 			Message struct {
 				Model string `json:"model"`
 				Usage struct {
-					Input int `json:"input_tokens"`
+					Input         int `json:"input_tokens"`
+					CacheCreation int `json:"cache_creation_input_tokens"`
+					CacheRead     int `json:"cache_read_input_tokens"`
 				} `json:"usage"`
 			} `json:"message"`
 		}
@@ -400,20 +402,29 @@ func scrapeUsage(ev event, st *captureStats) {
 			if m.Message.Model != "" {
 				st.model = m.Message.Model
 			}
-			if m.Message.Usage.Input > 0 {
-				st.inTok = m.Message.Usage.Input
+			if in := totalInputTokens(m.Message.Usage.Input, m.Message.Usage.CacheCreation, m.Message.Usage.CacheRead); in > 0 {
+				st.inTok = in
 			}
 		}
 	case "message_delta":
 		var d struct {
 			Usage struct {
-				Output int `json:"output_tokens"`
+				Input         int `json:"input_tokens"`
+				CacheCreation int `json:"cache_creation_input_tokens"`
+				CacheRead     int `json:"cache_read_input_tokens"`
+				Output        int `json:"output_tokens"`
 			} `json:"usage"`
 			Delta struct {
 				Stop string `json:"stop_reason"`
 			} `json:"delta"`
 		}
 		if json.Unmarshal([]byte(ev.data), &d) == nil {
+			// Some Anthropic-compatible gateways put the authoritative input usage
+			// on message_delta rather than message_start. Prefer the latest non-zero
+			// total so GPT-routed streams do not log "in=0".
+			if in := totalInputTokens(d.Usage.Input, d.Usage.CacheCreation, d.Usage.CacheRead); in > 0 {
+				st.inTok = in
+			}
 			if d.Usage.Output > 0 {
 				st.outTok = d.Usage.Output
 			}
@@ -422,6 +433,10 @@ func scrapeUsage(ev event, st *captureStats) {
 			}
 		}
 	}
+}
+
+func totalInputTokens(input, cacheCreation, cacheRead int) int {
+	return input + cacheCreation + cacheRead
 }
 
 func onReadErr(err error, ctx context.Context, committed bool, flush func()) (bool, *failure) {
