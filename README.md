@@ -186,7 +186,10 @@ Reading a line:
   or a spawned `sub`agent.
 - Then only what varies: **`in=/out=` tokens** (`in` includes cache read/create
   input tokens), **stop reason**, **`buffered`/`live`** capture mode, and
-  **duration**. Failures add the **`code`** and **`status`**, plus
+  **duration**. Buffered GPT-compatible streams also normalize final input/cache
+  usage into the replayed `message_start` event when the upstream sent zero
+  placeholders there, leaving `message_delta` to carry output usage. Failures add
+  the **`code`** and **`status`**, plus
   **`retry-after=Ns`** on a RETRY and **`attempt=N`** after a retry. The **`code`** is
   the true cause (`sse_overloaded`, `truncated_stream`, …). The **`status`** is the
   real upstream status; when it was masked it reads **`orig->surfaced`**

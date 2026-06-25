@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -148,6 +149,58 @@ data: {"type":"message_stop"}
 	if st.stop != "end_turn" {
 		t.Errorf("stop = %q, want end_turn", st.stop)
 	}
+	usage := messageStartUsage(t, rec.Body.String())
+	if usage.Input != 574 || usage.CacheCreation != 10 || usage.CacheRead != 24576 {
+		t.Errorf("replayed message_start usage = %d/%d/%d, want 574/10/24576",
+			usage.Input, usage.CacheCreation, usage.CacheRead)
+	}
+	deltaUsage := messageDeltaUsage(t, rec.Body.String())
+	assertNoInputUsage(t, deltaUsage)
+	if got := int(deltaUsage["output_tokens"].(float64)); got != 12376 {
+		t.Errorf("message_delta output_tokens = %d, want 12376", got)
+	}
+}
+
+func TestCaptureStatsGPTMiniUsageBackfill(t *testing.T) {
+	const stream = `event: message_start
+data: {"type":"message_start","message":{"id":"resp_1","model":"gpt-5.4-mini-2026-03-17","usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":5784,"cache_creation_input_tokens":0,"cache_read_input_tokens":117760,"output_tokens":7916}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	var st captureStats
+	if _, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(stream), &st); f != nil {
+		t.Fatalf("expected success, got %+v", *f)
+	}
+	if st.inTok != 123544 || st.outTok != 7916 {
+		t.Errorf("tokens in/out = %d/%d, want 123544/7916", st.inTok, st.outTok)
+	}
+	usage := messageStartUsage(t, rec.Body.String())
+	if usage.Input != 5784 || usage.CacheCreation != 0 || usage.CacheRead != 117760 {
+		t.Errorf("replayed message_start usage = %d/%d/%d, want 5784/0/117760",
+			usage.Input, usage.CacheCreation, usage.CacheRead)
+	}
+	deltaUsage := messageDeltaUsage(t, rec.Body.String())
+	assertNoInputUsage(t, deltaUsage)
+	if got := int(deltaUsage["output_tokens"].(float64)); got != 7916 {
+		t.Errorf("message_delta output_tokens = %d, want 7916", got)
+	}
 }
 
 func TestCaptureTruncated(t *testing.T) {
@@ -225,4 +278,59 @@ func (o *oneByte) Read(p []byte) (int, error) {
 	p[0] = o.s[o.i]
 	o.i++
 	return 1, nil
+}
+
+type testUsage struct {
+	Input         int `json:"input_tokens"`
+	CacheCreation int `json:"cache_creation_input_tokens"`
+	CacheRead     int `json:"cache_read_input_tokens"`
+}
+
+func messageStartUsage(t *testing.T, body string) testUsage {
+	t.Helper()
+	var parser sseParser
+	for _, ev := range parser.feed([]byte(body)) {
+		if ev.name != "message_start" {
+			continue
+		}
+		var m struct {
+			Message struct {
+				Usage testUsage `json:"usage"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(ev.data), &m); err != nil {
+			t.Fatalf("message_start JSON: %v", err)
+		}
+		return m.Message.Usage
+	}
+	t.Fatalf("message_start not found in %q", body)
+	return testUsage{}
+}
+
+func messageDeltaUsage(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var parser sseParser
+	for _, ev := range parser.feed([]byte(body)) {
+		if ev.name != "message_delta" {
+			continue
+		}
+		var m struct {
+			Usage map[string]any `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(ev.data), &m); err != nil {
+			t.Fatalf("message_delta JSON: %v", err)
+		}
+		return m.Usage
+	}
+	t.Fatalf("message_delta not found in %q", body)
+	return nil
+}
+
+func assertNoInputUsage(t *testing.T, usage map[string]any) {
+	t.Helper()
+	for _, key := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		if _, ok := usage[key]; ok {
+			t.Fatalf("message_delta still contains %s in %#v", key, usage)
+		}
+	}
 }

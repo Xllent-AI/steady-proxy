@@ -52,6 +52,21 @@ func (s *spool) write(p []byte) error {
 }
 
 func (s *spool) replay(w io.Writer) error {
+	return s.replayWithUsage(w, nil)
+}
+
+func (s *spool) replayWithUsage(w io.Writer, st *captureStats) error {
+	if st == nil || !st.shouldBackfillMessageStartUsage() {
+		return s.replayRaw(w)
+	}
+	r, err := s.reader()
+	if err != nil {
+		return err
+	}
+	return replayWithUsageBackfill(r, w, st)
+}
+
+func (s *spool) replayRaw(w io.Writer) error {
 	if !s.spilled {
 		_, err := w.Write(s.mem.Bytes())
 		return err
@@ -61,6 +76,16 @@ func (s *spool) replay(w io.Writer) error {
 	}
 	_, err := io.Copy(w, s.f)
 	return err
+}
+
+func (s *spool) reader() (io.Reader, error) {
+	if !s.spilled {
+		return bytes.NewReader(s.mem.Bytes()), nil
+	}
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return s.f, nil
 }
 
 func (s *spool) discard() {
@@ -191,13 +216,20 @@ func (v *streamValidator) terminal() bool {
 // captureStats collects human-friendly facts about a streamed response so the
 // caller can log one access-log line per request. All fields are best-effort.
 type captureStats struct {
-	mode    string    // "buffered" | "live" | "" (never committed any bytes)
-	bytes   int64     // SSE bytes of the response
-	inTok   int       // total input tokens incl. cache read/create (latest usage event)
-	outTok  int       // usage.output_tokens (from message_delta)
-	stop    string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
-	model   string    // resolved model echoed back by the upstream
-	respTee io.Writer // optional: when set, every raw response event is teed here (request-log)
+	mode                  string    // "buffered" | "live" | "" (never committed any bytes)
+	bytes                 int64     // SSE bytes of the response
+	inTok                 int       // total input tokens incl. cache read/create (latest usage event)
+	inputTok              int       // usage.input_tokens component of inTok
+	cacheCreationTok      int       // usage.cache_creation_input_tokens component of inTok
+	cacheReadTok          int       // usage.cache_read_input_tokens component of inTok
+	startInputTok         int       // message_start usage.input_tokens
+	startCacheCreationTok int       // message_start usage.cache_creation_input_tokens
+	startCacheReadTok     int       // message_start usage.cache_read_input_tokens
+	deltaInputUsage       bool      // message_delta carried authoritative input usage
+	outTok                int       // usage.output_tokens (from message_delta)
+	stop                  string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
+	model                 string    // resolved model echoed back by the upstream
+	respTee               io.Writer // optional: when set, every raw response event is teed here (request-log)
 }
 
 // ------------------------------------------------------------- captureSSE ---
@@ -370,7 +402,10 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 		}
 		if val.terminal() {
 			writeHead("buffered")
-			sp.replay(w)
+			if err := sp.replayWithUsage(w, st); err != nil {
+				sp.discard()
+				return true, &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}, true
+			}
 			flush()
 			sp.discard()
 			return true, nil, true
@@ -402,9 +437,10 @@ func scrapeUsage(ev event, st *captureStats) {
 			if m.Message.Model != "" {
 				st.model = m.Message.Model
 			}
-			if in := totalInputTokens(m.Message.Usage.Input, m.Message.Usage.CacheCreation, m.Message.Usage.CacheRead); in > 0 {
-				st.inTok = in
-			}
+			st.startInputTok = m.Message.Usage.Input
+			st.startCacheCreationTok = m.Message.Usage.CacheCreation
+			st.startCacheReadTok = m.Message.Usage.CacheRead
+			st.setInputUsage(m.Message.Usage.Input, m.Message.Usage.CacheCreation, m.Message.Usage.CacheRead)
 		}
 	case "message_delta":
 		var d struct {
@@ -423,7 +459,8 @@ func scrapeUsage(ev event, st *captureStats) {
 			// on message_delta rather than message_start. Prefer the latest non-zero
 			// total so GPT-routed streams do not log "in=0".
 			if in := totalInputTokens(d.Usage.Input, d.Usage.CacheCreation, d.Usage.CacheRead); in > 0 {
-				st.inTok = in
+				st.deltaInputUsage = true
+				st.setInputUsage(d.Usage.Input, d.Usage.CacheCreation, d.Usage.CacheRead)
 			}
 			if d.Usage.Output > 0 {
 				st.outTok = d.Usage.Output
@@ -435,8 +472,119 @@ func scrapeUsage(ev event, st *captureStats) {
 	}
 }
 
+func (st *captureStats) setInputUsage(input, cacheCreation, cacheRead int) {
+	if totalInputTokens(input, cacheCreation, cacheRead) <= 0 {
+		return
+	}
+	st.inputTok = input
+	st.cacheCreationTok = cacheCreation
+	st.cacheReadTok = cacheRead
+	st.inTok = totalInputTokens(input, cacheCreation, cacheRead)
+}
+
+func (st *captureStats) shouldBackfillMessageStartUsage() bool {
+	if st == nil || !st.deltaInputUsage || st.inTok <= 0 {
+		return false
+	}
+	return st.startInputTok != st.inputTok ||
+		st.startCacheCreationTok != st.cacheCreationTok ||
+		st.startCacheReadTok != st.cacheReadTok
+}
+
 func totalInputTokens(input, cacheCreation, cacheRead int) int {
 	return input + cacheCreation + cacheRead
+}
+
+func replayWithUsageBackfill(r io.Reader, w io.Writer, st *captureStats) error {
+	parser := &sseParser{}
+	buf := make([]byte, 32*1024)
+	startPatched := false
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			for _, ev := range parser.feed(buf[:n]) {
+				if !startPatched && ev.name == "message_start" {
+					raw, ok := backfillMessageStartUsage(ev, st)
+					if ok {
+						if _, err := w.Write(raw); err != nil {
+							return err
+						}
+						startPatched = true
+						continue
+					}
+				}
+				if ev.name == "message_delta" {
+					raw, ok := stripMessageDeltaInputUsage(ev)
+					if ok {
+						if _, err := w.Write(raw); err != nil {
+							return err
+						}
+						continue
+					}
+				}
+				if _, err := w.Write(ev.raw); err != nil {
+					return err
+				}
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func backfillMessageStartUsage(ev event, st *captureStats) ([]byte, bool) {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(ev.data), &root); err != nil {
+		return nil, false
+	}
+	msg, ok := root["message"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	usage, ok := msg["usage"].(map[string]any)
+	if !ok {
+		usage = map[string]any{}
+		msg["usage"] = usage
+	}
+	usage["input_tokens"] = st.inputTok
+	usage["cache_creation_input_tokens"] = st.cacheCreationTok
+	usage["cache_read_input_tokens"] = st.cacheReadTok
+
+	data, err := json.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return []byte("event: message_start\ndata: " + string(data) + "\n\n"), true
+}
+
+func stripMessageDeltaInputUsage(ev event) ([]byte, bool) {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(ev.data), &root); err != nil {
+		return nil, false
+	}
+	usage, ok := root["usage"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	changed := false
+	for _, key := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		if _, ok := usage[key]; ok {
+			delete(usage, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+	data, err := json.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return []byte("event: message_delta\ndata: " + string(data) + "\n\n"), true
 }
 
 func onReadErr(err error, ctx context.Context, committed bool, flush func()) (bool, *failure) {
