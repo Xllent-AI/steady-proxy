@@ -57,16 +57,17 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 
 // reqRecorder accumulates one request/response for later writing by finish().
 type reqRecorder struct {
-	when        time.Time
-	method      string
-	path        string
-	query       string
-	who         string
-	reqHeaders  http.Header
-	reqBody     []byte
-	respHeaders http.Header
-	resp        cappedBuffer
-	stats       *captureStats // optional: token/stop/mode summary for the SSE path
+	when         time.Time
+	method       string
+	path         string
+	query        string
+	who          string
+	reqHeaders   http.Header
+	reqBody      []byte
+	respHeaders  http.Header
+	resp         cappedBuffer
+	stats        *captureStats // optional: token/stop/mode summary for the SSE path
+	proxyRetries int
 
 	// outcome, set once at the terminal log site via note().
 	outcome    string
@@ -94,6 +95,22 @@ func (rec *reqRecorder) respWriter() io.Writer {
 		return nil
 	}
 	return &rec.resp
+}
+
+func (rec *reqRecorder) resetResponse() {
+	if rec == nil {
+		return
+	}
+	rec.respHeaders = nil
+	rec.resp = cappedBuffer{max: requestLogCap()}
+	rec.stats = nil
+}
+
+func (rec *reqRecorder) noteProxyRetries(n int) {
+	if rec == nil {
+		return
+	}
+	rec.proxyRetries = n
 }
 
 // note records the final outcome (mirrors the one-line access log). orig is the
@@ -153,7 +170,8 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	writeCapped(w, rec.reqBody, requestLogCap())
 
 	fmt.Fprintln(w, "\n=== RESPONSE ===")
-	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s\n", dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code))
+	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s%s\n",
+		dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code), proxyRetryField(rec.proxyRetries))
 	if st := rec.stats; st != nil {
 		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   dur=%s\n",
 			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), since(rec.when))

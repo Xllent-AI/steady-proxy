@@ -25,9 +25,10 @@ is ridden out, not surfaced.
 
 > Trade-off: a genuinely bad API key / exhausted billing now surfaces **late**
 > (after the retry budget) instead of failing fast. That's the accepted cost of
-> maximum steadiness. The effective retry ceiling is your **client's**
-> `maxRetries` (e.g. `API_MAX_RETRIES=30`); `PROXY_SDK_RETRY_CAP` is only a
-> backstop.
+> maximum steadiness. Claude Code 2.1.191 defaults to 10 retries and clamps
+> `CLAUDE_CODE_MAX_RETRIES` to **15**; `PROXY_SDK_RETRY_CAP` is only a backstop.
+> To amplify retry budget beyond the client clamp, opt in with
+> `PROXY_TRANSACTIONAL_LOCAL_RETRIES`.
 
 ## What it does
 
@@ -35,8 +36,9 @@ is ridden out, not surfaced.
   validates the *entire* Anthropic SSE stream and only writes `200 OK` +
   replays it once a complete, valid `message_stop` is captured.
 - Any failure **before** that commit point — connection error, 5xx, a stalled or
-  truncated stream, a mid-stream `error` event, any retryable status — is
-  converted into a *retryable* response by stamping **`x-should-retry: true`**
+  truncated stream, a mid-stream `error` event, any retryable status — is either
+  retried inside the proxy when `PROXY_TRANSACTIONAL_LOCAL_RETRIES` is enabled,
+  or converted into a *retryable* response by stamping **`x-should-retry: true`**
   plus a **`Retry-After` backoff** (exponential, capped ~30 s; the SDK waits then
   re-sends using Claude Code's own retry loop).
 - Every retryable response is **normalized to one generic shape — `503` +
@@ -48,11 +50,16 @@ is ridden out, not surfaced.
   true cause is preserved in the access-log `code` (e.g. `sse_overloaded`).
 - **Request-shape** errors pass through with **`x-should-retry: false`** so they
   surface instead of looping forever.
-- The **retry budget** is driven by the SDK's own `X-Stainless-Retry-Count`; the
-  client's `maxRetries` is the real ceiling and `PROXY_SDK_RETRY_CAP` is a
-  backstop (`0` disables conversion entirely). There is **no circuit breaker** —
-  a blind stabilizer never blocks the client; the `Retry-After` backoff is what
-  prevents a tight hammer loop.
+- The **client retry budget** is driven by the SDK's own
+  `X-Stainless-Retry-Count`; `PROXY_SDK_RETRY_CAP` is a backstop (`0` disables
+  conversion entirely). For extra budget under Claude Code's 15-retry clamp, set
+  `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N`: effective transactional upstream
+  attempts are `(client retries + 1) * (N + 1)`, as long as the proxy has not
+  committed bytes to the client. Hidden proxy retries wait for upstream
+  `Retry-After` **plus** an extra exponential delay capped by
+  `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` (default 10 s). There is **no circuit
+  breaker** — a blind stabilizer never blocks the client; backoff prevents a
+  tight hammer loop.
 - **Long generations (tuned for turns up to ~600 s):** Claude aborts any request
   that reaches its response-header ceiling with no bytes — **default 60 s**
   (`CLAUDE_CODE_CONNECT_TIMEOUT_MS`, measured; `API_FORCE_IDLE_TIMEOUT=0` does
@@ -168,6 +175,7 @@ extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
    (timestamp prefix elided on the lines below for readability)
 RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
+OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
 OK    /v1/messages/count_tokens  200  730B  2ms
@@ -190,9 +198,11 @@ Reading a line:
   usage into the replayed `message_start` event when the upstream sent zero
   placeholders there, leaving `message_delta` to carry output usage. Failures add
   the **`code`** and **`status`**, plus
-  **`retry-after=Ns`** on a RETRY and **`attempt=N`** after a retry. The **`code`** is
-  the true cause (`sse_overloaded`, `truncated_stream`, …). The **`status`** is the
-  real upstream status; when it was masked it reads **`orig->surfaced`**
+  **`retry-after=Ns`** on a RETRY, **`attempt=N`** after a Claude Code retry, and
+  **`proxy-retries=N`** when the proxy recovered or exhausted hidden local
+  transactional retries. The **`code`** is the true cause (`sse_overloaded`,
+  `truncated_stream`, …). The **`status`** is the real upstream status; when it
+  was masked it reads **`orig->surfaced`**
   (e.g. `529->503`) — left of the arrow is what the upstream returned, right is what
   the client receives (every transient cause is masked to a generic `503`; see
   [normalization](#what-it-does)). A single number means it was not masked (a `503`
@@ -216,7 +226,9 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 |---|---|---|
 | `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
 | `PROXY_UPSTREAM_URL` | `https://your-gateway.example.com` | the real gateway (set via `.env`) |
-| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). Your client's `maxRetries` is the real ceiling; raise that, not this |
+| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). Claude Code still has its own retry cap |
+| `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional `/v1/messages` attempt. `1` means one extra upstream try before returning a retryable response to Claude Code |
+| `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON validation (catches malformed `data:` events); `0` to disable |

@@ -24,9 +24,17 @@ Legend for "Proxy action":
 specific shapes on dedicated paths that **ignore `x-should-retry`** and give up
 after ~3 tries (e.g. `API Error: Repeated 529 Overloaded errors`, which never
 increments `X-Stainless-Retry-Count`). Masking them as a plain `503` keeps every
-retry inside the SDK loop the proxy drives — bounded by the client's own
-`maxRetries` (raise it with `API_MAX_RETRIES`). The true cause is preserved in
-the access-log `code` field (e.g. `sse_overloaded`), not the surfaced status.
+retry inside the SDK loop the proxy drives. Claude Code 2.1.191 defaults to 10
+retries and clamps `CLAUDE_CODE_MAX_RETRIES` to **15**; to amplify beyond that,
+set `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N`. The effective uncommitted
+transactional upstream attempt ceiling is `(client retries + 1) * (N + 1)`.
+The true cause is preserved in the access-log `code` field (e.g.
+`sse_overloaded`), not the surfaced status.
+
+When hidden transactional retries are enabled, the proxy waits before reissuing
+the upstream request. If the upstream supplied `Retry-After`, that wait is
+`Retry-After` plus the proxy's extra exponential delay, capped by
+`PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` (default 10 s).
 
 ## 1. Truncation / dropped stream  → convert (the primary target)
 

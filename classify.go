@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"time"
 )
 
 var errTooLarge = errors.New("response too large to buffer")
@@ -134,7 +135,7 @@ func classifyHTTPErrorBody(resp *http.Response) failure {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	body := strings.ToLower(string(b))
 	st := resp.StatusCode
-	ra := atoiSafe(resp.Header.Get("Retry-After"))
+	ra := retryAfterSeconds(resp.Header.Get("Retry-After"))
 
 	var ae struct {
 		Error struct{ Type, Message string } `json:"error"`
@@ -215,6 +216,25 @@ func retryAfterFor(retryCount int) int {
 		secs = 30
 	}
 	return secs + rand.Intn(2) // +0..1s jitter
+}
+
+func retryAfterSeconds(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n := atoiSafe(v); n > 0 {
+		return n
+	}
+	t, err := time.Parse(http.TimeFormat, v)
+	if err != nil {
+		return 0
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return 0
+	}
+	return int((d + time.Second - 1) / time.Second)
 }
 
 func mapTransientStatus(st int) int {

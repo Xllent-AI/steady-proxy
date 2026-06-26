@@ -31,8 +31,10 @@
 //     truncated stream, mid-stream `error` event, or a retryable status) is
 //     turned into a *retryable* response: it stamps `x-should-retry: true` plus a
 //     `Retry-After` backoff, so Claude Code's own SDK retry loop waits and
-//     transparently re-sends. The client's maxRetries is the effective ceiling
-//     (raise it with API_MAX_RETRIES); PROXY_SDK_RETRY_CAP is only a backstop.
+//     transparently re-sends. Claude Code 2.1.191 clamps
+//     CLAUDE_CODE_MAX_RETRIES to 15; PROXY_TRANSACTIONAL_LOCAL_RETRIES can
+//     opt-in to extra uncommitted upstream attempts inside each client attempt,
+//     and PROXY_SDK_RETRY_CAP remains only a backstop.
 //   - Every retryable failure is surfaced as ONE generic shape — a plain `503`
 //     with `api_error` (see surface() in classify.go) — never its real identity
 //     like `overloaded_error`/529 or `rate_limit_error`/429. Claude Code handles
@@ -78,6 +80,8 @@ type config struct {
 	deadlineMargin   time.Duration
 	maxRequestDur    time.Duration
 	sdkRetryCap      int
+	txLocalRetries   int
+	localBackoffCap  time.Duration
 	spoolDir         string
 	requestLogDir    string // when non-empty, save each request/response to a file here
 	requestLogMax    int64  // per-section cap (request body, response body) written per file
@@ -103,7 +107,9 @@ func loadConfig() config {
 		keepaliveMs:      envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
 		deadlineMargin:   envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
 		maxRequestDur:    envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
-		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; the client's own maxRetries is the real ceiling
+		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
+		txLocalRetries:   envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
+		localBackoffCap:  envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
 		spoolDir:         env("PROXY_SPOOL_DIR", os.TempDir()),
 		requestLogDir:    env("PROXY_REQUEST_LOG_DIR", ""),                // "" = disabled; set a dir to save each request/response
 		requestLogMax:    envInt64("PROXY_REQUEST_LOG_MAX_BYTES", 10<<20), // 10 MiB per section, then truncate (bounds RAM/disk)
@@ -145,8 +151,8 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy listening on http://%s -> %s  (transactional, keepalive=%s, sdkRetryCap=%d; one log line per request)",
-		cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.sdkRetryCap)
+	log.Printf("cc-retry-proxy listening on http://%s -> %s  (transactional, keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d; one log line per request)",
+		cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -188,13 +194,40 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var last failure
-	// Initial attempt + at most one cheap local retry for pre-header faults
-	// (only while the retry budget allows it).
-	for localAttempt := 0; localAttempt < 2; localAttempt++ {
+	proxyRetries := 0
+	tryLocalRetry := func(f failure) bool {
+		if cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
+			return false
+		}
+		wait := localRetryDelay(f.retryAfter, proxyRetries)
+		if !canWaitForLocalRetry(ctx, wait) {
+			vlog("[local-retry] skip %s; not enough time left for wait=%s", f.code, wait.Round(time.Millisecond))
+			return false
+		}
+		vlog("[local-retry] %s %s wait=%s retry=%d/%d",
+			f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond), proxyRetries+1, cfg.txLocalRetries)
+		if !sleepWithContext(ctx, wait) {
+			return false
+		}
+		proxyRetries++
+		return true
+	}
+
+	// With PROXY_TRANSACTIONAL_LOCAL_RETRIES=0, preserve the old behavior:
+	// initial attempt + at most one cheap local retry for fast pre-header faults.
+	// When enabled, use the explicit local retry budget for any transient
+	// uncommitted transactional failure.
+	for localAttempt := 0; ; localAttempt++ {
+		if localAttempt > 0 {
+			rec.resetResponse()
+		}
 		resp, started, rtErr := roundTrip(ctx, r, body)
 		if rtErr != nil {
 			last = classifyTransport(rtErr, ctx)
-			if localAttempt == 0 && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second {
+			if tryLocalRetry(last) {
+				continue
+			}
+			if cfg.txLocalRetries == 0 && localAttempt == 0 && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second {
 				vlog("[local-retry] transport fault, retrying once: %v", rtErr)
 				time.Sleep(250 * time.Millisecond)
 				continue
@@ -205,7 +238,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			last = classifyHTTPError(resp)
 			resp.Body.Close()
-			if localAttempt == 0 && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second {
+			if tryLocalRetry(last) {
+				continue
+			}
+			if cfg.txLocalRetries == 0 && localAttempt == 0 && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second {
 				vlog("[local-retry] http %d, retrying once", last.status)
 				time.Sleep(250 * time.Millisecond)
 				continue
@@ -217,6 +253,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			last = failure{transient: true, status: http.StatusBadGateway, atype: "api_error",
 				code: "unexpected_content_type", message: "upstream returned non-SSE to a streaming request"}
+			if tryLocalRetry(last) {
+				continue
+			}
 			break
 		}
 
@@ -231,19 +270,24 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		wrote, fail := captureSSE(ctx, cancel, w, resp.Header, resp.Body, &st)
 		resp.Body.Close()
 		if fail == nil {
-			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s",
-				who(r, body), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount))
+			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s",
+				who(r, body), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries))
+			rec.noteProxyRetries(proxyRetries)
 			rec.note("OK", http.StatusOK, http.StatusOK, "")
 			return
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
-			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s",
-				who(r, body), fail.code, htok(st.outTok), since(reqStart), att(retryCount))
+			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s",
+				who(r, body), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries))
+			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
 			return
 		}
 		last = *fail
-		break // do not nest local retries around an expensive capture
+		if tryLocalRetry(last) {
+			continue
+		}
+		break
 	}
 
 	// FAILED before committing. One rule: retry unless it's a request-shape error
@@ -263,8 +307,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// its x-should-retry loop. The log shows the true upstream status arrowed to
 	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
 	sStatus, sType := surface(last)
-	log.Printf("%-5s %s  %s %s%s  %s%s",
-		tag, who(r, body), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount))
+	log.Printf("%-5s %s  %s %s%s  %s%s%s",
+		tag, who(r, body), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries))
+	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
 	writeAnthropicError(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
 }
@@ -460,6 +505,65 @@ func retryField(secs int) string {
 	return fmt.Sprintf("  retry-after=%ds", secs)
 }
 
+func proxyRetryField(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("  proxy-retries=%d", n)
+}
+
+func localRetryDelay(upstreamRetryAfter int, retryIndex int) time.Duration {
+	if upstreamRetryAfter < 0 {
+		upstreamRetryAfter = 0
+	}
+	return time.Duration(upstreamRetryAfter)*time.Second + localRetryExtraBackoff(retryIndex)
+}
+
+func localRetryExtraBackoff(retryIndex int) time.Duration {
+	if retryIndex < 0 {
+		retryIndex = 0
+	}
+	capDur := cfg.localBackoffCap
+	if capDur <= 0 {
+		return 0
+	}
+	d := time.Second
+	for i := 0; i < retryIndex && d < capDur; i++ {
+		d *= 2
+	}
+	if d > capDur {
+		return capDur
+	}
+	return d
+}
+
+func canWaitForLocalRetry(ctx context.Context, wait time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if wait <= 0 {
+		return true
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= wait+time.Second {
+		return false
+	}
+	return true
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func modelOf(body []byte) string {
 	var b struct {
 		Model string `json:"model"`
@@ -526,6 +630,13 @@ func envInt64(k string, d int64) int64 {
 		}
 	}
 	return d
+}
+func envNonNegInt(k string, d int) int {
+	n := int(envInt64(k, int64(d)))
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 func envDur(k string, dms int64) time.Duration {
 	return time.Duration(envInt64(k, dms)) * time.Millisecond

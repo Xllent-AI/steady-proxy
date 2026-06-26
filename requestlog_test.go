@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -171,5 +172,52 @@ func TestRequestLogHostileInputs(t *testing.T) {
 	// Cap clamped to 0 → bodies fully dropped but recorded as truncated, not <empty>.
 	if !strings.Contains(got, "[truncated") {
 		t.Errorf("expected truncation marker at zero cap:\n%s", got)
+	}
+}
+
+func TestRequestLogLocalRetryKeepsFinalResponseOnly(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits.Add(1) == 1 {
+			io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"+
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n"+
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"FIRST_BAD\"}}\n\n")
+			return
+		}
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	dir := t.TempDir()
+	cfg.requestLogDir = dir
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = 0
+	t.Cleanup(func() {
+		cfg.requestLogDir = ""
+		cfg.txLocalRetries = 0
+	})
+
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if rec.Code != 200 {
+		t.Fatalf("want 200 after hidden retry, got %d", rec.Code)
+	}
+	files := logFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("want 1 log file, got %d", len(files))
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "proxy-retries=1") {
+		t.Fatalf("request log missing proxy retry count:\n%s", got)
+	}
+	if !strings.Contains(got, "message_stop") {
+		t.Fatalf("request log missing final successful response:\n%s", got)
+	}
+	if strings.Contains(got, "FIRST_BAD") {
+		t.Fatalf("request log retained failed first response bytes:\n%s", got)
 	}
 }

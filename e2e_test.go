@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -213,5 +214,133 @@ func TestE2ERetryableCarriesBackoff(t *testing.T) {
 				t.Fatalf("want a Retry-After backoff >= 1s, got %q", rec.Header().Get("Retry-After"))
 			}
 		})
+	}
+}
+
+func TestE2ETransactionalLocalRetryHTTPThenSuccess(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(529)
+			io.WriteString(w, `{"error":{"type":"overloaded_error","message":"Overloaded"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = 0
+
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if rec.Code != 200 {
+		t.Fatalf("want hidden retry to recover with 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("want exactly 2 upstream attempts, got %d", got)
+	}
+}
+
+func TestE2ETransactionalLocalRetryTruncateThenSuccess(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits.Add(1) == 1 {
+			io.WriteString(w, goodStream[:strings.Index(goodStream, "content_block_stop")])
+			return
+		}
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = 0
+
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "message_stop") {
+		t.Fatalf("want hidden retry to recover full stream, code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("want exactly 2 upstream attempts, got %d", got)
+	}
+}
+
+func TestE2ETransactionalLocalRetryDoesNotRetryPermanentShape(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"prompt is too long for context"}}`)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.txLocalRetries = 3
+	cfg.localBackoffCap = 0
+
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("permanent shape must not retry; want x-should-retry=false, got %q", got)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("want exactly 1 upstream attempt, got %d", got)
+	}
+}
+
+func TestE2ETransactionalLocalRetryExhaustsThenReturnsRetryable(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(503)
+		io.WriteString(w, `{"error":{"type":"api_error","message":"upstream unavailable"}}`)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.txLocalRetries = 2
+	cfg.localBackoffCap = 0
+
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if rec.Code != 503 {
+		t.Fatalf("want final retryable generic 503, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "true" {
+		t.Fatalf("want x-should-retry=true after local retries exhaust, got %q", got)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Fatalf("want initial + 2 local retries = 3 upstream attempts, got %d", got)
+	}
+}
+
+func TestE2ELocalRetryDoesNotApplyToNonTransactional(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(503)
+		io.WriteString(w, `{"error":{"type":"api_error","message":"upstream unavailable"}}`)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.txLocalRetries = 3
+	cfg.localBackoffCap = 0
+
+	rec := doStream(`{"stream":false,"model":"m"}`)
+	if rec.Code != 503 {
+		t.Fatalf("want non-transactional route to surface retryable 503, got %d", rec.Code)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("non-transactional route must not use local retries; got %d attempts", got)
+	}
+}
+
+func TestLocalRetryDelayAddsRetryAfterAndCappedExtraBackoff(t *testing.T) {
+	prev := cfg.localBackoffCap
+	cfg.localBackoffCap = 10 * time.Second
+	t.Cleanup(func() { cfg.localBackoffCap = prev })
+
+	if got := localRetryDelay(7, 0); got != 8*time.Second {
+		t.Fatalf("first local retry delay = %s, want 8s", got)
+	}
+	if got := localRetryDelay(7, 4); got != 17*time.Second {
+		t.Fatalf("capped local retry delay = %s, want 17s", got)
 	}
 }
