@@ -34,7 +34,9 @@ is ridden out, not surfaced.
 
 - For `POST /v1/messages` it runs in **transactional mode**: it buffers and
   validates the *entire* Anthropic SSE stream and only writes `200 OK` +
-  replays it once a complete, valid `message_stop` is captured.
+  replays it once a complete, valid `message_stop` is captured. Downstream
+  forwarding also coalesces tool/server-tool `input_json_delta` fragments into
+  one complete JSON delta, avoiding client-side partial-JSON EOF failures.
 - Any failure **before** that commit point — connection error, 5xx, a stalled or
   truncated stream, a mid-stream `error` event, any retryable status — is either
   retried inside the proxy when `PROXY_TRANSACTIONAL_LOCAL_RETRIES` is enabled,
@@ -231,7 +233,8 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
-| `PROXY_VALIDATE_JSON` | `1` | per-event JSON validation (catches malformed `data:` events); `0` to disable |
+| `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
+| `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a single buffered response |

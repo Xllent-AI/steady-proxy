@@ -68,25 +68,26 @@ import (
 )
 
 type config struct {
-	listenAddr       string
-	upstream         string // scheme://host[:port], no trailing slash
-	upstreamHost     string
-	maxBufferMem     int64
-	maxResponseBytes int64
-	maxRequestBytes  int64
-	respHeaderTO     time.Duration
-	upstreamByteIdle time.Duration
-	keepaliveMs      time.Duration
-	deadlineMargin   time.Duration
-	maxRequestDur    time.Duration
-	sdkRetryCap      int
-	txLocalRetries   int
-	localBackoffCap  time.Duration
-	spoolDir         string
-	requestLogDir    string // when non-empty, save each request/response to a file here
-	requestLogMax    int64  // per-section cap (request body, response body) written per file
-	validateJSON     bool
-	verbose          bool
+	listenAddr        string
+	upstream          string // scheme://host[:port], no trailing slash
+	upstreamHost      string
+	maxBufferMem      int64
+	maxResponseBytes  int64
+	maxRequestBytes   int64
+	respHeaderTO      time.Duration
+	upstreamByteIdle  time.Duration
+	keepaliveMs       time.Duration
+	deadlineMargin    time.Duration
+	maxRequestDur     time.Duration
+	sdkRetryCap       int
+	txLocalRetries    int
+	localBackoffCap   time.Duration
+	spoolDir          string
+	requestLogDir     string // when non-empty, save each request/response to a file here
+	requestLogMax     int64  // per-section cap (request body, response body) written per file
+	validateJSON      bool
+	normalizeToolJSON bool
+	verbose           bool
 }
 
 func loadConfig() config {
@@ -96,25 +97,26 @@ func loadConfig() config {
 		host = host[i+3:]
 	}
 	return config{
-		listenAddr:       env("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
-		upstream:         up,
-		upstreamHost:     host,
-		maxBufferMem:     envInt64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20),    // 1 MiB in RAM, then temp file
-		maxResponseBytes: envInt64("PROXY_MAX_RESPONSE_BYTES", 128<<20),    // 128 MiB hard cap
-		maxRequestBytes:  envInt64("PROXY_MAX_REQUEST_BYTES", 64<<20),      // 64 MiB request cap
-		respHeaderTO:     envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
-		upstreamByteIdle: envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
-		keepaliveMs:      envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
-		deadlineMargin:   envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
-		maxRequestDur:    envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
-		sdkRetryCap:      int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
-		txLocalRetries:   envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
-		localBackoffCap:  envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
-		spoolDir:         env("PROXY_SPOOL_DIR", os.TempDir()),
-		requestLogDir:    env("PROXY_REQUEST_LOG_DIR", ""),                // "" = disabled; set a dir to save each request/response
-		requestLogMax:    envInt64("PROXY_REQUEST_LOG_MAX_BYTES", 10<<20), // 10 MiB per section, then truncate (bounds RAM/disk)
-		validateJSON:     os.Getenv("PROXY_VALIDATE_JSON") != "0",         // default on
-		verbose:          os.Getenv("PROXY_VERBOSE") == "1",
+		listenAddr:        env("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
+		upstream:          up,
+		upstreamHost:      host,
+		maxBufferMem:      envInt64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20),    // 1 MiB in RAM, then temp file
+		maxResponseBytes:  envInt64("PROXY_MAX_RESPONSE_BYTES", 128<<20),    // 128 MiB hard cap
+		maxRequestBytes:   envInt64("PROXY_MAX_REQUEST_BYTES", 64<<20),      // 64 MiB request cap
+		respHeaderTO:      envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
+		upstreamByteIdle:  envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
+		keepaliveMs:       envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
+		deadlineMargin:    envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
+		maxRequestDur:     envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
+		sdkRetryCap:       int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
+		txLocalRetries:    envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
+		localBackoffCap:   envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
+		spoolDir:          env("PROXY_SPOOL_DIR", os.TempDir()),
+		requestLogDir:     env("PROXY_REQUEST_LOG_DIR", ""),                // "" = disabled; set a dir to save each request/response
+		requestLogMax:     envInt64("PROXY_REQUEST_LOG_MAX_BYTES", 10<<20), // 10 MiB per section, then truncate (bounds RAM/disk)
+		validateJSON:      os.Getenv("PROXY_VALIDATE_JSON") != "0",         // default on
+		normalizeToolJSON: os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0",   // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
+		verbose:           os.Getenv("PROXY_VERBOSE") == "1",
 	}
 }
 

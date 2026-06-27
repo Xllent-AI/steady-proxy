@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const goodStream = `event: message_start
@@ -203,6 +204,203 @@ data: {"type":"message_stop"}
 	}
 }
 
+func TestToolUseInputJSONDeltaConvertsWhenAccumulatedJSONIsInvalid(t *testing.T) {
+	cfg = loadConfig()
+	stream := toolUseStream([]string{`{"session_id":`})
+	_, f := capture(t, stream)
+	if f == nil || !f.transient || f.code != "malformed_sse" {
+		t.Fatalf("want transient malformed_sse for incomplete tool input JSON, got %+v", f)
+	}
+}
+
+func TestToolUseInputJSONDeltaNormalizedOnBufferedReplay(t *testing.T) {
+	cfg = loadConfig()
+	prompt := strings.Repeat("tool-fragment-", 600)
+	input := `{"session_id":"s_92d0f1da7c9b","prompt":"` + prompt + `","timeout_ms":3900000}`
+	chunks := append([]string{""}, splitEvery(input, 8)...)
+	if len(chunks) < 800 {
+		t.Fatalf("test setup must exercise a highly fragmented tool input, got %d chunks", len(chunks))
+	}
+	rec, f := capture(t, toolUseStream(chunks))
+	if f != nil {
+		t.Fatalf("expected success, got %+v", *f)
+	}
+	deltas := inputJSONDeltas(t, rec.Body.String())
+	if len(deltas) != 1 {
+		t.Fatalf("want one normalized input_json_delta, got %d: %#v", len(deltas), deltas)
+	}
+	if deltas[0] != input {
+		t.Fatalf("normalized tool input mismatch:\n got: %s\nwant: %s", deltas[0], input)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(deltas[0]), &parsed); err != nil {
+		t.Fatalf("normalized tool input is not valid JSON: %v", err)
+	}
+}
+
+func TestToolUseInputJSONDeltaNormalizedAcrossLiveHandoff(t *testing.T) {
+	cfg = loadConfig()
+	cfg.keepaliveMs = 20 * time.Millisecond
+	cfg.upstreamByteIdle = time.Second
+
+	input := `{"session_id":"s_live_handoff","prompt":"` + strings.Repeat("handoff-fragment-", 40) + `","timeout_ms":1000}`
+	chunks := splitEvery(input, 9)
+	parts := toolUseStreamParts(chunks, 5)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r := &gapReader{ctx: ctx, chunks: parts, gap: 80 * time.Millisecond}
+	wrote, f := captureSSE(ctx, cancel, rec, http.Header{}, r, nil)
+	if f != nil || !wrote {
+		t.Fatalf("expected live handoff success, wrote=%v failure=%+v", wrote, f)
+	}
+	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "live" {
+		t.Fatalf("want live mode, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	}
+	deltas := inputJSONDeltas(t, rec.Body.String())
+	if len(deltas) != 1 {
+		t.Fatalf("want one normalized input_json_delta across live handoff, got %d: %#v", len(deltas), deltas)
+	}
+	if deltas[0] != input {
+		t.Fatalf("normalized live handoff tool input mismatch:\n got: %s\nwant: %s", deltas[0], input)
+	}
+}
+
+func TestServerToolUseInputJSONDeltaNormalized(t *testing.T) {
+	cfg = loadConfig()
+	input := `{"query":"OEIS A048625 Pisot sequence P(4,6) linear recurrence proof Boyd"}`
+	rec, f := capture(t, inputJSONStream(inputJSONStreamSpec{
+		blockType: "server_tool_use",
+		toolID:    "srvtoolu_1",
+		name:      "web_search",
+		chunks:    append([]string{""}, splitEvery(input, 7)...),
+	}))
+	if f != nil {
+		t.Fatalf("expected server_tool_use success, got %+v", *f)
+	}
+	deltas := inputJSONDeltas(t, rec.Body.String())
+	if len(deltas) != 1 {
+		t.Fatalf("want one normalized server_tool_use input_json_delta, got %d: %#v", len(deltas), deltas)
+	}
+	if deltas[0] != input {
+		t.Fatalf("normalized server tool input mismatch:\n got: %s\nwant: %s", deltas[0], input)
+	}
+}
+
+func TestEmptyInputJSONDeltaIsAllowed(t *testing.T) {
+	for _, blockType := range []string{"tool_use", "server_tool_use"} {
+		t.Run(blockType, func(t *testing.T) {
+			cfg = loadConfig()
+			rec, f := capture(t, inputJSONStream(inputJSONStreamSpec{
+				blockType: blockType,
+				toolID:    "toolu_empty",
+				name:      "Tool",
+				chunks:    []string{""},
+			}))
+			if f != nil {
+				t.Fatalf("expected empty input_json_delta success, got %+v", *f)
+			}
+			deltas := inputJSONDeltas(t, rec.Body.String())
+			if len(deltas) != 1 || deltas[0] != "" {
+				t.Fatalf("want one preserved empty input_json_delta, got %#v", deltas)
+			}
+		})
+	}
+}
+
+func TestValidateJSONDisabledSkipsReplayParsing(t *testing.T) {
+	cfg = loadConfig()
+	cfg.validateJSON = false
+	const stream = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_1"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0}
+
+event: content_block_delta
+data: {oops not json
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	rec, f := capture(t, stream)
+	if f != nil {
+		t.Fatalf("expected validateJSON=0 to forward raw malformed event, got %+v", *f)
+	}
+	if !strings.Contains(rec.Body.String(), "{oops not json") {
+		t.Fatalf("raw malformed event was not forwarded: %q", rec.Body.String())
+	}
+}
+
+func TestValidateJSONDisabledSkipsUsageBackfillParsing(t *testing.T) {
+	cfg = loadConfig()
+	cfg.validateJSON = false
+	const stream = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0}
+
+event: content_block_delta
+data: {oops not json
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":99,"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	var st captureStats
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(stream), &st)
+	if f != nil {
+		t.Fatalf("expected validateJSON=0 to forward raw malformed event, got %+v", *f)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"{oops not json",
+		`"usage":{"input_tokens":0,"output_tokens":0}`,
+		`"usage":{"input_tokens":99,"output_tokens":3}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("validateJSON=0 replay should preserve %q in raw body:\n%s", want, body)
+		}
+	}
+}
+
+func TestToolUseInputJSONDeltaNormalizationCanBeDisabled(t *testing.T) {
+	cfg = loadConfig()
+	cfg.normalizeToolJSON = false
+	chunks := []string{`{"session_id":`, `"s_raw"`, `,"timeout_ms":1000}`}
+	rec, f := capture(t, toolUseStream(chunks))
+	if f != nil {
+		t.Fatalf("expected success, got %+v", *f)
+	}
+	deltas := inputJSONDeltas(t, rec.Body.String())
+	if len(deltas) != len(chunks) {
+		t.Fatalf("want raw input_json_delta fragments when normalization is disabled, got %d: %#v", len(deltas), deltas)
+	}
+	for i := range chunks {
+		if deltas[i] != chunks[i] {
+			t.Fatalf("raw fragment %d mismatch: got %q want %q", i, deltas[i], chunks[i])
+		}
+	}
+}
+
 func TestCaptureTruncated(t *testing.T) {
 	trunc := goodStream[:strings.Index(goodStream, "content_block_stop")]
 	_, f := capture(t, trunc)
@@ -333,4 +531,133 @@ func assertNoInputUsage(t *testing.T, usage map[string]any) {
 			t.Fatalf("message_delta still contains %s in %#v", key, usage)
 		}
 	}
+}
+
+func toolUseStream(chunks []string) string {
+	parts := inputJSONStreamParts(inputJSONStreamSpec{
+		blockType: "tool_use",
+		toolID:    "toolu_1",
+		name:      "Tool",
+		chunks:    chunks,
+		split:     len(chunks),
+	})
+	return parts[0] + parts[1]
+}
+
+func toolUseStreamParts(chunks []string, split int) []string {
+	return inputJSONStreamParts(inputJSONStreamSpec{
+		blockType: "tool_use",
+		toolID:    "toolu_1",
+		name:      "Tool",
+		chunks:    chunks,
+		split:     split,
+	})
+}
+
+type inputJSONStreamSpec struct {
+	blockType string
+	toolID    string
+	name      string
+	chunks    []string
+	split     int
+}
+
+func inputJSONStream(spec inputJSONStreamSpec) string {
+	spec.split = len(spec.chunks)
+	parts := inputJSONStreamParts(spec)
+	return parts[0] + parts[1]
+}
+
+func inputJSONStreamParts(spec inputJSONStreamSpec) []string {
+	var b strings.Builder
+	var tail strings.Builder
+	writeInputJSONPrelude(&b, spec.blockType, spec.toolID, spec.name)
+	for i, chunk := range spec.chunks {
+		dst := &b
+		if i >= spec.split {
+			dst = &tail
+		}
+		writeInputJSONDelta(dst, chunk)
+	}
+	writeInputJSONPostlude(&tail)
+	return []string{b.String(), tail.String()}
+}
+
+func writeInputJSONPrelude(b *strings.Builder, blockType, id, name string) {
+	b.WriteString(sseJSON("message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+			"content": []any{}, "usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+		},
+	}))
+	b.WriteString(sseJSON("content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": 0,
+		"content_block": map[string]any{
+			"type": blockType, "id": id, "name": name, "input": map[string]any{},
+		},
+	}))
+}
+
+func writeInputJSONDelta(b *strings.Builder, chunk string) {
+	b.WriteString(sseJSON("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": chunk},
+	}))
+}
+
+func writeInputJSONPostlude(b *strings.Builder) {
+	b.WriteString(sseJSON("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}))
+	b.WriteString(sseJSON("message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "tool_use", "stop_sequence": nil},
+		"usage": map[string]any{"output_tokens": 1},
+	}))
+	b.WriteString(sseJSON("message_stop", map[string]any{"type": "message_stop"}))
+}
+
+func sseJSON(eventName string, payload any) string {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return "event: " + eventName + "\ndata: " + string(b) + "\n\n"
+}
+
+func splitEvery(s string, n int) []string {
+	var out []string
+	for len(s) > 0 {
+		if len(s) < n {
+			n = len(s)
+		}
+		out = append(out, s[:n])
+		s = s[n:]
+	}
+	return out
+}
+
+func inputJSONDeltas(t *testing.T, body string) []string {
+	t.Helper()
+	var parser sseParser
+	var out []string
+	for _, ev := range parser.feed([]byte(body)) {
+		if ev.name != "content_block_delta" {
+			continue
+		}
+		var m struct {
+			Delta struct {
+				Type        string `json:"type"`
+				PartialJSON string `json:"partial_json"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal([]byte(ev.data), &m); err != nil {
+			t.Fatalf("content_block_delta JSON: %v", err)
+		}
+		if m.Delta.Type == "input_json_delta" {
+			out = append(out, m.Delta.PartialJSON)
+		}
+	}
+	return out
 }

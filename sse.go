@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -56,14 +57,22 @@ func (s *spool) replay(w io.Writer) error {
 }
 
 func (s *spool) replayWithUsage(w io.Writer, st *captureStats) error {
-	if st == nil || !st.shouldBackfillMessageStartUsage() {
+	if (st == nil || !st.shouldBackfillMessageStartUsage()) && !normalizeToolJSONEnabled() {
 		return s.replayRaw(w)
 	}
 	r, err := s.reader()
 	if err != nil {
 		return err
 	}
-	return replayWithUsageBackfill(r, w, st)
+	return replayBuffered(r, w, st)
+}
+
+func (s *spool) replayWithNormalizer(w io.Writer, norm *toolJSONReplayNormalizer) error {
+	r, err := s.reader()
+	if err != nil {
+		return err
+	}
+	return replayBufferedWithNormalizer(r, w, nil, norm)
 }
 
 func (s *spool) replayRaw(w io.Writer) error {
@@ -247,6 +256,8 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 	sp := newSpool()
 	parser := &sseParser{}
 	val := &streamValidator{}
+	toolVal := &toolJSONValidator{}
+	toolNorm := &toolJSONReplayNormalizer{}
 	committed := false
 	headerWritten := false
 
@@ -309,7 +320,7 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 		case r := <-ch:
 			if len(r.data) > 0 {
 				idleTimer.Reset(cfg.upstreamByteIdle)
-				wrote, fail, ret := process(r.data, sp, parser, val, w, &committed, writeHead, flush, st)
+				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, w, &committed, writeHead, flush, st)
 				if ret {
 					return wrote, fail
 				}
@@ -323,8 +334,11 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 			}
 			if !committed {
 				writeHead("live") // grace elapsed: commit buffered prefix, go live
-				sp.replay(w)
 				committed = true
+				if err := sp.replayWithNormalizer(w, toolNorm); err != nil {
+					sp.discard()
+					return true, &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
+				}
 			}
 			io.WriteString(w, ": keepalive\n\n")
 			flush()
@@ -352,12 +366,14 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 }
 
 // process handles one chunk. ret=true means captureSSE should return (wrote,fail).
-func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w http.ResponseWriter,
+func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, toolVal *toolJSONValidator, toolNorm *toolJSONReplayNormalizer, w http.ResponseWriter,
 	committed *bool, writeHead func(string), flush func(), st *captureStats) (bool, *failure, bool) {
 	for _, ev := range parser.feed(data) {
 		if st != nil {
 			st.bytes += int64(len(ev.raw))
-			scrapeUsage(ev, st)
+			if cfg.validateJSON {
+				scrapeUsage(ev, st)
+			}
 			if st.respTee != nil { // capture the full stream, incl. a mid-stream error
 				st.respTee.Write(ev.raw)
 			}
@@ -371,7 +387,16 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 			if ev.name == "error" {
 				return true, classifySSEError(ev.data), true
 			}
-			w.Write(ev.raw)
+			out, err := toolNorm.accept(ev, ev.raw)
+			if err != nil {
+				return true, malformedSSE("invalid tool input JSON in stream event"), true
+			}
+			for _, p := range out {
+				w.Write(p)
+			}
+			if len(out) == 0 {
+				io.WriteString(w, ": keepalive\n\n")
+			}
 			flush()
 			val.accept(ev)
 			if val.terminal() {
@@ -387,6 +412,12 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 		if cfg.validateJSON && ev.data != "" && !json.Valid([]byte(ev.data)) {
 			sp.discard()
 			return false, &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: "invalid JSON in stream event"}, true
+		}
+		if cfg.validateJSON {
+			if f := toolVal.accept(ev); f != nil {
+				sp.discard()
+				return false, f, true
+			}
 		}
 		val.accept(ev)
 		if val.invalid {
@@ -412,6 +443,72 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, w 
 		}
 	}
 	return false, nil, false
+}
+
+// toolJSONValidator catches an Anthropic edge case the per-event JSON check
+// cannot see: a stream can contain valid SSE event JSON while the accumulated
+// tool/server-tool input_json_delta fragments form invalid JSON. Claude Code reports
+// that downstream as "JSON Parse error: Unexpected EOF"; in transactional mode
+// we can classify it before committing bytes.
+type toolJSONValidator struct {
+	blocks map[int]*toolJSONBlock
+}
+
+type toolJSONBlock struct {
+	jsonInput     bool
+	sawInputDelta bool
+	input         bytes.Buffer
+}
+
+func (v *toolJSONValidator) accept(ev event) *failure {
+	if ev.data == "" {
+		return nil
+	}
+	var p streamPayload
+	if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
+		return malformedSSE("invalid JSON in stream event")
+	}
+	switch p.Type {
+	case "content_block_start":
+		if blockUsesInputJSON(p.ContentBlock.Type) {
+			if v.blocks == nil {
+				v.blocks = map[int]*toolJSONBlock{}
+			}
+			if len(p.ContentBlock.Input) > 0 && !json.Valid(p.ContentBlock.Input) {
+				return malformedSSE("invalid tool input JSON in stream event")
+			}
+			v.blocks[p.Index] = &toolJSONBlock{jsonInput: true}
+		}
+	case "content_block_delta":
+		if p.Delta.Type != "input_json_delta" {
+			return nil
+		}
+		b := v.blocks[p.Index]
+		if b == nil {
+			// Be forward-compatible with future Anthropic content block types that
+			// stream JSON input. We still validate the accumulator at block stop.
+			if v.blocks == nil {
+				v.blocks = map[int]*toolJSONBlock{}
+			}
+			b = &toolJSONBlock{jsonInput: true}
+			v.blocks[p.Index] = b
+		}
+		b.sawInputDelta = true
+		b.input.WriteString(p.Delta.PartialJSON)
+	case "content_block_stop":
+		b := v.blocks[p.Index]
+		if b != nil {
+			if b.jsonInput && b.sawInputDelta && b.input.Len() > 0 && !validJSONObject(b.input.Bytes()) {
+				return malformedSSE("invalid tool input JSON in stream event")
+			}
+			delete(v.blocks, p.Index)
+		}
+	}
+	return nil
+}
+
+func malformedSSE(message string) *failure {
+	return &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: message}
 }
 
 // scrapeUsage pulls the friendly numbers out of the events that carry them.
@@ -483,7 +580,7 @@ func (st *captureStats) setInputUsage(input, cacheCreation, cacheRead int) {
 }
 
 func (st *captureStats) shouldBackfillMessageStartUsage() bool {
-	if st == nil || !st.deltaInputUsage || st.inTok <= 0 {
+	if !cfg.validateJSON || st == nil || !st.deltaInputUsage || st.inTok <= 0 {
 		return false
 	}
 	return st.startInputTok != st.inputTok ||
@@ -495,7 +592,24 @@ func totalInputTokens(input, cacheCreation, cacheRead int) int {
 	return input + cacheCreation + cacheRead
 }
 
-func replayWithUsageBackfill(r io.Reader, w io.Writer, st *captureStats) error {
+type streamPayload struct {
+	Type         string `json:"type"`
+	Index        int    `json:"index"`
+	ContentBlock struct {
+		Type  string          `json:"type"`
+		Input json.RawMessage `json:"input"`
+	} `json:"content_block"`
+	Delta struct {
+		Type        string `json:"type"`
+		PartialJSON string `json:"partial_json"`
+	} `json:"delta"`
+}
+
+func replayBuffered(r io.Reader, w io.Writer, st *captureStats) error {
+	return replayBufferedWithNormalizer(r, w, st, &toolJSONReplayNormalizer{})
+}
+
+func replayBufferedWithNormalizer(r io.Reader, w io.Writer, st *captureStats, toolNorm *toolJSONReplayNormalizer) error {
 	parser := &sseParser{}
 	buf := make([]byte, 32*1024)
 	startPatched := false
@@ -503,27 +617,29 @@ func replayWithUsageBackfill(r io.Reader, w io.Writer, st *captureStats) error {
 		n, err := r.Read(buf)
 		if n > 0 {
 			for _, ev := range parser.feed(buf[:n]) {
-				if !startPatched && ev.name == "message_start" {
-					raw, ok := backfillMessageStartUsage(ev, st)
+				raw := ev.raw
+				if st != nil && st.shouldBackfillMessageStartUsage() && !startPatched && ev.name == "message_start" {
+					patched, ok := backfillMessageStartUsage(ev, st)
 					if ok {
-						if _, err := w.Write(raw); err != nil {
-							return err
-						}
+						raw = patched
 						startPatched = true
-						continue
 					}
 				}
-				if ev.name == "message_delta" {
-					raw, ok := stripMessageDeltaInputUsage(ev)
+				if st != nil && st.shouldBackfillMessageStartUsage() && ev.name == "message_delta" {
+					patched, ok := stripMessageDeltaInputUsage(ev)
 					if ok {
-						if _, err := w.Write(raw); err != nil {
-							return err
-						}
-						continue
+						raw = patched
+						ev.raw = raw
 					}
 				}
-				if _, err := w.Write(ev.raw); err != nil {
+				out, err := toolNorm.accept(ev, raw)
+				if err != nil {
 					return err
+				}
+				for _, p := range out {
+					if _, err := w.Write(p); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -534,6 +650,106 @@ func replayWithUsageBackfill(r io.Reader, w io.Writer, st *captureStats) error {
 			return err
 		}
 	}
+}
+
+type toolJSONReplayNormalizer struct {
+	blocks map[int]*toolReplayBlock
+}
+
+type toolReplayBlock struct {
+	jsonInput     bool
+	sawInputDelta bool
+	input         bytes.Buffer
+	rawDeltas     [][]byte
+}
+
+func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error) {
+	if !normalizeToolJSONEnabled() || ev.data == "" {
+		return [][]byte{raw}, nil
+	}
+	var p streamPayload
+	if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
+		return nil, err
+	}
+	switch p.Type {
+	case "content_block_start":
+		if blockUsesInputJSON(p.ContentBlock.Type) {
+			if n.blocks == nil {
+				n.blocks = map[int]*toolReplayBlock{}
+			}
+			n.blocks[p.Index] = &toolReplayBlock{jsonInput: true}
+		}
+		return [][]byte{raw}, nil
+	case "content_block_delta":
+		if p.Delta.Type != "input_json_delta" {
+			return [][]byte{raw}, nil
+		}
+		b := n.blocks[p.Index]
+		if b == nil {
+			if n.blocks == nil {
+				n.blocks = map[int]*toolReplayBlock{}
+			}
+			b = &toolReplayBlock{jsonInput: true}
+			n.blocks[p.Index] = b
+		}
+		b.sawInputDelta = true
+		b.input.WriteString(p.Delta.PartialJSON)
+		b.rawDeltas = append(b.rawDeltas, raw)
+		return nil, nil
+	case "content_block_stop":
+		b := n.blocks[p.Index]
+		if b == nil || !b.jsonInput || !b.sawInputDelta {
+			delete(n.blocks, p.Index)
+			return [][]byte{raw}, nil
+		}
+		if b.input.Len() == 0 {
+			delete(n.blocks, p.Index)
+			return append(b.rawDeltas, raw), nil
+		}
+		if !validJSONObject(b.input.Bytes()) {
+			return nil, errInvalidToolJSON
+		}
+		delete(n.blocks, p.Index)
+		return [][]byte{toolInputDeltaEvent(p.Index, b.input.String()), raw}, nil
+	default:
+		return [][]byte{raw}, nil
+	}
+}
+
+var errInvalidToolJSON = errors.New("invalid tool input JSON")
+
+func normalizeToolJSONEnabled() bool {
+	return cfg.validateJSON && cfg.normalizeToolJSON
+}
+
+func blockUsesInputJSON(blockType string) bool {
+	switch blockType {
+	case "tool_use", "server_tool_use":
+		return true
+	default:
+		return false
+	}
+}
+
+func toolInputDeltaEvent(index int, partial string) []byte {
+	payload := map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]string{
+			"type":         "input_json_delta",
+			"partial_json": partial,
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return []byte("event: content_block_delta\ndata: " + string(data) + "\n\n")
+}
+
+func validJSONObject(p []byte) bool {
+	p = bytes.TrimSpace(p)
+	return len(p) > 0 && p[0] == '{' && json.Valid(p)
 }
 
 func backfillMessageStartUsage(ev event, st *captureStats) ([]byte, bool) {

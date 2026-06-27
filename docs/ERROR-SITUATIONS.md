@@ -58,14 +58,19 @@ hits the parse error. The truncation becomes a clean pre-body retryable error.
 ## 2. Malformed (but complete) stream  → convert
 
 The stream is structurally complete (reaches `message_stop`) but an event's
-payload is invalid JSON — a gateway/shim serialization bug, not a cut.
+payload is invalid JSON — or a stream of valid events accumulates to invalid
+tool/server-tool input JSON. These are gateway/shim serialization bugs, not cuts.
 
 | Real message | Cause | Proxy action |
 |---|---|---|
 | `API Error: JSON Parse error: Unexpected identifier` | a fully-framed `data:` line with broken JSON | **convert** — per-event `json.Valid` check fails → `502 malformed_sse` + retry |
+| `API Error: JSON Parse error: Unexpected EOF` | valid outer SSE events but incomplete accumulated tool/server-tool `input_json_delta` | **convert** — accumulated tool input validation fails before commit → `502 malformed_sse` + retry |
 
 This is the edge case plain truncation-detection misses; the proxy validates the
-JSON of every data event (toggle: `PROXY_VALIDATE_JSON=0` to disable).
+JSON of every data event and each accumulated tool/server-tool input object (toggle:
+`PROXY_VALIDATE_JSON=0` to disable validation and JSON-fragment normalization).
+Downstream forwarding coalesces fragmented tool input JSON into one complete
+delta (`PROXY_NORMALIZE_TOOL_JSON=0` disables only this normalization).
 
 ## 3. Transient server errors  → convert (normalized to a generic 503)
 

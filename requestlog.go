@@ -175,6 +175,9 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	if st := rec.stats; st != nil {
 		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   dur=%s\n",
 			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), since(rec.when))
+		if normalizeToolJSONEnabled() {
+			fmt.Fprintln(w, "Note: response body is raw upstream capture; downstream tool JSON may be normalized.")
+		}
 	} else {
 		fmt.Fprintf(w, "Stats: dur=%s\n", since(rec.when))
 	}
