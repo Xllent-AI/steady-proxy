@@ -378,6 +378,15 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 				st.respTee.Write(ev.raw)
 			}
 		}
+		if cfg.validateJSON {
+			if f := validateSSEEventShape(ev); f != nil {
+				sp.discard()
+				if *committed {
+					return true, f, true
+				}
+				return false, f, true
+			}
+		}
 		if *committed {
 			// Live mode: headers are already sent, so we can't convert to a
 			// retryable status — but never forward the raw special identity
@@ -443,6 +452,17 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 		}
 	}
 	return false, nil, false
+}
+
+func validateSSEEventShape(ev event) *failure {
+	switch {
+	case ev.name != "" && ev.data == "":
+		return malformedSSE("stream event missing JSON data")
+	case ev.name == "" && ev.data != "":
+		return malformedSSE("stream event missing event name")
+	default:
+		return nil
+	}
 }
 
 // toolJSONValidator catches an Anthropic edge case the per-event JSON check
@@ -664,6 +684,11 @@ type toolReplayBlock struct {
 }
 
 func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error) {
+	if normalizeToolJSONEnabled() {
+		if f := validateSSEEventShape(ev); f != nil {
+			return nil, errInvalidSSEEventShape
+		}
+	}
 	if !normalizeToolJSONEnabled() || ev.data == "" {
 		return [][]byte{raw}, nil
 	}
@@ -717,6 +742,7 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 }
 
 var errInvalidToolJSON = errors.New("invalid tool input JSON")
+var errInvalidSSEEventShape = errors.New("invalid SSE event shape")
 
 func normalizeToolJSONEnabled() bool {
 	return cfg.validateJSON && cfg.normalizeToolJSON

@@ -409,6 +409,70 @@ func TestCaptureTruncated(t *testing.T) {
 	}
 }
 
+func TestCaptureRejectsNamedEventWithoutData(t *testing.T) {
+	cfg = loadConfig()
+	s := strings.Replace(goodStream,
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+		"event: content_block_delta\n: keep-alive\n\n"+
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+		1)
+	rec, f := capture(t, s)
+	if f == nil || !f.transient || f.code != "malformed_sse" {
+		t.Fatalf("want transient malformed_sse, got %+v", f)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("malformed stream should fail before commit, body=%q", rec.Body.String())
+	}
+}
+
+func TestCaptureRejectsDataWithoutEventName(t *testing.T) {
+	cfg = loadConfig()
+	s := strings.Replace(goodStream,
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+		1)
+	rec, f := capture(t, s)
+	if f == nil || !f.transient || f.code != "malformed_sse" {
+		t.Fatalf("want transient malformed_sse, got %+v", f)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("malformed stream should fail before commit, body=%q", rec.Body.String())
+	}
+}
+
+func TestCaptureAllowsCommentKeepaliveBetweenEvents(t *testing.T) {
+	cfg = loadConfig()
+	s := strings.Replace(goodStream,
+		"event: content_block_start",
+		": keep-alive\n\n"+"event: content_block_start",
+		1)
+	rec, f := capture(t, s)
+	if f != nil {
+		t.Fatalf("expected success with standalone comment keepalive, got %+v", *f)
+	}
+	if !strings.Contains(rec.Body.String(), "message_stop") {
+		t.Fatalf("missing terminal event in replay")
+	}
+}
+
+func TestCaptureAllowsSSEMetadataRecords(t *testing.T) {
+	cfg = loadConfig()
+	s := strings.Replace(goodStream,
+		"event: content_block_start",
+		"id: event-42\nretry: 1000\n\n"+"event: content_block_start",
+		1)
+	rec, f := capture(t, s)
+	if f != nil {
+		t.Fatalf("expected success with SSE metadata records, got %+v", *f)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"id: event-42", "retry: 1000", "message_stop"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("replayed body missing %q: %q", want, body)
+		}
+	}
+}
+
 func TestCaptureSSEErrorOverloaded(t *testing.T) {
 	s := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n"
