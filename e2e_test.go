@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,11 +24,40 @@ func setupForTest(upURL string) {
 	client = &http.Client{Transport: &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Second}}
 }
 
+func useDefaultConfig(t *testing.T) {
+	t.Helper()
+	cfg = loadConfig()
+	t.Cleanup(func() { cfg = loadConfig() })
+}
+
 func doStream(body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handle(rec, req)
 	return rec
+}
+
+func captureLogs(t *testing.T, fn func()) (out string) {
+	t.Helper()
+	var buf bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+	fn()
+	return buf.String()
+}
+
+func firstLogLineContaining(logs, needle string) string {
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	return ""
 }
 
 func TestE2EStreamingSuccess(t *testing.T) {
@@ -239,6 +270,70 @@ func TestE2ETransactionalLocalRetryHTTPThenSuccess(t *testing.T) {
 	}
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("want exactly 2 upstream attempts, got %d", got)
+	}
+}
+
+func TestE2ELocalRetryLogIncludesRequestIdentity(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(503)
+			io.WriteString(w, `{"error":{"type":"api_error","message":"upstream unavailable"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	prevLocalRetries, prevBackoffCap, prevVerbose := cfg.txLocalRetries, cfg.localBackoffCap, cfg.verbose
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = 0
+	cfg.verbose = true
+	t.Cleanup(func() {
+		cfg.txLocalRetries = prevLocalRetries
+		cfg.localBackoffCap = prevBackoffCap
+		cfg.verbose = prevVerbose
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"model":"gpt-5.5"}`))
+	req.Header.Set("X-Stainless-Retry-Count", "2")
+	rec := httptest.NewRecorder()
+	logs := captureLogs(t, func() { handle(rec, req) })
+
+	if rec.Code != 200 {
+		t.Fatalf("want hidden retry to recover with 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	line := firstLogLineContaining(logs, "[local-retry]")
+	if line == "" {
+		t.Fatalf("missing local retry log:\n%s", logs)
+	}
+	for _, want := range []string{"[local-retry] gpt-5.5/main", "http_503 503", "wait=0s", "retry=1/1", "attempt=2"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("local retry log missing %q:\n%s", want, line)
+		}
+	}
+}
+
+func TestE2EAccessLogShowsResolvedModelWhenDifferent(t *testing.T) {
+	stream := strings.Replace(goodStream,
+		`{"type":"message_start","message":{"id":"msg_1"}}`,
+		`{"type":"message_start","message":{"id":"msg_1","model":"actual-model"}}`, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, stream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+
+	logs := captureLogs(t, func() {
+		rec := doStream(`{"stream":true,"model":"alias-model"}`)
+		if rec.Code != 200 {
+			t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+	if !strings.Contains(logs, "OK    alias-model->actual-model/main") {
+		t.Fatalf("access log missing resolved model:\n%s", logs)
 	}
 }
 

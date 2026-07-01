@@ -205,7 +205,7 @@ data: {"type":"message_stop"}
 }
 
 func TestToolUseInputJSONDeltaConvertsWhenAccumulatedJSONIsInvalid(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	stream := toolUseStream([]string{`{"session_id":`})
 	_, f := capture(t, stream)
 	if f == nil || !f.transient || f.code != "malformed_sse" {
@@ -214,7 +214,7 @@ func TestToolUseInputJSONDeltaConvertsWhenAccumulatedJSONIsInvalid(t *testing.T)
 }
 
 func TestToolUseInputJSONDeltaNormalizedOnBufferedReplay(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	prompt := strings.Repeat("tool-fragment-", 600)
 	input := `{"session_id":"s_92d0f1da7c9b","prompt":"` + prompt + `","timeout_ms":3900000}`
 	chunks := append([]string{""}, splitEvery(input, 8)...)
@@ -239,7 +239,7 @@ func TestToolUseInputJSONDeltaNormalizedOnBufferedReplay(t *testing.T) {
 }
 
 func TestToolUseInputJSONDeltaNormalizedAcrossLiveHandoff(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.keepaliveMs = 20 * time.Millisecond
 	cfg.upstreamByteIdle = time.Second
 
@@ -268,7 +268,7 @@ func TestToolUseInputJSONDeltaNormalizedAcrossLiveHandoff(t *testing.T) {
 }
 
 func TestServerToolUseInputJSONDeltaNormalized(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	input := `{"query":"OEIS A048625 Pisot sequence P(4,6) linear recurrence proof Boyd"}`
 	rec, f := capture(t, inputJSONStream(inputJSONStreamSpec{
 		blockType: "server_tool_use",
@@ -291,7 +291,7 @@ func TestServerToolUseInputJSONDeltaNormalized(t *testing.T) {
 func TestEmptyInputJSONDeltaIsAllowed(t *testing.T) {
 	for _, blockType := range []string{"tool_use", "server_tool_use"} {
 		t.Run(blockType, func(t *testing.T) {
-			cfg = loadConfig()
+			useDefaultConfig(t)
 			rec, f := capture(t, inputJSONStream(inputJSONStreamSpec{
 				blockType: blockType,
 				toolID:    "toolu_empty",
@@ -310,7 +310,7 @@ func TestEmptyInputJSONDeltaIsAllowed(t *testing.T) {
 }
 
 func TestValidateJSONDisabledSkipsReplayParsing(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.validateJSON = false
 	const stream = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1"}}
@@ -341,7 +341,7 @@ data: {"type":"message_stop"}
 }
 
 func TestValidateJSONDisabledSkipsUsageBackfillParsing(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.validateJSON = false
 	const stream = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":0,"output_tokens":0}}}
@@ -383,7 +383,7 @@ data: {"type":"message_stop"}
 }
 
 func TestToolUseInputJSONDeltaNormalizationCanBeDisabled(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.normalizeToolJSON = false
 	chunks := []string{`{"session_id":`, `"s_raw"`, `,"timeout_ms":1000}`}
 	rec, f := capture(t, toolUseStream(chunks))
@@ -410,7 +410,7 @@ func TestCaptureTruncated(t *testing.T) {
 }
 
 func TestCaptureRejectsNamedEventWithoutData(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	s := strings.Replace(goodStream,
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
 		"event: content_block_delta\n: keep-alive\n\n"+
@@ -426,7 +426,7 @@ func TestCaptureRejectsNamedEventWithoutData(t *testing.T) {
 }
 
 func TestCaptureRejectsDataWithoutEventName(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	s := strings.Replace(goodStream,
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
 		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
@@ -441,7 +441,7 @@ func TestCaptureRejectsDataWithoutEventName(t *testing.T) {
 }
 
 func TestCaptureAllowsCommentKeepaliveBetweenEvents(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	s := strings.Replace(goodStream,
 		"event: content_block_start",
 		": keep-alive\n\n"+"event: content_block_start",
@@ -456,7 +456,7 @@ func TestCaptureAllowsCommentKeepaliveBetweenEvents(t *testing.T) {
 }
 
 func TestCaptureAllowsSSEMetadataRecords(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	s := strings.Replace(goodStream,
 		"event: content_block_start",
 		"id: event-42\nretry: 1000\n\n"+"event: content_block_start",

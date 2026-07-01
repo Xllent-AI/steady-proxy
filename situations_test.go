@@ -175,7 +175,7 @@ func eventsOf(s string) []string {
 
 // §6: a slow but progressing stream (gaps < byte-idle) is held to completion.
 func TestLongGenerationSlowDrip(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.upstreamByteIdle = 200 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -191,7 +191,7 @@ func TestLongGenerationSlowDrip(t *testing.T) {
 // turn survives the client's no-bytes ceiling). Real >300s wall-clock is the
 // live docker `long-gen` scenario; here we shrink the grace to prove the path.
 func TestKeepaliveCommitThenLive(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.keepaliveMs = 80 * time.Millisecond
 	cfg.upstreamByteIdle = 3 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
@@ -219,7 +219,7 @@ func TestKeepaliveCommitThenLive(t *testing.T) {
 // proxy ends the stream as a DROP so CC's native truncated-stream retry kicks in,
 // and the access log keeps the true cause.
 func TestLiveModeErrorNotForwardedRaw(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.keepaliveMs = 60 * time.Millisecond
 	cfg.upstreamByteIdle = 3 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
@@ -244,7 +244,7 @@ func TestLiveModeErrorNotForwardedRaw(t *testing.T) {
 
 // §6: a silent gap beyond byte-idle is a wedged upstream -> retryable.
 func TestSilentGapAborts(t *testing.T) {
-	cfg = loadConfig()
+	useDefaultConfig(t)
 	cfg.upstreamByteIdle = 150 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

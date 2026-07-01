@@ -79,6 +79,38 @@ func TestRequestLogWritesRequestAndResponse(t *testing.T) {
 	}
 }
 
+func TestRequestLogShowsResolvedModelWhenDifferent(t *testing.T) {
+	stream := strings.Replace(goodStream,
+		`{"type":"message_start","message":{"id":"msg_1"}}`,
+		`{"type":"message_start","message":{"id":"msg_1","model":"actual-model"}}`, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, stream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	dir := t.TempDir()
+	cfg.requestLogDir = dir
+	t.Cleanup(func() { cfg.requestLogDir = "" })
+
+	rec := doStream(`{"stream":true,"model":"alias-model"}`)
+	if rec.Code != 200 {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+
+	files := logFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("want exactly 1 log file, got %d (%v)", len(files), files)
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if got := string(data); !strings.Contains(got, "Who: alias-model->actual-model/main") {
+		t.Fatalf("request log missing resolved model:\n%s", got)
+	}
+}
+
 func TestRequestLogDisabledWritesNothing(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

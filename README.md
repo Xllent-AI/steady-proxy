@@ -177,6 +177,7 @@ extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
    (timestamp prefix elided on the lines below for readability)
 RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
+[local-retry] claude-opus-4-8/main http_503 503 wait=1s retry=1/6
 OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
@@ -193,7 +194,8 @@ Reading a line:
   failed *after* committing a long turn, so Claude's native dropped-stream retry
   takes over.
 - **`model/agent`** — the model called, and whether the caller is the `main` agent
-  or a spawned `sub`agent.
+  or a spawned `sub`agent. If the upstream stream echoes a different resolved
+  model, success/drop lines show `requested->resolved/agent`.
 - Then only what varies: **`in=/out=` tokens** (`in` includes cache read/create
   input tokens), **stop reason**, **`buffered`/`live`** capture mode, and
   **duration**. Buffered GPT-compatible streams also normalize final input/cache
@@ -209,6 +211,9 @@ Reading a line:
   the client receives (every transient cause is masked to a generic `503`; see
   [normalization](#what-it-does)). A single number means it was not masked (a `503`
   that was already `503`, or a surfaced `FAIL` like `request_shape 400`).
+- **`[local-retry]`** lines appear only with `PROXY_VERBOSE=1`. They are the
+  proxy's hidden in-request retries and include the same `model/agent`, the true
+  cause/status, wait time, hidden retry index, and SDK `attempt=N` when present.
 
 Responses also carry headers: `X-CC-Retry-Proxy-Mode` (`buffered`/`live`) on
 success, `X-CC-Retry-Proxy-Reason` on a synthesized error.

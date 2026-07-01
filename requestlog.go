@@ -160,7 +160,7 @@ func (rec *reqRecorder) finish() {
 func (rec *reqRecorder) writeTo(w io.Writer) {
 	fmt.Fprintln(w, "=== REQUEST ===")
 	fmt.Fprintf(w, "Timestamp: %s\n", rec.when.Format("2006-01-02T15:04:05.000Z07:00"))
-	fmt.Fprintf(w, "Method: %s   Path: %s   Who: %s\n", rec.method, rec.path, rec.who)
+	fmt.Fprintf(w, "Method: %s   Path: %s   Who: %s\n", rec.method, rec.path, rec.displayWho())
 	if q := redactQuery(rec.query); q != "" {
 		fmt.Fprintf(w, "Query: %s\n", q)
 	}
@@ -197,6 +197,13 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	if rec.resp.dropped > 0 {
 		fmt.Fprintf(w, "… [truncated %d bytes]\n", rec.resp.dropped)
 	}
+}
+
+func (rec *reqRecorder) displayWho() string {
+	if rec.stats == nil {
+		return rec.who
+	}
+	return whoWithResolvedModel(rec.who, rec.stats.model)
 }
 
 // writeCapped writes at most max bytes of p, annotating any truncation.
