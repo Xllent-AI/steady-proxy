@@ -225,7 +225,8 @@ func TestLiveModeErrorNotForwardedRaw(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rec := httptest.NewRecorder()
-	// message_start commits on the keepalive tick; the error arrives after, in live mode.
+	// This is the ungated (main-session) path, so message_start commits on the
+	// keepalive tick; the error arrives after, in live mode.
 	r := &gapReader{ctx: ctx, chunks: []string{
 		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",

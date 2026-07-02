@@ -107,7 +107,7 @@ func loadConfig() config {
 		respHeaderTO:      envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
 		upstreamByteIdle:  envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
 		keepaliveMs:       envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
-		wfKeepaliveMs:     envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 120000),    // shorter window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit + stream live before their per-agent stall watchdog (default 180s, no global env override) fires. 0 = disable (falls back to full transactional; stall bug returns).
+		wfKeepaliveMs:     envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 10000),     // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
 		deadlineMargin:    envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
 		maxRequestDur:     envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
 		sdkRetryCap:       int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
@@ -206,8 +206,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// for the window. Full transactional buffering starves it. Give ONLY those
 	// requests a shorter window so the proxy commits + streams real events (=
 	// progress) before the stall fires; every other caller keeps the full window.
+	// Workflow agents carry a per-agent stall watchdog; give them a short window
+	// AND gate its commit on real forwarded progress (see captureSSEWindow). Every
+	// other caller keeps the full window and the plain commit-at-window keepalive.
+	gated := isWorkflowAgent(body)
 	kaWindow := cfg.keepaliveMs
-	if isWorkflowAgent(body) {
+	if gated {
 		kaWindow = cfg.wfKeepaliveMs
 	}
 	tryLocalRetry := func(f failure) bool {
@@ -287,7 +291,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			rec.respHeaders = resp.Header
 			rec.stats = &st
 		}
-		wrote, fail := captureSSEWindow(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow)
+		wrote, fail := captureSSEWindow(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated)
 		resp.Body.Close()
 		if fail == nil {
 			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s",

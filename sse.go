@@ -253,22 +253,33 @@ type captureStats struct {
 //   - wrote=true,  fail!=nil  -> failed AFTER committing; can't convert, caller logs
 //   - wrote=false, fail!=nil  -> failed BEFORE committing; caller converts to a retry
 func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats) (bool, *failure) {
-	return captureSSEWindow(ctx, cancel, w, upstreamHdr, body, st, cfg.keepaliveMs)
+	return captureSSEWindow(ctx, cancel, w, upstreamHdr, body, st, cfg.keepaliveMs, false)
 }
 
 // captureSSEWindow is captureSSE with an explicit transactional/keepalive window
 // so a caller can vary it per request. Below keepaliveMs the stream is buffered
-// (a pre-commit failure converts cleanly to a retry); once the window elapses
-// the buffered prefix is committed and the rest streams live with keepalive
-// pings. Workflow-tool agents pass a shorter window than the main session so the
-// commit happens before their per-agent stall watchdog fires (see
-// isWorkflowAgent); keepaliveMs<=0 keeps the stream fully transactional.
-func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration) (bool, *failure) {
+// (a pre-commit failure converts cleanly to a retry); once the window elapses the
+// buffered prefix is committed and the rest streams live with keepalive pings.
+//
+// progressGated is for callers behind a Workflow-style stall watchdog that only
+// counts real, downstream-forwarded assistant/tool deltas as progress (keepalive
+// comments and ping do not). When set, the commit is deferred until such a delta
+// is buffered: committing a content-less prefix would feed the watchdog nothing
+// while needlessly forfeiting the clean pre-commit retry path. When unset (the
+// main session and ordinary subagents, which have no such watchdog), the window
+// commits on time regardless — so a long ping-only stream still gets keepalives
+// and never trips the client's no-bytes ceiling.
+//
+// Workflow-tool agents pass a shorter window than the main session so the commit
+// happens before their per-agent stall watchdog fires (see isWorkflowAgent);
+// keepaliveMs<=0 keeps the stream fully transactional.
+func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated bool) (bool, *failure) {
 	sp := newSpool()
 	parser := &sseParser{}
 	val := &streamValidator{}
 	toolVal := &toolJSONValidator{}
 	toolNorm := &toolJSONReplayNormalizer{}
+	prog := &progressTracker{}
 	committed := false
 	headerWritten := false
 
@@ -326,29 +337,67 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 	idleTimer := time.NewTimer(cfg.upstreamByteIdle)
 	defer idleTimer.Stop()
 
+	// commitLive sends headers + the buffered prefix, then switches to live
+	// streaming. Returns a failure only if replaying the buffer fails.
+	commitLive := func() *failure {
+		writeHead("live")
+		committed = true
+		if err := sp.replayWithNormalizer(w, toolNorm); err != nil {
+			sp.discard()
+			return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
+		}
+		return nil
+	}
+	graceElapsed := false // the transactional window has fired at least once
+
 	for {
 		select {
 		case r := <-ch:
 			if len(r.data) > 0 {
 				idleTimer.Reset(cfg.upstreamByteIdle)
-				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, w, &committed, writeHead, flush, st)
+				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, prog, w, &committed, writeHead, flush, st)
 				if ret {
 					return wrote, fail
 				}
 			}
+			// Check the read error BEFORE any deferred commit: a read can return
+			// data together with io.EOF, and if that final read is a truncation
+			// (no message_stop) we must convert it to a clean uncommitted retry
+			// rather than commit the partial buffer and log a post-commit DROP.
 			if r.err != nil {
 				return onReadErr(r.err, ctx, committed, flush)
+			}
+			// Clean read, gated caller: the window already elapsed and real
+			// forwarded content is now buffered — commit immediately instead of
+			// waiting for the next keepalive tick (a full window away, long enough
+			// for the watchdog/TTFB ceiling to fire on a healthy stream).
+			if progressGated && !committed && graceElapsed && prog.sawForwardable {
+				if f := commitLive(); f != nil {
+					return true, f
+				}
+				flush()
 			}
 		case <-keepTimer.C:
 			if keepEvery <= 0 {
 				continue
 			}
+			graceElapsed = true
 			if !committed {
-				writeHead("live") // grace elapsed: commit buffered prefix, go live
-				committed = true
-				if err := sp.replayWithNormalizer(w, toolNorm); err != nil {
-					sp.discard()
-					return true, &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
+				// Gated caller (Workflow stall watchdog): only commit once real
+				// forwarded content (a non-withheld content_block_delta) is buffered.
+				// Committing a content-less prefix (message_start/ping) would send
+				// 200 + keepalive comments — which the watchdog ignores (no progress)
+				// — while forfeiting the clean pre-commit retry path. Stay buffered
+				// until content arrives; the per-chunk check above then commits
+				// promptly, and the idle watchdog + deadline still bound a silent
+				// upstream. Ungated callers commit here regardless, so a long
+				// ping-only stream keeps getting keepalives and never times out.
+				if progressGated && !prog.sawForwardable {
+					keepTimer.Reset(keepEvery)
+					continue
+				}
+				if f := commitLive(); f != nil {
+					return true, f
 				}
 			}
 			io.WriteString(w, ": keepalive\n\n")
@@ -377,7 +426,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 }
 
 // process handles one chunk. ret=true means captureSSE should return (wrote,fail).
-func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, toolVal *toolJSONValidator, toolNorm *toolJSONReplayNormalizer, w http.ResponseWriter,
+func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, toolVal *toolJSONValidator, toolNorm *toolJSONReplayNormalizer, prog *progressTracker, w http.ResponseWriter,
 	committed *bool, writeHead func(string), flush func(), st *captureStats) (bool, *failure, bool) {
 	for _, ev := range parser.feed(data) {
 		if st != nil {
@@ -444,6 +493,7 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 			sp.discard()
 			return false, &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: "out-of-order stream event"}, true
 		}
+		prog.accept(ev) // does the buffered prefix now forward incremental progress?
 		if err := sp.write(ev.raw); err != nil {
 			sp.discard()
 			// transient:false is intentional — the same request will always
@@ -757,6 +807,54 @@ var errInvalidSSEEventShape = errors.New("invalid SSE event shape")
 
 func normalizeToolJSONEnabled() bool {
 	return cfg.validateJSON && cfg.normalizeToolJSON
+}
+
+// progressTracker mirrors, during buffering, whether the buffered prefix would
+// forward at least one incremental content_block_delta downstream when replayed —
+// the real progress a Workflow stall watchdog counts (keepalive comments and ping
+// do not). It accounts for tool-JSON normalization, which withholds
+// input_json_delta fragments until the content_block_stop that coalesces them
+// (see toolJSONReplayNormalizer): a text/thinking delta is progress immediately,
+// a tool block's input becomes progress at its stop, and with normalization off
+// every delta is forwarded as-is.
+type progressTracker struct {
+	sawForwardable   bool
+	toolInputPending map[int]bool
+}
+
+func (p *progressTracker) accept(ev event) {
+	if p.sawForwardable {
+		return
+	}
+	switch ev.name {
+	case "content_block_delta":
+		if !normalizeToolJSONEnabled() {
+			p.sawForwardable = true // nothing is withheld; forwarded as-is
+			return
+		}
+		var s streamPayload
+		if json.Unmarshal([]byte(ev.data), &s) != nil {
+			p.sawForwardable = true // unparseable here; forwarded as-is at replay
+			return
+		}
+		if s.Delta.Type != "input_json_delta" {
+			p.sawForwardable = true // text/thinking delta forwarded as-is
+			return
+		}
+		if p.toolInputPending == nil {
+			p.toolInputPending = map[int]bool{}
+		}
+		p.toolInputPending[s.Index] = true // withheld until this block's stop
+	case "content_block_stop":
+		var s streamPayload
+		if json.Unmarshal([]byte(ev.data), &s) != nil {
+			return
+		}
+		if p.toolInputPending[s.Index] {
+			p.sawForwardable = true // the coalesced tool delta is emitted at this stop
+			delete(p.toolInputPending, s.Index)
+		}
+	}
 }
 
 func blockUsesInputJSON(blockType string) bool {

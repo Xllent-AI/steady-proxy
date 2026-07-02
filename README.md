@@ -112,13 +112,29 @@ have no such watchdog.
 The proxy fixes this transparently: it detects a workflow agent by the prologue
 the Workflow runtime injects into its `system` prompt (*"You are a subagent
 spawned by a workflow orchestration script"*) and gives **only those requests** a
-shorter transactional window, `PROXY_WORKFLOW_KEEPALIVE_MS` (default 120 000). A
-workflow turn that runs past the window commits its buffered prefix and streams
-the rest live — real events the watchdog counts as progress — so it never stalls,
-while turns that finish sooner stay fully transactional (cleanly retryable). The
-detection is scoped to the `system` field, so a *main* session that merely
-discusses workflows is never misclassified. These requests show as `/wf` in the
-access log. Everything else keeps `PROXY_KEEPALIVE_MS`.
+**small** transactional window, `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10 000). A
+workflow turn that runs past the window commits its buffered prefix and then
+streams the rest live — real events the watchdog counts as progress — so it clears
+the *first-gap* stall (see below), while turns that finish inside the window stay
+fully transactional (cleanly retryable). The detection is scoped to the `system`
+field, so a *main* session that merely discusses workflows is never misclassified.
+These requests show as `/wf` in the access log. Everything else keeps
+`PROXY_KEEPALIVE_MS`.
+
+**Why small, precisely.** The watchdog kills on a *forwarded-content-delta gap*:
+it aborts when `stallMs` passes with no real delta reaching the client (keepalive
+comments and `ping` do not count) — i.e. at `(last forwarded delta) + stallMs`.
+While the proxy buffers it forwards nothing, so the **first gap** — query start to
+the first forwarded delta — is roughly `window + upstream TTFB`. A small window
+keeps that first gap under `stallMs`; that first-gap stall is the one this proxy
+prevents. A large window (e.g. 120 000) is not *automatically* fatal — if the
+upstream then streams steadily the turn can still survive — but it pushes the
+first gap toward `stallMs` and delays going live, so small is the safe default.
+**What the proxy cannot fix:** once past the first gap the stream is governed by
+the upstream's own content-delta gaps, which the proxy cannot change — a genuine
+mid-turn content-silent pause ≥ `stallMs` (server-side reasoning emitting only
+pings, or a slow first byte under `effort:'high'`) will still stall. The only
+remedy there is a larger per-agent `stallMs`.
 
 > The robustness cost is small and targeted: pre-stream transient failures (5xx,
 > `overloaded_error`, rate limits, capacity, connection errors) are classified
@@ -273,7 +289,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional `/v1/messages` attempt. `1` means one extra upstream try before returning a retryable response to Claude Code |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
-| `PROXY_WORKFLOW_KEEPALIVE_MS` | `120000` | **workflow agents only** — a shorter window so the proxy commits + streams live before Claude Code's Workflow per-agent **stall** watchdog (default ~180 s, no global env override) kills a long turn. Keep it below 180000; `0` disables (stall returns). Other callers keep `PROXY_KEEPALIVE_MS`. See [Workflow agents](#workflow-agents) |
+| `PROXY_WORKFLOW_KEEPALIVE_MS` | `10000` | **workflow agents only** — a **small** window so the proxy commits *early* and streams live, feeding Claude Code's Workflow per-agent **stall** watchdog (default ~180 s, no global env override; kills on a forwarded-delta gap ≥ `stallMs`). Keep it small so the first gap (≈ window + TTFB) stays under `stallMs`; it can't fix a mid-turn content-silent pause ≥ `stallMs`. `0` disables (stall returns). Other callers keep `PROXY_KEEPALIVE_MS`. See [Workflow agents](#workflow-agents) |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |
