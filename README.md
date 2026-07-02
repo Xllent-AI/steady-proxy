@@ -92,6 +92,42 @@ that complete within the grace window — the reply appears in a burst, then
 completes. In exchange you get "complete reply or automatic retry, never a stuck
 half-reply."
 
+## Workflow agents
+
+Claude Code's **Workflow** tool (`agent()` calls in an orchestration script) wraps
+each agent in a **per-agent stall watchdog**: if the agent's stream produces no
+assistant/user message for the stall budget — **default 180 s**, retried a few
+times, then the agent hard-fails with *"agent stalled … no progress"* — it aborts
+the request. That budget is **hardcoded** (there is no global env override;
+`CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` drives a *different* path, and the only
+per-agent override is the script-side `agent(prompt, {stallMs})`).
+
+Full transactional buffering starves that watchdog: the proxy withholds every
+byte until the upstream stream completes, so a single workflow turn that runs
+longer than ~180 s emits nothing → the orchestrator sees no progress → it aborts
+at 180 s (the proxy logs `client_gone`), retries, and the whole agent fails. This
+hits **only workflow agents** — the interactive session and ordinary subagents
+have no such watchdog.
+
+The proxy fixes this transparently: it detects a workflow agent by the prologue
+the Workflow runtime injects into its `system` prompt (*"You are a subagent
+spawned by a workflow orchestration script"*) and gives **only those requests** a
+shorter transactional window, `PROXY_WORKFLOW_KEEPALIVE_MS` (default 120 000). A
+workflow turn that runs past the window commits its buffered prefix and streams
+the rest live — real events the watchdog counts as progress — so it never stalls,
+while turns that finish sooner stay fully transactional (cleanly retryable). The
+detection is scoped to the `system` field, so a *main* session that merely
+discusses workflows is never misclassified. These requests show as `/wf` in the
+access log. Everything else keeps `PROXY_KEEPALIVE_MS`.
+
+> The robustness cost is small and targeted: pre-stream transient failures (5xx,
+> `overloaded_error`, rate limits, capacity, connection errors) are classified
+> *before* any bytes are captured, so they still convert to clean retries for
+> workflow agents too. Only a mid-stream truncation on a turn already past the
+> window degrades from a clean retry to a `DROP` (Claude's native dropped-stream
+> retry). If a workflow sets a per-agent `stallMs` **below**
+> `PROXY_WORKFLOW_KEEPALIVE_MS`, lower the window to match.
+
 ## Run (docker compose — recommended)
 
 ```bash
@@ -237,6 +273,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional `/v1/messages` attempt. `1` means one extra upstream try before returning a retryable response to Claude Code |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
+| `PROXY_WORKFLOW_KEEPALIVE_MS` | `120000` | **workflow agents only** — a shorter window so the proxy commits + streams live before Claude Code's Workflow per-agent **stall** watchdog (default ~180 s, no global env override) kills a long turn. Keep it below 180000; `0` disables (stall returns). Other callers keep `PROXY_KEEPALIVE_MS`. See [Workflow agents](#workflow-agents) |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |

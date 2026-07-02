@@ -253,6 +253,17 @@ type captureStats struct {
 //   - wrote=true,  fail!=nil  -> failed AFTER committing; can't convert, caller logs
 //   - wrote=false, fail!=nil  -> failed BEFORE committing; caller converts to a retry
 func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats) (bool, *failure) {
+	return captureSSEWindow(ctx, cancel, w, upstreamHdr, body, st, cfg.keepaliveMs)
+}
+
+// captureSSEWindow is captureSSE with an explicit transactional/keepalive window
+// so a caller can vary it per request. Below keepaliveMs the stream is buffered
+// (a pre-commit failure converts cleanly to a retry); once the window elapses
+// the buffered prefix is committed and the rest streams live with keepalive
+// pings. Workflow-tool agents pass a shorter window than the main session so the
+// commit happens before their per-agent stall watchdog fires (see
+// isWorkflowAgent); keepaliveMs<=0 keeps the stream fully transactional.
+func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration) (bool, *failure) {
 	sp := newSpool()
 	parser := &sseParser{}
 	val := &streamValidator{}
@@ -309,7 +320,7 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 		}
 	}()
 
-	keepEvery := cfg.keepaliveMs
+	keepEvery := keepaliveMs
 	keepTimer := time.NewTimer(timerOr(keepEvery))
 	defer keepTimer.Stop()
 	idleTimer := time.NewTimer(cfg.upstreamByteIdle)

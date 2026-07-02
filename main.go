@@ -77,6 +77,7 @@ type config struct {
 	respHeaderTO      time.Duration
 	upstreamByteIdle  time.Duration
 	keepaliveMs       time.Duration
+	wfKeepaliveMs     time.Duration
 	deadlineMargin    time.Duration
 	maxRequestDur     time.Duration
 	sdkRetryCap       int
@@ -106,6 +107,7 @@ func loadConfig() config {
 		respHeaderTO:      envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
 		upstreamByteIdle:  envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
 		keepaliveMs:       envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
+		wfKeepaliveMs:     envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 120000),    // shorter window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit + stream live before their per-agent stall watchdog (default 180s, no global env override) fires. 0 = disable (falls back to full transactional; stall bug returns).
 		deadlineMargin:    envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
 		maxRequestDur:     envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
 		sdkRetryCap:       int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
@@ -153,8 +155,8 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy listening on http://%s -> %s  (transactional, keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d; one log line per request)",
-		cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries)
+	log.Printf("cc-retry-proxy listening on http://%s -> %s  (transactional, keepalive=%s, wf-keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d; one log line per request)",
+		cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -198,6 +200,16 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	var last failure
 	proxyRetries := 0
 	reqWho := who(r, body)
+
+	// Workflow-tool agents carry a per-agent "stall" watchdog (default 180s, no
+	// global env override) that aborts a turn streaming no assistant/user message
+	// for the window. Full transactional buffering starves it. Give ONLY those
+	// requests a shorter window so the proxy commits + streams real events (=
+	// progress) before the stall fires; every other caller keeps the full window.
+	kaWindow := cfg.keepaliveMs
+	if isWorkflowAgent(body) {
+		kaWindow = cfg.wfKeepaliveMs
+	}
 	tryLocalRetry := func(f failure) bool {
 		if cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
 			return false
@@ -275,7 +287,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			rec.respHeaders = resp.Header
 			rec.stats = &st
 		}
-		wrote, fail := captureSSE(ctx, cancel, w, resp.Header, resp.Body, &st)
+		wrote, fail := captureSSEWindow(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow)
 		resp.Body.Close()
 		if fail == nil {
 			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s",
@@ -492,7 +504,18 @@ func isEventStream(ct string) bool { return strings.Contains(strings.ToLower(ct)
 // The method/path/gateway are static for the transactional route, so omitted.
 
 func who(r *http.Request, body []byte) string {
-	return modelOf(body) + "/" + agentKind(r)
+	return modelOf(body) + "/" + agentKindFull(r, body)
+}
+
+// agentKindFull refines agentKind with a body-derived signal: a Workflow-tool
+// agent is labeled "wf" (it is neither the interactive "main" session nor a
+// generic "sub"agent, and only it carries the Workflow per-agent stall). Falls
+// back to the header-only agentKind for everything else.
+func agentKindFull(r *http.Request, body []byte) string {
+	if isWorkflowAgent(body) {
+		return "wf"
+	}
+	return agentKind(r)
 }
 
 func whoWithResolvedModel(reqWho, resolvedModel string) string {
@@ -639,6 +662,32 @@ func agentKind(r *http.Request) string {
 		return "sub"
 	}
 	return "main"
+}
+
+// workflowAgentMarker is the fixed prologue the Claude Code Workflow runtime
+// injects into every workflow agent()'s system prompt: "You are a subagent
+// spawned by a workflow orchestration script. Use the tools available to
+// complete the task." ONLY these agents carry the Workflow tool's per-agent
+// stall watchdog (default 180000ms = Rkf in the CLI, retried CIl=5×, with no
+// global env override) that aborts a turn which streams no assistant/user
+// message for the window. Regular Task/SDK subagents (system prompt "You are a
+// Claude agent, built on … the Agent SDK") and the interactive main session do
+// NOT carry it, so they must keep the full transactional window.
+var workflowAgentMarker = []byte("workflow orchestration script")
+
+// isWorkflowAgent reports whether a /v1/messages request is a Workflow-tool
+// agent. It matches the marker in the request's `system` field ONLY: scoping to
+// system (not the whole body) avoids a false positive on an ordinary
+// conversation whose messages merely mention workflows — e.g. a main session
+// discussing the Workflow tool, which is not itself a workflow agent.
+func isWorkflowAgent(body []byte) bool {
+	var b struct {
+		System json.RawMessage `json:"system"`
+	}
+	if json.Unmarshal(body, &b) != nil {
+		return false
+	}
+	return bytes.Contains(b.System, workflowAgentMarker)
 }
 
 func htok(n int) string {
