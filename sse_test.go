@@ -753,7 +753,7 @@ func TestPingRunTripwire(t *testing.T) {
 	}, gap: 2 * time.Millisecond}
 	// Large window + ungated: buffer the whole turn and commit at message_stop, so
 	// every event (incl. pings) passes through process() and is counted.
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, &st, time.Hour, false)
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, &st, time.Hour, false, false)
 	if f != nil {
 		t.Fatalf("unexpected failure %+v", *f)
 	}

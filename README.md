@@ -231,6 +231,7 @@ RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
 [local-retry] claude-opus-4-8/main http_503 503 wait=1s retry=1/6
 OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
+WARN  claude-fable-5/main  refusal -> retry with claude-opus-4-8  in=258.8k out=2.8k tok  40.7s
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
 OK    /v1/messages/count_tokens  200  730B  2ms
@@ -242,9 +243,11 @@ Every line is prefixed by the logger with the date and time at second resolution
 Reading a line:
 - **First column** = outcome — `OK` served · `RETRY` converted to an automatic
   retry (`x-should-retry: true` + `Retry-After` backoff, the SDK re-sends) ·
-  `FAIL` surfaced to you (request-shape error, or retry backstop hit) · `DROP`
-  failed *after* committing a long turn, so Claude's native dropped-stream retry
-  takes over.
+  `WARN` a `stop_reason: "refusal"` was intercepted and the request re-issued with
+  `PROXY_REFUSAL_FALLBACK_MODEL` (`refusal -> retry with <model>`; a following `OK`
+  line reports the fallback's result) · `FAIL` surfaced to you (request-shape
+  error, or retry backstop hit) · `DROP` failed *after* committing a long turn, so
+  Claude's native dropped-stream retry takes over.
 - **`model/agent`** — the model called, and whether the caller is the `main` agent
   or a spawned `sub`agent. If the upstream stream echoes a different resolved
   model, success/drop lines show `requested->resolved/agent`.
@@ -293,6 +296,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |
+| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-4-8` | when a request completes with `stop_reason: "refusal"`, silently re-issue the same request with this model instead of returning the refusal (logs a `WARN`). Fires at most once per request (a refusal from the fallback model is delivered as-is) and only on the buffered path; every non-model field is preserved. Set to `off`/`none`/empty to disable. Needs `PROXY_VALIDATE_JSON=1` |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a single buffered response |

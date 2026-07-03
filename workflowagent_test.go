@@ -112,7 +112,7 @@ func TestCaptureSSEWindowEarlyCommit(t *testing.T) {
 		defer cancel()
 		rec := httptest.NewRecorder()
 		r := &gapReader{ctx: ctx, chunks: chunks, gap: 40 * time.Millisecond}
-		wrote, f = captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, window, true)
+		wrote, f = captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, window, true, false)
 		return rec.Header().Get("X-CC-Retry-Proxy-Mode"), wrote, f
 	}
 
@@ -160,7 +160,7 @@ func TestWindowCommitGatedOnProgress(t *testing.T) {
 		"event: ping\ndata: {\"type\":\"ping\"}\n\n",
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
 	}, gap: 30 * time.Millisecond}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true)
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
 
 	if wrote {
 		t.Fatalf("content-less prefix must stay uncommitted (cleanly retryable), but committed; body=%q", rec.Body.String())
@@ -194,7 +194,7 @@ func TestWindowGateIgnoresWithheldToolDelta(t *testing.T) {
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n",
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
 	}, gap: 30 * time.Millisecond}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true)
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
 
 	if wrote {
 		t.Fatalf("withheld tool delta must not trip the gate (stay cleanly retryable), but committed; body=%q", rec.Body.String())
@@ -230,7 +230,7 @@ func TestWindowGateOpensOnToolBlockStop(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
 			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 	}, gap: 40 * time.Millisecond}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true)
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
 
 	if f != nil {
 		t.Fatalf("expected success, got failure %+v", *f)
@@ -287,7 +287,7 @@ func TestGatedCommitSkippedOnDataPlusEOF(t *testing.T) {
 			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
 		delay: 60 * time.Millisecond, // lands after the 20ms window (grace) elapses
 	}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true)
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
 
 	if wrote {
 		t.Fatalf("a data+EOF truncation must stay uncommitted (clean retry), but committed; body=%q", rec.Body.String())
@@ -326,7 +326,7 @@ func TestWindowCommitsLiveOnDelayedContent(t *testing.T) {
 			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
 			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 	}, gap: 90 * time.Millisecond}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 150*time.Millisecond, true)
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 150*time.Millisecond, true, false)
 
 	if f != nil {
 		t.Fatalf("expected success, got failure %+v", *f)

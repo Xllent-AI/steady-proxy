@@ -255,7 +255,7 @@ type captureStats struct {
 //   - wrote=true,  fail!=nil  -> failed AFTER committing; can't convert, caller logs
 //   - wrote=false, fail!=nil  -> failed BEFORE committing; caller converts to a retry
 func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats) (bool, *failure) {
-	return captureSSEWindow(ctx, cancel, w, upstreamHdr, body, st, cfg.keepaliveMs, false)
+	return captureSSEWindow(ctx, cancel, w, upstreamHdr, body, st, cfg.keepaliveMs, false, false)
 }
 
 // captureSSEWindow is captureSSE with an explicit transactional/keepalive window
@@ -275,7 +275,15 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 // Workflow-tool agents pass a shorter window than the main session so the commit
 // happens before their per-agent stall watchdog fires (see isWorkflowAgent);
 // keepaliveMs<=0 keeps the stream fully transactional.
-func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated bool) (bool, *failure) {
+//
+// interceptRefusal, when set, makes a COMPLETE stream whose stop_reason is
+// "refusal" return the refusalFallbackCode sentinel (wrote=false, fail!=nil)
+// instead of being replayed downstream — so the caller can re-issue with a
+// fallback model. It only fires on the uncommitted (buffered) path: once the
+// stream has committed live the refusal bytes are already downstream and cannot
+// be swapped. Requires st!=nil and JSON validation on (that is what scrapes
+// stop_reason); otherwise it is a no-op and the refusal is delivered normally.
+func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, interceptRefusal bool) (bool, *failure) {
 	sp := newSpool()
 	parser := &sseParser{}
 	val := &streamValidator{}
@@ -357,7 +365,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 		case r := <-ch:
 			if len(r.data) > 0 {
 				idleTimer.Reset(cfg.upstreamByteIdle)
-				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, prog, w, &committed, writeHead, flush, st)
+				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, prog, w, &committed, writeHead, flush, st, interceptRefusal)
 				if ret {
 					return wrote, fail
 				}
@@ -429,7 +437,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 
 // process handles one chunk. ret=true means captureSSE should return (wrote,fail).
 func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, toolVal *toolJSONValidator, toolNorm *toolJSONReplayNormalizer, prog *progressTracker, w http.ResponseWriter,
-	committed *bool, writeHead func(string), flush func(), st *captureStats) (bool, *failure, bool) {
+	committed *bool, writeHead func(string), flush func(), st *captureStats, interceptRefusal bool) (bool, *failure, bool) {
 	for _, ev := range parser.feed(data) {
 		if st != nil {
 			st.bytes += int64(len(ev.raw))
@@ -517,6 +525,18 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 			return false, &failure{status: http.StatusBadGateway, atype: "api_error", code: "response_too_large", message: "response exceeded proxy buffer cap"}, true
 		}
 		if val.terminal() {
+			// Complete, valid stream — but if the model refused and the caller armed
+			// refusal interception, do NOT replay it downstream. Discard the buffered
+			// refusal and hand back the sentinel so the caller can re-issue with the
+			// fallback model. Uncommitted path only: this branch runs before any bytes
+			// (headers or buffered prefix) reach the client, so the swap is clean.
+			if interceptRefusal && st != nil && st.stop == "refusal" {
+				sp.discard()
+				// api_error/502 are defensive defaults: the handler keys on
+				// .code and never surfaces this, but a benign shape keeps any
+				// future leak clean rather than an empty error type.
+				return false, &failure{status: http.StatusBadGateway, atype: "api_error", code: refusalFallbackCode, message: "model refused; retrying with fallback model"}, true
+			}
 			writeHead("buffered")
 			if err := sp.replayWithUsage(w, st); err != nil {
 				sp.discard()
