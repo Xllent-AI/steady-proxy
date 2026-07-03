@@ -294,15 +294,15 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		wrote, fail := captureSSEWindow(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated)
 		resp.Body.Close()
 		if fail == nil {
-			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s",
-				whoWithResolvedModel(reqWho, st.model), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries))
+			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s%s%s",
+				whoWithResolvedModel(reqWho, st.model), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("OK", http.StatusOK, http.StatusOK, "")
 			return
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
-			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s",
-				whoWithResolvedModel(reqWho, st.model), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries))
+			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s%s%s",
+				whoWithResolvedModel(reqWho, st.model), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
 			return
@@ -331,8 +331,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// its x-should-retry loop. The log shows the true upstream status arrowed to
 	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
 	sStatus, sType := surface(last)
-	log.Printf("%-5s %s  %s %s%s  %s%s%s",
-		tag, reqWho, last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries))
+	log.Printf("%-5s %s  %s %s%s  %s%s%s%s",
+		tag, reqWho, last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
 	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
 	writeAnthropicError(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
@@ -388,7 +388,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 			tag = "RETRY"
 		}
 		sStatus, sType := surface(f)
-		log.Printf("%-5s %s  %s %s%s  %s%s", tag, who(r, body), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount))
+		log.Printf("%-5s %s  %s %s%s  %s%s%s", tag, who(r, body), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
 		writeAnthropicError(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
@@ -405,7 +405,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		dst = io.MultiWriter(w, sink)
 	}
 	n, _ := io.Copy(dst, resp.Body)
-	log.Printf("OK    %s  %d  %s  %s", who(r, body), resp.StatusCode, hbytes(n), since(start))
+	log.Printf("OK    %s  %d  %s  %s%s", who(r, body), resp.StatusCode, hbytes(n), since(start), rec.idField())
 	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
 }
 
@@ -588,6 +588,17 @@ func proxyRetryField(n int) string {
 		return ""
 	}
 	return fmt.Sprintf("  proxy-retries=%d", n)
+}
+
+// prunField surfaces the longest consecutive upstream ping-run — the tripwire for
+// a content-silent gap (Case B). Shown only when >0: a healthy dense stream never
+// pings in a run, so any value is worth noticing, and a large one is what a
+// Workflow stall watchdog would trip on. See captureStats.maxPingRun.
+func prunField(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("  prun=%d", n)
 }
 
 func localRetryDelay(upstreamRetryAfter int, retryIndex int) time.Duration {

@@ -227,6 +227,8 @@ func (v *streamValidator) terminal() bool {
 type captureStats struct {
 	mode                  string    // "buffered" | "live" | "" (never committed any bytes)
 	bytes                 int64     // SSE bytes of the response
+	maxPingRun            int       // longest run of consecutive upstream `ping` events — the content-silent-gap (Case B / stall) tripwire; 0 = content never went silent
+	curPingRun            int       // internal: current consecutive-ping counter feeding maxPingRun
 	inTok                 int       // total input tokens incl. cache read/create (latest usage event)
 	inputTok              int       // usage.input_tokens component of inTok
 	cacheCreationTok      int       // usage.cache_creation_input_tokens component of inTok
@@ -431,6 +433,19 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 	for _, ev := range parser.feed(data) {
 		if st != nil {
 			st.bytes += int64(len(ev.raw))
+			// Tripwire: track the longest run of consecutive upstream `ping` events.
+			// A ping run with no intervening content is exactly a content-silent gap
+			// — what a Workflow stall watchdog counts toward a kill. Any non-ping
+			// event breaks the run. Healthy dense streams stay at 0; a climbing value
+			// is the signal Case B (mid-turn silence) has started to appear.
+			if ev.name == "ping" {
+				st.curPingRun++
+				if st.curPingRun > st.maxPingRun {
+					st.maxPingRun = st.curPingRun
+				}
+			} else {
+				st.curPingRun = 0
+			}
 			if cfg.validateJSON {
 				scrapeUsage(ev, st)
 			}

@@ -10,6 +10,8 @@ package main
 
 import (
 	"bufio"
+	crand "crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,6 +59,7 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 
 // reqRecorder accumulates one request/response for later writing by finish().
 type reqRecorder struct {
+	id           string // short correlation id: printed in the access log AND embedded in this dump's filename/body, so a bad log line pins to the exact payload
 	when         time.Time
 	method       string
 	path         string
@@ -78,6 +81,7 @@ type reqRecorder struct {
 
 func newReqRecorder(start time.Time, r *http.Request, body []byte) *reqRecorder {
 	return &reqRecorder{
+		id:         newReqID(),
 		when:       start,
 		method:     r.Method,
 		path:       r.URL.Path,
@@ -140,7 +144,7 @@ func (rec *reqRecorder) finish() {
 		vlog("[request-log] mkdir %s: %v", cfg.requestLogDir, err)
 		return
 	}
-	path := filepath.Join(cfg.requestLogDir, requestLogName(rec.path))
+	path := filepath.Join(cfg.requestLogDir, requestLogName(rec.path, rec.id))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		vlog("[request-log] create %s: %v", path, err)
@@ -159,6 +163,7 @@ func (rec *reqRecorder) finish() {
 
 func (rec *reqRecorder) writeTo(w io.Writer) {
 	fmt.Fprintln(w, "=== REQUEST ===")
+	fmt.Fprintf(w, "Id: %s\n", dash(rec.id))
 	fmt.Fprintf(w, "Timestamp: %s\n", rec.when.Format("2006-01-02T15:04:05.000Z07:00"))
 	fmt.Fprintf(w, "Method: %s   Path: %s   Who: %s\n", rec.method, rec.path, rec.displayWho())
 	if q := redactQuery(rec.query); q != "" {
@@ -173,8 +178,8 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s%s\n",
 		dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code), proxyRetryField(rec.proxyRetries))
 	if st := rec.stats; st != nil {
-		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   dur=%s\n",
-			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), since(rec.when))
+		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   prun=%d   dur=%s\n",
+			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), st.maxPingRun, since(rec.when))
 		if normalizeToolJSONEnabled() {
 			fmt.Fprintln(w, "Note: response body is raw upstream capture; downstream tool JSON may be normalized.")
 		}
@@ -292,13 +297,38 @@ func redactQuery(raw string) string {
 	return vals.Encode()
 }
 
-var requestLogSeq atomic.Uint64
+// requestIDSeq is a monotonic fallback used only if crypto/rand ever fails.
+var requestIDSeq atomic.Uint64
 
-// requestLogName builds a collision-free, sortable filename for one request,
-// e.g. v1-messages-20260621t143005-000017.log.
-func requestLogName(urlPath string) string {
-	return fmt.Sprintf("%s-%s-%06d.log",
-		sanitizeForFilename(urlPath), time.Now().Format("20060102t150405"), requestLogSeq.Add(1))
+// newReqID returns a short, greppable correlation id (8 hex chars). It ties one
+// access-log line to the exact request/response dump: the id is printed in the
+// log line (idField), embedded in the dump filename, and written in the dump
+// body — so a bad line points straight at the payload via `ls logs/*<id>*` or a
+// grep. Falls back to a monotonic counter in the (practically impossible) event
+// crypto/rand fails, so an id is always produced.
+func newReqID() string {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x", requestIDSeq.Add(1))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// idField renders the correlation id for a one-line access log; nil-safe and
+// empty when request logging is off (no dump exists to point at), so the id only
+// appears when it is actually actionable.
+func (rec *reqRecorder) idField() string {
+	if rec == nil || rec.id == "" {
+		return ""
+	}
+	return "  id=" + rec.id
+}
+
+// requestLogName builds a collision-free, sortable filename for one request whose
+// unique suffix is the correlation id, e.g. v1-messages-20260621t143005-a1b2c3d4.log.
+func requestLogName(urlPath, id string) string {
+	return fmt.Sprintf("%s-%s-%s.log",
+		sanitizeForFilename(urlPath), time.Now().Format("20060102t150405"), id)
 }
 
 // sanitizeForFilename reduces a URL path to a safe, bounded filename stem.

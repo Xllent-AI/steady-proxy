@@ -725,3 +725,42 @@ func inputJSONDeltas(t *testing.T, body string) []string {
 	}
 	return out
 }
+
+// TestPingRunTripwire verifies captureStats records the LONGEST run of consecutive
+// upstream `ping` events — the content-silent-gap tripwire. A dense stream with a
+// 3-ping run and a later 1-ping run must report maxPingRun=3; any non-ping event
+// (here, content deltas) breaks the run.
+func TestPingRunTripwire(t *testing.T) {
+	useDefaultConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	var st captureStats
+	ping := "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+	delta := func(s string) string {
+		return "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" + s + "\"}}\n\n"
+	}
+	r := &gapReader{ctx: ctx, chunks: []string{
+		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n",
+		delta("Hi"),
+		ping, ping, ping, // longest run = 3
+		delta("!"),
+		ping, // isolated run = 1
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}, gap: 2 * time.Millisecond}
+	// Large window + ungated: buffer the whole turn and commit at message_stop, so
+	// every event (incl. pings) passes through process() and is counted.
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, &st, time.Hour, false)
+	if f != nil {
+		t.Fatalf("unexpected failure %+v", *f)
+	}
+	if !wrote {
+		t.Fatalf("expected a committed write")
+	}
+	if st.maxPingRun != 3 {
+		t.Fatalf("maxPingRun=%d, want 3 (longest consecutive ping run)", st.maxPingRun)
+	}
+}

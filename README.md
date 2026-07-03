@@ -311,13 +311,21 @@ proxy writes **one human-readable file per request** into it:
 
 ```
 PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./cc-retry-proxy
-# ./logs/v1-messages-20260621t143005-000001.log
+# ./logs/v1-messages-20260621t143005-a1b2c3d4.log   (a1b2c3d4 = the correlation id)
 ```
 
 Each file has a `=== REQUEST ===` section (method, path, headers, body) and a
-`=== RESPONSE ===` section (outcome, token/stop/mode stats, headers, and the
+`=== RESPONSE ===` section (outcome, token/stop/mode/prun stats, headers, and the
 captured SSE events — or the body for non-streaming routes). Notes:
 
+- **Correlation id.** Every access-log line carries `id=<hex>`, and that same id is
+  the dump's filename suffix and its `Id:` line — so a bad line pins straight to the
+  payload: `ls logs/*<id>*` (or `grep -l <id> logs/*.log`). The id only appears in
+  the log when `PROXY_REQUEST_LOG_DIR` is set (otherwise there's no dump to point at).
+- **`prun` (ping-run).** The stats line reports the longest run of consecutive
+  upstream `ping` events — a content-silent-gap tripwire. Healthy dense streams stay
+  at `0`; a climbing `prun` on a `DROP` is the signature of a genuine mid-turn
+  upstream pause (what a Workflow stall watchdog kills on).
 - **Secrets are redacted.** `Authorization`, `x-api-key`, `cookie`, and similar
   headers are written as `***redacted (…last4)***`, never in full.
 - **Bodies are capped** at `PROXY_REQUEST_LOG_MAX_BYTES` (default 10 MiB) each, so a

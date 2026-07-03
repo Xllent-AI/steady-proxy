@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -76,6 +78,57 @@ func TestRequestLogWritesRequestAndResponse(t *testing.T) {
 	// Filename should be derived from the route path.
 	if base := filepath.Base(files[0]); !strings.HasPrefix(base, "v1-messages-") {
 		t.Errorf("unexpected log filename %q", base)
+	}
+}
+
+// TestRequestLogIDCorrelatesLogLineToDump is the whole point of the correlation
+// id: the exact id printed in the one-line access log must also be in the dump's
+// filename and body, so a bad log line pins straight to the payload.
+func TestRequestLogIDCorrelatesLogLineToDump(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	dir := t.TempDir()
+	cfg.requestLogDir = dir
+	t.Cleanup(func() { cfg.requestLogDir = "" })
+
+	// Capture the access log so we can match its id= against the dump.
+	var logbuf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&logbuf)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	if rec := doStream(`{"stream":true,"model":"m"}`); rec.Code != 200 {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	files := logFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("want 1 log file, got %d", len(files))
+	}
+	body, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+
+	// The id the dump recorded.
+	id := ""
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "Id: ") {
+			id = strings.TrimSpace(strings.TrimPrefix(line, "Id: "))
+			break
+		}
+	}
+	if id == "" || id == "-" {
+		t.Fatalf("dump has no Id: line:\n%s", body)
+	}
+	if base := filepath.Base(files[0]); !strings.Contains(base, id) {
+		t.Fatalf("dump filename %q does not contain id %q", base, id)
+	}
+	if al := logbuf.String(); !strings.Contains(al, "id="+id) {
+		t.Fatalf("access log line missing id=%s:\n%s", id, al)
 	}
 }
 
