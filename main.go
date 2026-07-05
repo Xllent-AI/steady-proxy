@@ -130,6 +130,9 @@ var (
 )
 
 func main() {
+	if handleVersionCLI(os.Args[1:]) {
+		return
+	}
 	log.SetFlags(log.LstdFlags) // timestamp every line at second resolution: date + HH:MM:SS
 	cfg = loadConfig()
 
@@ -157,12 +160,15 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy listening on http://%s -> %s  (transactional, keepalive=%s, wf-keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
-		cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
+	log.Printf("cc-retry-proxy %s listening on http://%s -> %s  (transactional, keepalive=%s, wf-keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
+		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
 	log.Fatal(srv.ListenAndServe())
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
+	if handleVersionRequest(w, r) {
+		return
+	}
 	reqStart := time.Now()
 	// Only POST /v1/messages gets the full transactional treatment. Everything
 	// else (e.g. /v1/messages/count_tokens, model listing) is forwarded with a

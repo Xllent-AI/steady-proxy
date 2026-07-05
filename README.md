@@ -159,7 +159,8 @@ Then point Claude Code at it (next section). Logs: `docker compose logs -f proxy
 
 ```bash
 cd cc-retry-proxy
-go build -o cc-retry-proxy .
+make build                  # stamps VERSION + git commit + build date
+./cc-retry-proxy --version
 go test -race ./...          # unit + integration tests
 ./test/live.sh               # live: real `claude -p` -> proxy -> mock + real gateway
 ```
@@ -168,6 +169,20 @@ Run the binary directly instead of compose:
 
 ```bash
 PROXY_UPSTREAM_URL=https://your-gateway.example.com PROXY_LISTEN_ADDR=127.0.0.1:8789 ./cc-retry-proxy
+```
+
+`docker compose up -d --build` stamps the binary with `VERSION`, the current Git
+commit (from minimal `.git` metadata copied into the build context), and a build
+timestamp. For fully explicit release builds, use:
+
+```bash
+make docker-build
+```
+
+To query a running proxy without reading process state:
+
+```bash
+curl -s http://127.0.0.1:8789/__version
 ```
 
 Background / persistent (systemd user unit, survives logout):
@@ -224,6 +239,7 @@ The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only add
 extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 
 ```text
+2026/06/21 16:34:00  cc-retry-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-4-8; one log line per request)
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
    (timestamp prefix elided on the lines below for readability)

@@ -9,10 +9,19 @@
 # descends into it, then re-exclude its contents and allow only main.go — so a
 # future file dropped under testupstream/ can't silently enter the context.
 !go.mod
+!VERSION
 !*.go
 !testupstream/
 testupstream/*
 !testupstream/main.go
+
+# Copy only enough Git metadata for Dockerfile to stamp the binary with the
+# current commit. Do not include .git/config, hooks, objects, or logs.
+!.git/
+!.git/HEAD
+!.git/refs/
+!.git/refs/**
+!.git/packed-refs
 
 # ...but still drop test sources that slipped through the *.go allow above
 # (go build ignores them anyway; no reason to send them to the daemon).

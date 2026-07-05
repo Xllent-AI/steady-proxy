@@ -187,8 +187,8 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	writeCapped(w, rec.reqBody, requestLogCap())
 
 	fmt.Fprintln(w, "\n=== RESPONSE ===")
-	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s%s%s\n",
-		dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code), proxyRetryField(rec.proxyRetries), modelSwapField(rec.swapReason, rec.swapFrom, rec.swapTo))
+	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s%s%s%s\n",
+		dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code), proxyRetryField(rec.proxyRetries), modelSwapField(rec.swapReason, rec.swapFrom, rec.swapTo), proxyVersionField())
 	if st := rec.stats; st != nil {
 		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   prun=%d   dur=%s\n",
 			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), st.maxPingRun, since(rec.when))
