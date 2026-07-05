@@ -88,7 +88,7 @@ type config struct {
 	requestLogMax     int64  // per-section cap (request body, response body) written per file
 	validateJSON      bool
 	normalizeToolJSON bool
-	refusalFallback   string // model to re-issue with when a stream ends in stop_reason "refusal"; "" = feature off
+	refusalFallback   string // model to re-issue with when a model refusal/safeguard is detected; "" = feature off
 	verbose           bool
 }
 
@@ -238,6 +238,30 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		proxyRetries++
 		return true
 	}
+	swapToFallback := func(reason string, st *captureStats) bool {
+		swapped, ok := swapModel(body, cfg.refusalFallback)
+		if !ok {
+			return false
+		}
+		if st != nil {
+			log.Printf("WARN  %s  %s -> retry with %s  in=%s out=%s tok  %s%s%s",
+				whoWithResolvedModel(reqWho, st.model), reason, cfg.refusalFallback,
+				htok(st.inTok), htok(st.outTok), since(reqStart), att(retryCount), rec.idField())
+		} else {
+			log.Printf("WARN  %s  %s -> retry with %s  %s%s",
+				reqWho, reason, cfg.refusalFallback, since(reqStart), rec.idField())
+		}
+		body = swapped
+		reqWho = who(r, body)
+		// The fallback is a fresh logical request: grant it a full hidden local-retry
+		// budget rather than inheriting what the refusing model already spent. Both
+		// the explicit (proxyRetries) and the legacy (legacyFastUsed) budgets reset so
+		// a transient fallback fault is retried locally instead of surfacing a 503 that
+		// resends the original refusing body. Bounded: the swap happens at most once.
+		proxyRetries = 0
+		legacyFastUsed = false
+		return true
+	}
 
 	// With PROXY_TRANSACTIONAL_LOCAL_RETRIES=0, preserve the old behavior:
 	// initial attempt + at most one cheap local retry for fast pre-header faults.
@@ -280,6 +304,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			last = classifyHTTPError(resp)
 			resp.Body.Close()
+			if interceptRefusal {
+				if reason := refusalFallbackFailureReason(last); reason != "" && swapToFallback(reason, nil) {
+					continue
+				}
+			}
 			if tryLocalRetry(last) {
 				continue
 			}
@@ -322,28 +351,18 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			rec.note("OK", http.StatusOK, http.StatusOK, "")
 			return
 		}
-		// Refusal fallback: a complete stream that ended in stop_reason "refusal".
-		// Nothing was committed downstream and the buffered refusal was discarded, so
-		// swap in the fallback model and re-issue on the next loop iteration. This is
-		// a substitution, not a transient retry: it does not consume the local-retry
+		// Refusal fallback: either a complete stream that ended in
+		// stop_reason="refusal", or a pre-commit safeguard error reported outside
+		// the normal stream path. Nothing was committed downstream, so swap in the
+		// fallback model and re-issue on the next loop iteration. This is a
+		// substitution, not a transient retry: it does not consume the local-retry
 		// or SDK-retry budget, and it happens at most once per request (see above).
-		if !wrote && fail.code == refusalFallbackCode {
-			if swapped, ok := swapModel(body, cfg.refusalFallback); ok {
-				log.Printf("WARN  %s  refusal -> retry with %s  in=%s out=%s tok  %s%s%s",
-					whoWithResolvedModel(reqWho, st.model), cfg.refusalFallback,
-					htok(st.inTok), htok(st.outTok), since(reqStart), att(retryCount), rec.idField())
-				body = swapped
-				reqWho = who(r, body)
-				// The fallback is a fresh logical request: grant it a full hidden
-				// local-retry budget rather than inheriting what the refusing model
-				// already spent. Both the explicit (proxyRetries) and the legacy
-				// (legacyFastUsed) budgets reset so a transient fallback fault is
-				// retried locally instead of surfacing a 503 that resends the
-				// original refusing body. Bounded: the swap happens at most once.
-				proxyRetries = 0
-				legacyFastUsed = false
+		if !wrote && interceptRefusal {
+			if reason := refusalFallbackFailureReason(*fail); reason != "" && swapToFallback(reason, &st) {
 				continue
 			}
+		}
+		if !wrote && fail.code == refusalFallbackCode {
 			// Unreachable: interception is only armed for a concrete model, which
 			// guarantees swapModel succeeds. Guard anyway — the buffered refusal is
 			// already discarded, so surface a clean error rather than strand the
@@ -721,6 +740,28 @@ func modelOf(body []byte) string {
 // armed for the request. It never reaches the client: the handler recognizes it,
 // rewrites the request to the fallback model, and re-issues (see handle()).
 const refusalFallbackCode = "refusal_fallback"
+
+// refusalFallbackFailureReason reports whether an uncommitted failure should be
+// treated as a model refusal and re-issued with the configured fallback model.
+func refusalFallbackFailureReason(f failure) string {
+	if f.code == refusalFallbackCode {
+		return "refusal"
+	}
+	if isModelSafeguardRefusal(f) {
+		return "safeguard"
+	}
+	return ""
+}
+
+// isModelSafeguardRefusal catches Fable's pre-stream guardrail shape. Claude Code
+// records these as synthetic API errors, not as the normal SSE
+// message_delta.stop_reason="refusal" path, so the stream-only interception above
+// never sees them.
+func isModelSafeguardRefusal(f failure) bool {
+	msg := strings.ToLower(f.message)
+	return strings.Contains(msg, "safeguards flagged this message") ||
+		strings.Contains(msg, "claude code can't respond to this request with fable")
+}
 
 // loadRefusalFallback resolves the model to re-issue with when a response
 // completes with stop_reason "refusal". Unset -> default claude-opus-4-8. Set to

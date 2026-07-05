@@ -172,6 +172,63 @@ func TestE2ERefusalFallsBackToConfiguredModel(t *testing.T) {
 	}
 }
 
+// Fable's safeguard block can arrive as a pre-stream HTTP invalid_request error
+// rather than a normal SSE message_delta.stop_reason="refusal". It must still use
+// the configured fallback immediately instead of retrying/surfacing the same model.
+func TestE2EHTTPSafeguardFallsBackToConfiguredModel(t *testing.T) {
+	var hits atomic.Int32
+	var mu sync.Mutex
+	var bodies [][]byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, b)
+		mu.Unlock()
+		if hits.Add(1) == 1 {
+			w.Header().Set("X-Should-Retry", "false")
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations."}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.refusalFallback = "claude-opus-4-8"
+	cfg.txLocalRetries = 3
+	cfg.localBackoffCap = 0
+
+	var rec *httptest.ResponseRecorder
+	logs := captureLogs(t, func() {
+		rec = doStream(`{"stream":true,"model":"claude-fable-5","max_tokens":256}`)
+	})
+
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Hi") {
+		t.Fatalf("want fallback success 200 with content, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "safeguards flagged") {
+		t.Fatalf("the safeguard error must not be delivered to the client: %s", rec.Body.String())
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("want 2 upstream attempts (safeguard + fallback), got %d", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream bodies, got %d", len(bodies))
+	}
+	if modelOf(bodies[0]) != "claude-fable-5" {
+		t.Fatalf("first attempt model = %q, want claude-fable-5", modelOf(bodies[0]))
+	}
+	if modelOf(bodies[1]) != "claude-opus-4-8" {
+		t.Fatalf("fallback attempt model = %q, want claude-opus-4-8", modelOf(bodies[1]))
+	}
+	if !strings.Contains(logs, "WARN") || !strings.Contains(logs, "safeguard -> retry with claude-opus-4-8") {
+		t.Fatalf("missing safeguard fallback WARN log:\n%s", logs)
+	}
+}
+
 // Regression: the fallback attempt is a fresh request and must earn its own free
 // legacy fast retry (PROXY_TRANSACTIONAL_LOCAL_RETRIES=0). Here the fallback's
 // first hit is a fast 503; the proxy must fast-retry it locally and recover with

@@ -22,6 +22,9 @@ services:
       PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
       PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}" # workflow agents only: SMALL window — commit early + stream live so forwarded deltas feed their ~180s per-agent stall watchdog. Keep small: while buffering nothing is forwarded, so the first gap (~= window + TTFB) must stay under stallMs. A content-silent pause >= stallMs is unfixable here (raise the workflow's stallMs instead).
       PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
+      PROXY_VALIDATE_JSON: "${PROXY_VALIDATE_JSON:-1}"
+      PROXY_NORMALIZE_TOOL_JSON: "${PROXY_NORMALIZE_TOOL_JSON:-1}"
+      PROXY_REFUSAL_FALLBACK_MODEL: "${PROXY_REFUSAL_FALLBACK_MODEL-claude-opus-4-8}"
       PROXY_REQUEST_LOG_DIR: "${PROXY_REQUEST_LOG_DIR:-}"
       PROXY_REQUEST_LOG_MAX_BYTES: "${PROXY_REQUEST_LOG_MAX_BYTES:-10485760}"
       PROXY_VERBOSE: "${PROXY_VERBOSE:-1}"
