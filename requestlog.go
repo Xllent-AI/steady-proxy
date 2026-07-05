@@ -71,6 +71,9 @@ type reqRecorder struct {
 	resp         cappedBuffer
 	stats        *captureStats // optional: token/stop/mode summary for the SSE path
 	proxyRetries int
+	swapReason   string
+	swapFrom     string
+	swapTo       string
 
 	// outcome, set once at the terminal log site via note().
 	outcome    string
@@ -115,6 +118,15 @@ func (rec *reqRecorder) noteProxyRetries(n int) {
 		return
 	}
 	rec.proxyRetries = n
+}
+
+func (rec *reqRecorder) noteModelSwap(reason, from, to string) {
+	if rec == nil {
+		return
+	}
+	rec.swapReason = reason
+	rec.swapFrom = from
+	rec.swapTo = to
 }
 
 // note records the final outcome (mirrors the one-line access log). orig is the
@@ -175,8 +187,8 @@ func (rec *reqRecorder) writeTo(w io.Writer) {
 	writeCapped(w, rec.reqBody, requestLogCap())
 
 	fmt.Fprintln(w, "\n=== RESPONSE ===")
-	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s%s\n",
-		dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code), proxyRetryField(rec.proxyRetries))
+	fmt.Fprintf(w, "Outcome: %s   status=%s   code=%s%s%s\n",
+		dash(rec.outcome), statusField(rec.origStatus, rec.status), dash(rec.code), proxyRetryField(rec.proxyRetries), modelSwapField(rec.swapReason, rec.swapFrom, rec.swapTo))
 	if st := rec.stats; st != nil {
 		fmt.Fprintf(w, "Stats: in=%s out=%s tok   stop=%s   mode=%s   prun=%d   dur=%s\n",
 			htok(st.inTok), htok(st.outTok), dash(st.stop), dash(st.mode), st.maxPingRun, since(rec.when))
@@ -209,6 +221,22 @@ func (rec *reqRecorder) displayWho() string {
 		return rec.who
 	}
 	return whoWithResolvedModel(rec.who, rec.stats.model)
+}
+
+func modelSwapField(reason, from, to string) string {
+	to = strings.TrimSpace(to)
+	if to == "" {
+		return ""
+	}
+	reason = strings.TrimSpace(reason)
+	from = strings.TrimSpace(from)
+	if reason == "" {
+		reason = "unknown"
+	}
+	if from == "" {
+		from = "?"
+	}
+	return fmt.Sprintf("   model-swap=%s:%s->%s", reason, from, to)
 }
 
 // writeCapped writes at most max bytes of p, annotating any truncation.

@@ -239,10 +239,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	swapToFallback := func(reason string, st *captureStats) bool {
+		from := modelOf(body)
 		swapped, ok := swapModel(body, cfg.refusalFallback)
 		if !ok {
 			return false
 		}
+		rec.noteModelSwap(reason, from, cfg.refusalFallback)
 		if st != nil {
 			log.Printf("WARN  %s  %s -> retry with %s  in=%s out=%s tok  %s%s%s",
 				whoWithResolvedModel(reqWho, st.model), reason, cfg.refusalFallback,

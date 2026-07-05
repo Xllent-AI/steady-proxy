@@ -164,6 +164,69 @@ func TestRequestLogShowsResolvedModelWhenDifferent(t *testing.T) {
 	}
 }
 
+func TestRequestLogRecordsModelSwapWithoutChangingPayloadShape(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"Fable 5's safeguards flagged this message"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	dir := t.TempDir()
+	cfg.requestLogDir = dir
+	cfg.refusalFallback = "claude-opus-4-8"
+	t.Cleanup(func() { cfg.requestLogDir = "" })
+
+	rec := doStream(`{"stream":true,"model":"claude-fable-5","max_tokens":256}`)
+	if rec.Code != 200 {
+		t.Fatalf("want 200 after fallback, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	files := logFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("want exactly 1 log file, got %d (%v)", len(files), files)
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	got := string(data)
+
+	for _, want := range []string{
+		"=== REQUEST ===",
+		"=== RESPONSE ===",
+		`{"stream":true,"model":"claude-fable-5","max_tokens":256}`,
+		"Outcome: OK",
+		"Stats:",
+		"message_stop",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("request log missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "Headers:\n") != 2 || strings.Count(got, "Body:\n") != 2 {
+		t.Fatalf("request log shape changed unexpectedly:\n%s", got)
+	}
+
+	var outcomeLine string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "Outcome: ") {
+			outcomeLine = line
+			break
+		}
+	}
+	if !strings.Contains(outcomeLine, "model-swap=safeguard:claude-fable-5->claude-opus-4-8") {
+		t.Fatalf("outcome line missing model swap indication:\n%s", got)
+	}
+	if strings.Contains(got, "\nModel-Swap:") {
+		t.Fatalf("model swap should not add a new payload section line:\n%s", got)
+	}
+}
+
 func TestRequestLogDisabledWritesNothing(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
