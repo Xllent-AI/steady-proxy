@@ -337,9 +337,9 @@ Each archive uses the versioned schema `cc-retry-proxy.payload.v2`. Bodies are
 stored as JSON `data_base64` fields with `encoding`, byte `size`, and `sha256`, so
 request and response payload bytes can be restored exactly, including binary or
 image payloads. The archive records the original client request envelope, the
-redacted upstream URL, proxy build/version metadata, all upstream attempts, each
-attempt's response or transport failure, retry wait/result, SSE stats, and any
-model-swap decision.
+upstream URL with API secrets redacted, proxy build/version metadata, all upstream
+attempts, each attempt's response or transport failure, retry wait/result, SSE
+stats, and any model-swap decision.
 
 - **Correlation id.** Every access-log line carries `id=<hex>`, and that same id is
   the archive filename suffix and top-level `id` — so a bad line pins straight to
@@ -349,9 +349,12 @@ model-swap decision.
   upstream `ping` events — a content-silent-gap tripwire. Healthy dense streams stay
   at `0`; a climbing `prun` on a `DROP` is the signature of a genuine mid-turn
   upstream pause (what a Workflow stall watchdog kills on).
-- **Secrets are redacted.** `Authorization`, `x-api-key`, `cookie`, similar
-  headers, and credential-looking query params are written redacted and listed in
-  `redactions`.
+- **API secrets are redacted.** API-secret carriers such as `Authorization`,
+  `x-api-key`, `api-key`, and query params such as `api_key`, `key`,
+  `api_token`, `auth_token`, `access_token`/`accessToken`, and
+  `client_secret`/`clientSecret` are written redacted and listed in `redactions`.
+  Non-forwarded `Proxy-Authorization` is also redacted. Other headers and query
+  params are preserved for debugging/restoration.
 - **Bodies are not truncated.** Full request and response bodies are archived for
   restoration. This can use significant disk for large requests or long streams.
 - **Bodies are preserved verbatim.** The request body (your conversation) and

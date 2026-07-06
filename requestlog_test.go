@@ -383,6 +383,101 @@ func TestRequestLogHostileInputs(t *testing.T) {
 	requireArchiveBody(t, ar.ClientRequest.Body, reqBody)
 }
 
+func TestRequestLogOnlyRedactsAPISecrets(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Set-Cookie", "sid=response-cookie")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	dir := t.TempDir()
+	cfg.requestLogDir = dir
+	t.Cleanup(func() { cfg.requestLogDir = "" })
+
+	reqBody := []byte(`{"stream":true,"model":"m"}`)
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1/messages?token=keep-me&session=keep-too&api_key=sk-secret-0000&key=sk-secret-key&api_token=sk-api-token&auth_token=sk-auth-token&accessToken=sk-access&clientSecret=sk-client&plain=visible", bytes.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer sk-secret-auth")
+	req.Header.Set("X-API-Key", "sk-secret-header")
+	req.Header.Set("Proxy-Authorization", "Basic proxy-secret")
+	req.Header.Set("Cookie", "sid=request-cookie")
+	rec := httptest.NewRecorder()
+	handle(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+
+	files := archiveFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("want 1 archive file, got %d", len(files))
+	}
+	ar, raw := readArchive(t, files[0])
+	for _, leaked := range []string{"sk-secret-auth", "sk-secret-header", "proxy-secret", "sk-secret-0000", "sk-secret-key", "sk-api-token", "sk-auth-token", "sk-access", "sk-client"} {
+		if bytes.Contains(raw, []byte(leaked)) {
+			t.Fatalf("API secret %q leaked into archive:\n%s", leaked, raw)
+		}
+	}
+	for _, visible := range []string{"sid=request-cookie", "sid=response-cookie", "token=keep-me", "session=keep-too"} {
+		if !bytes.Contains(raw, []byte(visible)) {
+			t.Fatalf("non-API credential-like value %q should remain visible:\n%s", visible, raw)
+		}
+	}
+	if ar.ClientRequest.Query != "token=keep-me&session=keep-too&api_key=REDACTED&key=REDACTED&api_token=REDACTED&auth_token=REDACTED&accessToken=REDACTED&clientSecret=REDACTED&plain=visible" {
+		t.Fatalf("unexpected query redaction: %q", ar.ClientRequest.Query)
+	}
+	if ar.ClientRequest.Headers.Get("Cookie") != "sid=request-cookie" {
+		t.Fatalf("cookie should not be redacted: %q", ar.ClientRequest.Headers.Get("Cookie"))
+	}
+	if ar.Attempts[0].Response.Headers.Get("Set-Cookie") != "sid=response-cookie" {
+		t.Fatalf("set-cookie should not be redacted: %q", ar.Attempts[0].Response.Headers.Get("Set-Cookie"))
+	}
+	if !containsString(ar.Redactions.HeaderNames, "Authorization") ||
+		!containsString(ar.Redactions.HeaderNames, "X-Api-Key") ||
+		!containsString(ar.Redactions.HeaderNames, "Proxy-Authorization") {
+		t.Fatalf("missing API header redactions: %+v", ar.Redactions)
+	}
+	if containsString(ar.Redactions.HeaderNames, "Cookie") || containsString(ar.Redactions.QueryParams, "token") {
+		t.Fatalf("redactions should only list API secrets: %+v", ar.Redactions)
+	}
+}
+
+func TestRequestLogRedactsUnparseableQuery(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest("http://user:pass@" + strings.TrimPrefix(up.URL, "http://"))
+	dir := t.TempDir()
+	cfg.requestLogDir = dir
+	t.Cleanup(func() { cfg.requestLogDir = "" })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages?api_key%ZZ=sk-secret-raw", strings.NewReader(`{"stream":true,"model":"m"}`))
+	rec := httptest.NewRecorder()
+	handle(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+
+	files := archiveFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("want 1 archive file, got %d", len(files))
+	}
+	ar, raw := readArchive(t, files[0])
+	for _, leaked := range []string{"sk-secret-raw", "user:pass"} {
+		if bytes.Contains(raw, []byte(leaked)) {
+			t.Fatalf("malformed-query secret %q leaked into archive:\n%s", leaked, raw)
+		}
+	}
+	if ar.ClientRequest.Query != "[redacted: unparseable query]" {
+		t.Fatalf("query should fail closed, got %q", ar.ClientRequest.Query)
+	}
+	if !containsString(ar.Redactions.QueryParams, "*") {
+		t.Fatalf("query redaction metadata should include wildcard: %+v", ar.Redactions)
+	}
+}
+
 func TestRequestLogLocalRetryCapturesAllAttemptResponses(t *testing.T) {
 	var hits atomic.Int32
 	firstBody := []byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +

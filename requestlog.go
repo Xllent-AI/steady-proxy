@@ -3,8 +3,8 @@ package main
 // Optional request/response archive. When PROXY_REQUEST_LOG_DIR is set, the
 // proxy writes one JSON file per proxied request into that directory. Bodies are
 // encoded as base64 JSON []byte fields with size+SHA256 metadata so request and
-// response payload bytes can be restored exactly. Credential-bearing headers and
-// query params are redacted before writing.
+// response payload bytes can be restored exactly. API-secret carriers are
+// redacted before writing; other fields are kept intact for restoration/debugging.
 
 import (
 	"bytes"
@@ -901,11 +901,17 @@ func bodyKey(p []byte) string {
 	return fmt.Sprintf("%d:%s", len(p), bodySHA256(p))
 }
 
-// secretHeaders are redacted in the archive so an API key never lands on disk.
-var secretHeaders = map[string]bool{
-	"authorization": true, "x-api-key": true, "api-key": true,
-	"cookie": true, "set-cookie": true, "proxy-authorization": true,
+// apiSecretHeaders are redacted in the archive so API secrets never land on
+// disk. Keep this list narrow: non-API credentials are useful payload context
+// and should not be hidden unless they are known API-secret carriers.
+var apiSecretHeaders = map[string]bool{
+	"authorization":       true,
+	"x-api-key":           true,
+	"api-key":             true,
 	"x-stainless-api-key": true,
+	"anthropic-api-key":   true,
+	"openai-api-key":      true,
+	"proxy-authorization": true,
 }
 
 func maskHeaders(h http.Header) http.Header {
@@ -917,7 +923,7 @@ func maskHeadersWithNames(h http.Header) (http.Header, []string) {
 	out := make(http.Header, len(h))
 	var redacted []string
 	for k, vv := range h {
-		if secretHeaders[strings.ToLower(k)] {
+		if apiSecretHeaders[strings.ToLower(k)] {
 			redacted = append(redacted, k)
 			for _, v := range vv {
 				out.Add(k, maskHeader(k, v))
@@ -929,9 +935,9 @@ func maskHeadersWithNames(h http.Header) (http.Header, []string) {
 	return out, redacted
 }
 
-// maskHeader redacts secret-bearing values, keeping a short tail as a hint.
+// maskHeader redacts API-secret-bearing values, keeping a short tail as a hint.
 func maskHeader(name, value string) string {
-	if !secretHeaders[strings.ToLower(name)] {
+	if !apiSecretHeaders[strings.ToLower(name)] {
 		return value
 	}
 	if len(value) >= 8 {
@@ -940,10 +946,44 @@ func maskHeader(name, value string) string {
 	return "***redacted***"
 }
 
-// secretParamSigs mark query-parameter names whose value may be a credential.
-var secretParamSigs = []string{
-	"key", "token", "secret", "password", "passwd", "pwd",
-	"sig", "auth", "bearer", "credential", "session", "jwt",
+// apiSecretQueryNames mark query-parameter names that conventionally carry API
+// keys. Keep this narrow so non-secret query context remains restorable.
+var apiSecretQueryNames = map[string]bool{
+	"api_key":           true,
+	"apikey":            true,
+	"api-key":           true,
+	"api_secret":        true,
+	"apisecret":         true,
+	"api-secret":        true,
+	"api_token":         true,
+	"apitoken":          true,
+	"api-token":         true,
+	"key":               true,
+	"x-api-key":         true,
+	"x_api_key":         true,
+	"anthropic_api_key": true,
+	"anthropic-api-key": true,
+	"openai_api_key":    true,
+	"openai-api-key":    true,
+	"access_token":      true,
+	"accesstoken":       true,
+	"access-token":      true,
+	"refresh_token":     true,
+	"refreshtoken":      true,
+	"refresh-token":     true,
+	"id_token":          true,
+	"idtoken":           true,
+	"id-token":          true,
+	"auth_token":        true,
+	"authtoken":         true,
+	"auth-token":        true,
+	"bearer_token":      true,
+	"bearertoken":       true,
+	"bearer-token":      true,
+	"client_secret":     true,
+	"clientsecret":      true,
+	"client-secret":     true,
+	"authorization":     true,
 }
 
 func redactQuery(raw string) string {
@@ -968,16 +1008,12 @@ func redactQueryWithNames(raw string) (string, []string) {
 		if err != nil {
 			return "[redacted: unparseable query]", []string{"*"}
 		}
-		lk := strings.ToLower(name)
-		for _, sig := range secretParamSigs {
-			if strings.Contains(lk, sig) {
-				redacted = append(redacted, name)
-				if valueStart >= 0 {
-					parts[i] = part[:valueStart] + "REDACTED"
-				} else {
-					parts[i] = part + "=REDACTED"
-				}
-				break
+		if apiSecretQueryNames[strings.ToLower(name)] {
+			redacted = append(redacted, name)
+			if valueStart >= 0 {
+				parts[i] = part[:valueStart] + "REDACTED"
+			} else {
+				parts[i] = part + "=REDACTED"
 			}
 		}
 	}
