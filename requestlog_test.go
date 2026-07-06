@@ -2,25 +2,66 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
-// logFiles returns the .log files written into dir.
-func logFiles(t *testing.T, dir string) []string {
+// archiveFiles returns the JSON archive files written into dir.
+func archiveFiles(t *testing.T, dir string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	matches, err := filepath.Glob(filepath.Join(dir, "*.json"))
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
 	return matches
+}
+
+func readArchive(t *testing.T, path string) (requestArchive, []byte) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	var ar requestArchive
+	if err := json.Unmarshal(data, &ar); err != nil {
+		t.Fatalf("unmarshal archive: %v\n%s", err, data)
+	}
+	return ar, data
+}
+
+func requireArchiveBody(t *testing.T, b archiveBody, want []byte) {
+	t.Helper()
+	if b.Encoding != "base64" {
+		t.Fatalf("encoding = %q, want base64", b.Encoding)
+	}
+	if b.Size != int64(len(want)) {
+		t.Fatalf("size = %d, want %d", b.Size, len(want))
+	}
+	if b.SHA256 != bodySHA256(want) {
+		t.Fatalf("sha256 = %s, want %s", b.SHA256, bodySHA256(want))
+	}
+	if !bytes.Equal(b.Data, want) {
+		t.Fatalf("body mismatch\nwant: %q\n got: %q", want, b.Data)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // doStreamWith issues a streaming request carrying extra headers.
@@ -36,7 +77,7 @@ func doStreamWith(body string, hdr http.Header) *httptest.ResponseRecorder {
 	return rec
 }
 
-func TestRequestLogWritesRequestAndResponse(t *testing.T) {
+func TestRequestLogWritesRestorableRequestAndResponse(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, goodStream)
@@ -44,46 +85,72 @@ func TestRequestLogWritesRequestAndResponse(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 	dir := t.TempDir()
+	prevMem := cfg.maxBufferMem
 	cfg.requestLogDir = dir
-	t.Cleanup(func() { cfg.requestLogDir = "" })
+	cfg.maxBufferMem = 4 // force the response archive body through the spool path
+	t.Cleanup(func() {
+		cfg.requestLogDir = ""
+		cfg.maxBufferMem = prevMem
+	})
 
+	reqBody := []byte(`{"stream":true,"model":"m"}`)
 	hdr := http.Header{"Authorization": {"Bearer sk-secret-abcd1234"}}
-	rec := doStreamWith(`{"stream":true,"model":"m"}`, hdr)
+	rec := doStreamWith(string(reqBody), hdr)
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 
-	files := logFiles(t, dir)
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want exactly 1 log file, got %d (%v)", len(files), files)
+		t.Fatalf("want exactly 1 archive file, got %d (%v)", len(files), files)
 	}
-	data, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
+	ar, raw := readArchive(t, files[0])
+	if ar.Schema != requestArchiveSchema {
+		t.Fatalf("schema = %q, want %q", ar.Schema, requestArchiveSchema)
 	}
-	got := string(data)
+	if ar.ID == "" {
+		t.Fatalf("archive id is empty")
+	}
+	base := filepath.Base(files[0])
+	if ok := regexp.MustCompile(`^v1-messages-\d{8}t\d{6}-[0-9a-f]{8}\.json$`).MatchString(base); !ok {
+		t.Fatalf("unexpected archive filename %q", base)
+	}
+	if !strings.Contains(base, ar.ID) {
+		t.Fatalf("archive filename %q does not contain id %q", base, ar.ID)
+	}
 
-	for _, want := range []string{"=== REQUEST ===", "=== RESPONSE ===", `"model":"m"`, "message_stop", "Outcome: OK"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("log missing %q\n---\n%s", want, got)
-		}
+	requireArchiveBody(t, ar.ClientRequest.Body, reqBody)
+	if ar.ClientRequest.BodyReference != "client_request.body" {
+		t.Fatalf("body reference = %q", ar.ClientRequest.BodyReference)
 	}
-	// The gateway secret must be redacted, not written verbatim.
-	if strings.Contains(got, "sk-secret-abcd1234") {
-		t.Errorf("Authorization secret leaked into log:\n%s", got)
+	if len(ar.Attempts) != 1 {
+		t.Fatalf("want 1 attempt, got %d", len(ar.Attempts))
 	}
-	if !strings.Contains(got, "***redacted") {
-		t.Errorf("expected redaction marker for Authorization:\n%s", got)
+	a := ar.Attempts[0]
+	if a.RequestBodyRef != "client_request.body" || a.RequestBody != nil {
+		t.Fatalf("attempt should reference client body without duplicating it: %+v", a)
 	}
-	// Filename should be derived from the route path.
-	if base := filepath.Base(files[0]); !strings.HasPrefix(base, "v1-messages-") {
-		t.Errorf("unexpected log filename %q", base)
+	if a.Response == nil {
+		t.Fatalf("attempt response missing")
+	}
+	requireArchiveBody(t, a.Response.Body, []byte(goodStream))
+	if ar.Outcome.Result != "OK" || ar.Outcome.Status != 200 {
+		t.Fatalf("unexpected outcome: %+v", ar.Outcome)
+	}
+	if bytes.Contains(raw, []byte("sk-secret-abcd1234")) {
+		t.Fatalf("Authorization secret leaked into archive:\n%s", raw)
+	}
+	if got := ar.ClientRequest.Headers.Get("Authorization"); !strings.Contains(got, "redacted") {
+		t.Fatalf("expected redacted Authorization header, got %q", got)
+	}
+	if !containsString(ar.Redactions.HeaderNames, "Authorization") {
+		t.Fatalf("redactions missing Authorization: %+v", ar.Redactions)
 	}
 }
 
 // TestRequestLogIDCorrelatesLogLineToDump is the whole point of the correlation
-// id: the exact id printed in the one-line access log must also be in the dump's
-// filename and body, so a bad log line pins straight to the payload.
+// id: the exact id printed in the one-line access log must also be in the
+// archive's filename and body, so a bad log line pins straight to the payload.
 func TestRequestLogIDCorrelatesLogLineToDump(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -95,7 +162,6 @@ func TestRequestLogIDCorrelatesLogLineToDump(t *testing.T) {
 	cfg.requestLogDir = dir
 	t.Cleanup(func() { cfg.requestLogDir = "" })
 
-	// Capture the access log so we can match its id= against the dump.
 	var logbuf bytes.Buffer
 	prevOut := log.Writer()
 	log.SetOutput(&logbuf)
@@ -104,31 +170,19 @@ func TestRequestLogIDCorrelatesLogLineToDump(t *testing.T) {
 	if rec := doStream(`{"stream":true,"model":"m"}`); rec.Code != 200 {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	files := logFiles(t, dir)
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want 1 log file, got %d", len(files))
+		t.Fatalf("want 1 archive file, got %d", len(files))
 	}
-	body, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
+	ar, raw := readArchive(t, files[0])
+	if ar.ID == "" {
+		t.Fatalf("archive has no id:\n%s", raw)
 	}
-
-	// The id the dump recorded.
-	id := ""
-	for _, line := range strings.Split(string(body), "\n") {
-		if strings.HasPrefix(line, "Id: ") {
-			id = strings.TrimSpace(strings.TrimPrefix(line, "Id: "))
-			break
-		}
+	if base := filepath.Base(files[0]); !strings.Contains(base, ar.ID) {
+		t.Fatalf("archive filename %q does not contain id %q", base, ar.ID)
 	}
-	if id == "" || id == "-" {
-		t.Fatalf("dump has no Id: line:\n%s", body)
-	}
-	if base := filepath.Base(files[0]); !strings.Contains(base, id) {
-		t.Fatalf("dump filename %q does not contain id %q", base, id)
-	}
-	if al := logbuf.String(); !strings.Contains(al, "id="+id) {
-		t.Fatalf("access log line missing id=%s:\n%s", id, al)
+	if al := logbuf.String(); !strings.Contains(al, "id="+ar.ID) {
+		t.Fatalf("access log line missing id=%s:\n%s", ar.ID, al)
 	}
 }
 
@@ -151,25 +205,26 @@ func TestRequestLogShowsResolvedModelWhenDifferent(t *testing.T) {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 
-	files := logFiles(t, dir)
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want exactly 1 log file, got %d (%v)", len(files), files)
+		t.Fatalf("want exactly 1 archive file, got %d (%v)", len(files), files)
 	}
-	data, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
+	ar, _ := readArchive(t, files[0])
+	if ar.Outcome.Who != "alias-model->actual-model/main" {
+		t.Fatalf("outcome who = %q, want resolved model", ar.Outcome.Who)
 	}
-	if got := string(data); !strings.Contains(got, "Who: alias-model->actual-model/main") {
-		t.Fatalf("request log missing resolved model:\n%s", got)
+	if ar.Outcome.Stats == nil || ar.Outcome.Stats.Model != "actual-model" {
+		t.Fatalf("archive missing resolved stats model: %+v", ar.Outcome.Stats)
 	}
 }
 
-func TestRequestLogRecordsModelSwapWithoutChangingPayloadShape(t *testing.T) {
+func TestRequestLogRecordsModelSwapWithAttemptDetails(t *testing.T) {
 	var hits atomic.Int32
+	errBody := []byte(`{"error":{"type":"invalid_request_error","message":"Fable 5's safeguards flagged this message"}}`)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits.Add(1) == 1 {
 			w.WriteHeader(400)
-			io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"Fable 5's safeguards flagged this message"}}`)
+			w.Write(errBody)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -180,51 +235,51 @@ func TestRequestLogRecordsModelSwapWithoutChangingPayloadShape(t *testing.T) {
 	dir := t.TempDir()
 	cfg.requestLogDir = dir
 	cfg.refusalFallback = "claude-opus-4-8"
-	t.Cleanup(func() { cfg.requestLogDir = "" })
+	t.Cleanup(func() {
+		cfg.requestLogDir = ""
+		cfg.refusalFallback = ""
+	})
 
-	rec := doStream(`{"stream":true,"model":"claude-fable-5","max_tokens":256}`)
+	original := []byte(`{"stream":true,"model":"claude-fable-5","max_tokens":256}`)
+	rec := doStream(string(original))
 	if rec.Code != 200 {
 		t.Fatalf("want 200 after fallback, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	files := logFiles(t, dir)
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want exactly 1 log file, got %d (%v)", len(files), files)
+		t.Fatalf("want exactly 1 archive file, got %d (%v)", len(files), files)
 	}
-	data, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
-	}
-	got := string(data)
+	ar, _ := readArchive(t, files[0])
 
-	for _, want := range []string{
-		"=== REQUEST ===",
-		"=== RESPONSE ===",
-		`{"stream":true,"model":"claude-fable-5","max_tokens":256}`,
-		"Outcome: OK",
-		"Stats:",
-		"message_stop",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("request log missing %q:\n%s", want, got)
-		}
+	requireArchiveBody(t, ar.ClientRequest.Body, original)
+	if ar.Outcome.ModelSwap == nil {
+		t.Fatalf("outcome missing model swap: %+v", ar.Outcome)
 	}
-	if strings.Count(got, "Headers:\n") != 2 || strings.Count(got, "Body:\n") != 2 {
-		t.Fatalf("request log shape changed unexpectedly:\n%s", got)
+	if *ar.Outcome.ModelSwap != (archiveModelSwap{Reason: "safeguard", From: "claude-fable-5", To: "claude-opus-4-8"}) {
+		t.Fatalf("unexpected outcome model swap: %+v", ar.Outcome.ModelSwap)
 	}
-
-	var outcomeLine string
-	for _, line := range strings.Split(got, "\n") {
-		if strings.HasPrefix(line, "Outcome: ") {
-			outcomeLine = line
-			break
-		}
+	if len(ar.Attempts) != 2 {
+		t.Fatalf("want 2 attempts, got %d", len(ar.Attempts))
 	}
-	if !strings.Contains(outcomeLine, "model-swap=safeguard:claude-fable-5->claude-opus-4-8") {
-		t.Fatalf("outcome line missing model swap indication:\n%s", got)
+	first := ar.Attempts[0]
+	if first.ModelSwap == nil || first.ModelSwap.Reason != "safeguard" || first.Result != "model_swap" {
+		t.Fatalf("first attempt missing model swap details: %+v", first)
 	}
-	if strings.Contains(got, "\nModel-Swap:") {
-		t.Fatalf("model swap should not add a new payload section line:\n%s", got)
+	if first.Response == nil {
+		t.Fatalf("first attempt missing error response")
 	}
+	requireArchiveBody(t, first.Response.Body, errBody)
+	if first.Failure == nil || first.Failure.Message == "" {
+		t.Fatalf("first attempt missing failure: %+v", first)
+	}
+	second := ar.Attempts[1]
+	if second.RequestBody == nil {
+		t.Fatalf("second attempt should archive the swapped request body: %+v", second)
+	}
+	if !bytes.Contains(second.RequestBody.Data, []byte(`"claude-opus-4-8"`)) {
+		t.Fatalf("swapped request body missing fallback model: %s", second.RequestBody.Data)
+	}
+	requireArchiveBody(t, second.Response.Body, []byte(goodStream))
 }
 
 func TestRequestLogDisabledWritesNothing(t *testing.T) {
@@ -244,43 +299,53 @@ func TestRequestLogDisabledWritesNothing(t *testing.T) {
 	}
 }
 
-func TestRequestLogTruncatesOversizedBodies(t *testing.T) {
+func TestRequestLogRestoresBinaryNonStreamingPayload(t *testing.T) {
+	reqBody := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00, 0xff}
+	respBody := []byte{0x00, 0x01, 0x02, 0xfe, 0xff}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, goodStream)
+		got, _ := io.ReadAll(r.Body)
+		if !bytes.Equal(got, reqBody) {
+			t.Fatalf("upstream request body mismatch: %q", got)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(respBody)
 	}))
 	defer up.Close()
 	setupForTest(up.URL)
 	dir := t.TempDir()
-	prevMax := cfg.requestLogMax
 	cfg.requestLogDir = dir
-	cfg.requestLogMax = 40 // tiny: both request and response exceed this
-	t.Cleanup(func() { cfg.requestLogDir = ""; cfg.requestLogMax = prevMax })
+	t.Cleanup(func() { cfg.requestLogDir = "" })
 
-	rec := doStream(`{"stream":true,"model":"m","extra":"` + strings.Repeat("x", 200) + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/files?z=1&x=a%2Bb", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "image/png")
+	req.Header.Set("Authorization", "Bearer sk-binary-secret")
+	rec := httptest.NewRecorder()
+	handle(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	files := logFiles(t, dir)
+	if !bytes.Equal(rec.Body.Bytes(), respBody) {
+		t.Fatalf("downstream response mismatch: %q", rec.Body.Bytes())
+	}
+
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want 1 log file, got %d", len(files))
+		t.Fatalf("want 1 archive file, got %d", len(files))
 	}
-	data, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
+	ar, raw := readArchive(t, files[0])
+	requireArchiveBody(t, ar.ClientRequest.Body, reqBody)
+	if ar.ClientRequest.Query != "z=1&x=a%2Bb" {
+		t.Fatalf("query was normalized: %q", ar.ClientRequest.Query)
 	}
-	got := string(data)
-	if !strings.Contains(got, "[truncated") {
-		t.Errorf("expected a truncation marker with a tiny cap:\n%s", got)
+	if len(ar.Attempts) != 1 || ar.Attempts[0].Response == nil {
+		t.Fatalf("archive missing response attempt: %+v", ar.Attempts)
 	}
-	// The captured response must not exceed the cap (plus the small marker text).
-	if strings.Count(got, "message_start") > 0 && len(got) > 4096 {
-		t.Errorf("capped log unexpectedly large: %d bytes", len(got))
+	requireArchiveBody(t, ar.Attempts[0].Response.Body, respBody)
+	if bytes.Contains(raw, []byte("sk-binary-secret")) {
+		t.Fatalf("Authorization secret leaked into archive:\n%s", raw)
 	}
 }
 
-// A pathological negative cap must never panic (the file write runs in the
-// handler's deferred path), and a credential in the query string must be masked.
 func TestRequestLogHostileInputs(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -289,48 +354,44 @@ func TestRequestLogHostileInputs(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 	dir := t.TempDir()
-	prevMax := cfg.requestLogMax
 	cfg.requestLogDir = dir
-	cfg.requestLogMax = -1 // negative: must clamp, not panic on p[:max]
-	t.Cleanup(func() { cfg.requestLogDir = ""; cfg.requestLogMax = prevMax })
+	t.Cleanup(func() { cfg.requestLogDir = "" })
 
+	reqBody := []byte(`{"stream":true,"model":"m"}`)
 	req := httptest.NewRequest(http.MethodPost,
-		"/v1/messages?beta=true&api_key=sk-secret-9999", strings.NewReader(`{"stream":true,"model":"m"}`))
+		"/v1/messages?beta=true&api_key=sk-secret-9999&plain=a%2Bb", bytes.NewReader(reqBody))
 	rec := httptest.NewRecorder()
-	handle(rec, req) // would panic before the fix
+	handle(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 
-	files := logFiles(t, dir)
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want 1 log file, got %d", len(files))
+		t.Fatalf("want 1 archive file, got %d", len(files))
 	}
-	data, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
+	ar, raw := readArchive(t, files[0])
+	if bytes.Contains(raw, []byte("sk-secret-9999")) {
+		t.Fatalf("query credential leaked into archive:\n%s", raw)
 	}
-	got := string(data)
-	if strings.Contains(got, "sk-secret-9999") {
-		t.Errorf("query credential leaked into log:\n%s", got)
+	if ar.ClientRequest.Query != "beta=true&api_key=REDACTED&plain=a%2Bb" {
+		t.Fatalf("unexpected redacted query: %q", ar.ClientRequest.Query)
 	}
-	if !strings.Contains(got, "REDACTED") {
-		t.Errorf("expected the api_key query param to be REDACTED:\n%s", got)
+	if !containsString(ar.Redactions.QueryParams, "api_key") {
+		t.Fatalf("query redaction metadata missing api_key: %+v", ar.Redactions)
 	}
-	// Cap clamped to 0 → bodies fully dropped but recorded as truncated, not <empty>.
-	if !strings.Contains(got, "[truncated") {
-		t.Errorf("expected truncation marker at zero cap:\n%s", got)
-	}
+	requireArchiveBody(t, ar.ClientRequest.Body, reqBody)
 }
 
-func TestRequestLogLocalRetryKeepsFinalResponseOnly(t *testing.T) {
+func TestRequestLogLocalRetryCapturesAllAttemptResponses(t *testing.T) {
 	var hits atomic.Int32
+	firstBody := []byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"FIRST_BAD\"}}\n\n")
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		if hits.Add(1) == 1 {
-			io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"+
-				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n"+
-				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"FIRST_BAD\"}}\n\n")
+			w.Write(firstBody)
 			return
 		}
 		io.WriteString(w, goodStream)
@@ -350,22 +411,46 @@ func TestRequestLogLocalRetryKeepsFinalResponseOnly(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("want 200 after hidden retry, got %d", rec.Code)
 	}
-	files := logFiles(t, dir)
+	files := archiveFiles(t, dir)
 	if len(files) != 1 {
-		t.Fatalf("want 1 log file, got %d", len(files))
+		t.Fatalf("want 1 archive file, got %d", len(files))
 	}
-	data, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatalf("read log: %v", err)
+	ar, _ := readArchive(t, files[0])
+	if ar.Outcome.ProxyRetries != 1 {
+		t.Fatalf("proxy retries = %d, want 1", ar.Outcome.ProxyRetries)
 	}
-	got := string(data)
-	if !strings.Contains(got, "proxy-retries=1") {
-		t.Fatalf("request log missing proxy retry count:\n%s", got)
+	if len(ar.Attempts) != 2 {
+		t.Fatalf("want 2 attempts, got %d", len(ar.Attempts))
 	}
-	if !strings.Contains(got, "message_stop") {
-		t.Fatalf("request log missing final successful response:\n%s", got)
+	if ar.Attempts[0].Result != "local_retry" || ar.Attempts[0].Failure == nil {
+		t.Fatalf("first attempt should be retained as a local retry failure: %+v", ar.Attempts[0])
 	}
-	if strings.Contains(got, "FIRST_BAD") {
-		t.Fatalf("request log retained failed first response bytes:\n%s", got)
+	requireArchiveBody(t, ar.Attempts[0].Response.Body, firstBody)
+	requireArchiveBody(t, ar.Attempts[1].Response.Body, []byte(goodStream))
+}
+
+func TestRequestLogOutcomeStatsResetForFinalAttempt(t *testing.T) {
+	setupForTest("http://127.0.0.1:1")
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"model":"claude-fable-5"}`))
+	rec := newReqRecorder(time.Now(), req, []byte(`{"stream":true,"model":"claude-fable-5"}`))
+
+	rec.beginAttempt([]byte(`{"stream":true,"model":"claude-fable-5"}`), "claude-fable-5/main", 0)
+	rec.noteAttemptStats(&captureStats{model: "claude-fable-5", stop: "refusal", inTok: 100, outTok: 2})
+	rec.noteAttemptFailure(failure{code: refusalFallbackCode, status: 502, atype: "api_error"}, "model_swap")
+
+	rec.beginAttempt([]byte(`{"stream":true,"model":"claude-opus-4-8"}`), "claude-opus-4-8/main", 0)
+	rec.noteAttemptFailure(failure{code: "transport_error", status: 502, atype: "api_error", transient: true}, "transport_error")
+	rec.note("RETRY", 502, 503, "transport_error")
+	rec.finishCurrentAttempt()
+
+	ar := rec.archive()
+	if ar.ClientRequest.Who != "claude-fable-5/main" {
+		t.Fatalf("client request who changed: %q", ar.ClientRequest.Who)
+	}
+	if ar.Outcome.Who != "claude-opus-4-8/main" {
+		t.Fatalf("outcome who = %q, want final attempt", ar.Outcome.Who)
+	}
+	if ar.Outcome.Stats != nil {
+		t.Fatalf("outcome stats should not reuse abandoned attempt stats: %+v", ar.Outcome.Stats)
 	}
 }

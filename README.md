@@ -318,8 +318,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a single buffered response |
 | `PROXY_DEADLINE_MARGIN_MS` | `25000` | finish before the client's own timeout |
 | `PROXY_SPOOL_DIR` | `$TMPDIR` | where large responses spill (use tmpfs for sensitive prompts) |
-| `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save the full request + response of each call to a file there (see below) |
-| `PROXY_REQUEST_LOG_MAX_BYTES` | `10485760` | per-section cap (request body, response body) written to each saved file; the rest is truncated with a marker |
+| `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save each request/response JSON archive there (see below) |
 | `PROXY_VERBOSE` | off | set `1` for per-decision logs |
 
 ## Saving request/response data
@@ -327,35 +326,41 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 The one-line access log tells you *what happened*; sometimes you need to see
 *exactly what was sent and returned* — to debug a converted retry, a malformed
 stream, or a surfaced request-shape 4xx. Set `PROXY_REQUEST_LOG_DIR` to a directory and the
-proxy writes **one human-readable file per request** into it:
+proxy writes **one JSON archive per client request** into it:
 
 ```
 PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./cc-retry-proxy
-# ./logs/v1-messages-20260621t143005-a1b2c3d4.log   (a1b2c3d4 = the correlation id)
+# ./logs/v1-messages-20260621t143005-a1b2c3d4.json   (a1b2c3d4 = the correlation id)
 ```
 
-Each file has a `=== REQUEST ===` section (method, path, headers, body) and a
-`=== RESPONSE ===` section (outcome, token/stop/mode/prun stats, headers, and the
-captured SSE events — or the body for non-streaming routes). Notes:
+Each archive uses the versioned schema `cc-retry-proxy.payload.v2`. Bodies are
+stored as JSON `data_base64` fields with `encoding`, byte `size`, and `sha256`, so
+request and response payload bytes can be restored exactly, including binary or
+image payloads. The archive records the original client request envelope, the
+redacted upstream URL, proxy build/version metadata, all upstream attempts, each
+attempt's response or transport failure, retry wait/result, SSE stats, and any
+model-swap decision.
 
 - **Correlation id.** Every access-log line carries `id=<hex>`, and that same id is
-  the dump's filename suffix and its `Id:` line — so a bad line pins straight to the
-  payload: `ls logs/*<id>*` (or `grep -l <id> logs/*.log`). The id only appears in
-  the log when `PROXY_REQUEST_LOG_DIR` is set (otherwise there's no dump to point at).
+  the archive filename suffix and top-level `id` — so a bad line pins straight to
+  the payload: `ls logs/*<id>*.json`. The id only appears in the access log when
+  `PROXY_REQUEST_LOG_DIR` is set (otherwise there's no archive to point at).
 - **`prun` (ping-run).** The stats line reports the longest run of consecutive
   upstream `ping` events — a content-silent-gap tripwire. Healthy dense streams stay
   at `0`; a climbing `prun` on a `DROP` is the signature of a genuine mid-turn
   upstream pause (what a Workflow stall watchdog kills on).
-- **Secrets are redacted.** `Authorization`, `x-api-key`, `cookie`, and similar
-  headers are written as `***redacted (…last4)***`, never in full.
-- **Bodies are capped** at `PROXY_REQUEST_LOG_MAX_BYTES` (default 10 MiB) each, so a
-  huge stream can't exhaust RAM or disk; truncation is marked inline.
-- **Prompts are written verbatim.** The request body (your conversation) lands on
-  disk unencrypted — point the dir at a tmpfs or a path you control, and keep it out
-  of version control (`.gitignore` already excludes `/logs/`).
-- For failures *before* the stream starts (e.g. a pre-stream HTTP error), the file
-  records the request and the outcome/code; the upstream error body itself is not
-  separately captured.
+- **Secrets are redacted.** `Authorization`, `x-api-key`, `cookie`, similar
+  headers, and credential-looking query params are written redacted and listed in
+  `redactions`.
+- **Bodies are not truncated.** Full request and response bodies are archived for
+  restoration. This can use significant disk for large requests or long streams.
+- **Bodies are preserved verbatim.** The request body (your conversation) and
+  response bodies land on disk unencrypted and are not inspected/redacted; point
+  the dir at a tmpfs or a path you control, and keep it out of version control
+  (`.gitignore` already excludes `/logs/`).
+- For failures before a stream starts, the archive records the upstream HTTP
+  status, response headers, and full upstream error body. Hidden local retries and
+  model-fallback reissues appear as separate entries in `attempts`.
 
 ## Caveats
 

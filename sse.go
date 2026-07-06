@@ -365,6 +365,9 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 		case r := <-ch:
 			if len(r.data) > 0 {
 				idleTimer.Reset(cfg.upstreamByteIdle)
+				if st != nil && st.respTee != nil {
+					st.respTee.Write(r.data)
+				}
 				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, prog, w, &committed, writeHead, flush, st, interceptRefusal)
 				if ret {
 					return wrote, fail
@@ -456,9 +459,6 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 			}
 			if cfg.validateJSON {
 				scrapeUsage(ev, st)
-			}
-			if st.respTee != nil { // capture the full stream, incl. a mid-stream error
-				st.respTee.Write(ev.raw)
 			}
 		}
 		if cfg.validateJSON {

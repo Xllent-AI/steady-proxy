@@ -85,7 +85,6 @@ type config struct {
 	localBackoffCap   time.Duration
 	spoolDir          string
 	requestLogDir     string // when non-empty, save each request/response to a file here
-	requestLogMax     int64  // per-section cap (request body, response body) written per file
 	validateJSON      bool
 	normalizeToolJSON bool
 	refusalFallback   string // model to re-issue with when a model refusal/safeguard is detected; "" = feature off
@@ -115,11 +114,10 @@ func loadConfig() config {
 		txLocalRetries:    envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
 		localBackoffCap:   envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
 		spoolDir:          env("PROXY_SPOOL_DIR", os.TempDir()),
-		requestLogDir:     env("PROXY_REQUEST_LOG_DIR", ""),                // "" = disabled; set a dir to save each request/response
-		requestLogMax:     envInt64("PROXY_REQUEST_LOG_MAX_BYTES", 10<<20), // 10 MiB per section, then truncate (bounds RAM/disk)
-		validateJSON:      os.Getenv("PROXY_VALIDATE_JSON") != "0",         // default on
-		normalizeToolJSON: os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0",   // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
-		refusalFallback:   loadRefusalFallback(),                           // default claude-opus-4-8; off/none/empty disables
+		requestLogDir:     env("PROXY_REQUEST_LOG_DIR", ""),              // "" = disabled; set a dir to save each request/response archive
+		validateJSON:      os.Getenv("PROXY_VALIDATE_JSON") != "0",       // default on
+		normalizeToolJSON: os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
+		refusalFallback:   loadRefusalFallback(),                         // default claude-opus-4-8; off/none/empty disables
 		verbose:           os.Getenv("PROXY_VERBOSE") == "1",
 	}
 }
@@ -237,6 +235,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			logLocalRetrySkip(reqWho, f, wait, retryCount, "not-enough-time")
 			return false
 		}
+		rec.noteAttemptRetry("local_retry", wait)
 		logLocalRetry(reqWho, f, wait, proxyRetries+1, cfg.txLocalRetries, retryCount, "")
 		if !sleepWithContext(ctx, wait) {
 			return false
@@ -275,10 +274,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// initial attempt + at most one cheap local retry for fast pre-header faults.
 	// When enabled, use the explicit local retry budget for any transient
 	// uncommitted transactional failure.
-	for localAttempt := 0; ; localAttempt++ {
-		if localAttempt > 0 {
-			rec.resetResponse()
-		}
+	for {
 		// Refusal fallback: if the upstream returns a COMPLETE stream whose
 		// stop_reason is "refusal", re-issue once with the fallback model instead of
 		// handing the refusal back to the client. Arm interception only when a real
@@ -291,14 +287,17 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		reqModel := modelOf(body)
 		interceptRefusal := cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
 
+		rec.beginAttempt(body, reqWho, proxyRetries)
 		resp, started, rtErr := roundTrip(ctx, r, body)
 		if rtErr != nil {
 			last = classifyTransport(rtErr, ctx)
+			rec.noteAttemptFailure(last, "transport_error")
 			if tryLocalRetry(last) {
 				continue
 			}
 			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second {
 				wait := 250 * time.Millisecond
+				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, last, wait, 1, 1, retryCount, "legacy-fast")
 				if !sleepWithContext(ctx, wait) {
 					break
@@ -310,7 +309,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			last = classifyHTTPError(resp)
+			respBody := readHTTPErrorBody(resp, rec)
+			last = classifyHTTPErrorBytes(resp, respBody)
+			last.origStatus = resp.StatusCode
+			rec.noteAttemptFailure(last, "http_error")
 			resp.Body.Close()
 			if interceptRefusal {
 				if reason := refusalFallbackFailureReason(last); reason != "" && swapToFallback(reason, nil) {
@@ -322,6 +324,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			}
 			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second {
 				wait := 250 * time.Millisecond
+				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, last, wait, 1, 1, retryCount, "legacy-fast")
 				if !sleepWithContext(ctx, wait) {
 					break
@@ -333,9 +336,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !isEventStream(resp.Header.Get("Content-Type")) {
+			copyResponseBodyToArchive(resp, rec)
 			resp.Body.Close()
 			last = failure{transient: true, status: http.StatusBadGateway, atype: "api_error",
 				code: "unexpected_content_type", message: "upstream returned non-SSE to a streaming request"}
+			rec.noteAttemptFailure(last, "unexpected_content_type")
 			if tryLocalRetry(last) {
 				continue
 			}
@@ -347,18 +352,20 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		var st captureStats
 		st.respTee = rec.respWriter() // nil when request-log disabled
 		if rec != nil {
-			rec.respHeaders = resp.Header
-			rec.stats = &st
+			rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 		}
 		wrote, fail := captureSSEWindow(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, interceptRefusal)
 		resp.Body.Close()
+		rec.noteAttemptStats(&st)
 		if fail == nil {
 			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s%s%s",
 				whoWithResolvedModel(reqWho, st.model), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
+			rec.noteAttemptResult("success")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("OK", http.StatusOK, http.StatusOK, "")
 			return
 		}
+		rec.noteAttemptFailure(*fail, "sse_failure")
 		// Refusal fallback: either a complete stream that ended in
 		// stop_reason="refusal", or a pre-commit safeguard error reported outside
 		// the normal stream path. Nothing was committed downstream, so swap in the
@@ -382,6 +389,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if wrote { // failed AFTER committing — can't convert, response already streaming
 			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s%s%s",
 				whoWithResolvedModel(reqWho, st.model), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
+			rec.noteAttemptResult("drop")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
 			return
@@ -428,11 +436,53 @@ func readBody(r *http.Request) (body []byte, tooBig bool, err error) {
 	return body, false, err
 }
 
+const httpErrorClassifyBytes = 64 << 10
+
+type prefixCapture struct {
+	buf bytes.Buffer
+	max int64
+}
+
+func (p *prefixCapture) Write(b []byte) (int, error) {
+	if room := p.max - int64(p.buf.Len()); room > 0 {
+		if int64(len(b)) <= room {
+			p.buf.Write(b)
+		} else {
+			p.buf.Write(b[:room])
+		}
+	}
+	return len(b), nil
+}
+
+func readHTTPErrorBody(resp *http.Response, rec *reqRecorder) []byte {
+	if rec == nil {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, httpErrorClassifyBytes))
+		return b
+	}
+	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
+	prefix := &prefixCapture{max: httpErrorClassifyBytes}
+	dst := io.MultiWriter(prefix, rec.respWriter())
+	_, _ = io.Copy(dst, resp.Body)
+	return prefix.buf.Bytes()
+}
+
+func copyResponseBodyToArchive(resp *http.Response, rec *reqRecorder) {
+	if rec == nil {
+		return
+	}
+	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
+	if sink := rec.respWriter(); sink != nil {
+		_, _ = io.Copy(sink, resp.Body)
+	}
+}
+
 // proxyOnce is a plain single-shot reverse proxy for non-transactional routes.
 func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqRecorder) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
 	defer cancel()
+	reqWho := who(r, body)
+	rec.beginAttempt(body, reqWho, 0)
 	resp, _, err := roundTrip(ctx, r, body)
 
 	// Surface transport faults AND upstream HTTP errors through the same
@@ -445,8 +495,12 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	switch {
 	case err != nil:
 		f = classifyTransport(err, ctx)
+		rec.noteAttemptFailure(f, "transport_error")
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
-		f = classifyHTTPError(resp)
+		respBody := readHTTPErrorBody(resp, rec)
+		f = classifyHTTPErrorBytes(resp, respBody)
+		f.origStatus = resp.StatusCode
+		rec.noteAttemptFailure(f, "http_error")
 		resp.Body.Close()
 	default:
 		failed = false
@@ -467,24 +521,25 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 			tag = "RETRY"
 		}
 		sStatus, sType := surface(f)
-		log.Printf("%-5s %s  %s %s%s  %s%s%s", tag, who(r, body), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
+		log.Printf("%-5s %s  %s %s%s  %s%s%s", tag, reqWho, f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
 		writeAnthropicError(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
 	}
 	defer resp.Body.Close()
+	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 	for k, v := range safeResponseHeaders(resp.Header) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	// Tee the body into the recorder when request-log is on (capped sink).
+	// Tee the body into the recorder when request-log is on.
 	var dst io.Writer = w
 	if sink := rec.respWriter(); sink != nil {
-		rec.respHeaders = resp.Header
 		dst = io.MultiWriter(w, sink)
 	}
 	n, _ := io.Copy(dst, resp.Body)
-	log.Printf("OK    %s  %d  %s  %s%s", who(r, body), resp.StatusCode, hbytes(n), since(start), rec.idField())
+	rec.noteAttemptResult("success")
+	log.Printf("OK    %s  %d  %s  %s%s", reqWho, resp.StatusCode, hbytes(n), since(start), rec.idField())
 	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
 }
 

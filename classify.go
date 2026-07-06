@@ -121,18 +121,18 @@ func classifyTransport(err error, ctx context.Context) failure {
 }
 
 // classifyHTTPError inspects a non-2xx upstream response, tagging it with the raw
-// upstream status so logs keep the true status even when classifyHTTPErrorBody
+// upstream status so logs keep the true status even when classifyHTTPErrorBytes
 // normalizes failure.status (e.g. a retryable 4xx surfaced as 502).
 func classifyHTTPError(resp *http.Response) failure {
-	f := classifyHTTPErrorBody(resp)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	f := classifyHTTPErrorBytes(resp, b)
 	f.origStatus = resp.StatusCode
 	return f
 }
 
-// classifyHTTPErrorBody is the body/header inspection; it reads (and drains) a
-// bounded prefix of the body; the caller still closes resp.Body.
-func classifyHTTPErrorBody(resp *http.Response) failure {
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+// classifyHTTPErrorBytes is the body/header inspection. The caller supplies the
+// already-read body bytes when it also needs to archive the exact payload.
+func classifyHTTPErrorBytes(resp *http.Response, b []byte) failure {
 	body := strings.ToLower(string(b))
 	st := resp.StatusCode
 	ra := retryAfterSeconds(resp.Header.Get("Retry-After"))
