@@ -281,8 +281,8 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 // instead of being replayed downstream — so the caller can re-issue with a
 // fallback model. It only fires on the uncommitted (buffered) path: once the
 // stream has committed live the refusal bytes are already downstream and cannot
-// be swapped. Requires st!=nil and JSON validation on (that is what scrapes
-// stop_reason); otherwise it is a no-op and the refusal is delivered normally.
+// be swapped. It requires st!=nil; stop_reason is scraped whenever interception
+// is armed, even if full JSON validation is disabled.
 func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, interceptRefusal bool) (bool, *failure) {
 	sp := newSpool()
 	parser := &sseParser{}
@@ -457,7 +457,7 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 			} else {
 				st.curPingRun = 0
 			}
-			if cfg.validateJSON {
+			if cfg.validateJSON || interceptRefusal {
 				scrapeUsage(ev, st)
 			}
 		}

@@ -172,6 +172,36 @@ func TestE2ERefusalFallsBackToConfiguredModel(t *testing.T) {
 	}
 }
 
+// Refusal interception scrapes stop_reason itself when armed, so it must keep
+// working with PROXY_VALIDATE_JSON=0 (which disables the usage/stop scrape that
+// full validation would otherwise provide).
+func TestE2ERefusalFallbackWorksWithValidationDisabled(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if modelOf(b) == "claude-opus-4-8" {
+			io.WriteString(w, goodStream)
+			return
+		}
+		hits.Add(1)
+		io.WriteString(w, refusalStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.refusalFallback = "claude-opus-4-8"
+	cfg.validateJSON = false
+	t.Cleanup(func() { cfg.validateJSON = true })
+
+	rec := doStream(`{"stream":true,"model":"claude-fable-5"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Hi") {
+		t.Fatalf("want fallback success with validation disabled, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("want exactly one refusing attempt before fallback, got %d", got)
+	}
+}
+
 // Fable's safeguard block can arrive as a pre-stream HTTP invalid_request error
 // rather than a normal SSE message_delta.stop_reason="refusal". It must still use
 // the configured fallback immediately instead of retrying/surfacing the same model.
