@@ -130,15 +130,35 @@ func classifyHTTPError(resp *http.Response) failure {
 	return f
 }
 
+// requestShaped decides whether a non-2xx body names a deterministic
+// request-shape error (surface, don't retry). It differs per wire: Anthropic
+// matches message substrings; OpenAI Responses keys on the error type/code (see
+// responsesRequestShaped). It receives the parsed error type/code/message plus
+// the whole lowercased body.
+type requestShaped func(atype, code, msg, bodyLower string) bool
+
+// anthropicRequestShaped is the historical Anthropic rule: match a known
+// request-shape phrase anywhere in the body.
+func anthropicRequestShaped(_, _, _, bodyLower string) bool {
+	return anyContains(bodyLower, requestShapeSigs)
+}
+
 // classifyHTTPErrorBytes is the body/header inspection. The caller supplies the
 // already-read body bytes when it also needs to archive the exact payload.
 func classifyHTTPErrorBytes(resp *http.Response, b []byte) failure {
+	return classifyHTTPErrorBytesShaped(resp, b, anthropicRequestShaped)
+}
+
+// classifyHTTPErrorBytesShaped is classifyHTTPErrorBytes with a pluggable
+// request-shape decision so each wire keeps its own "can never succeed" rule
+// while sharing the status/header handling.
+func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, reqShaped requestShaped) failure {
 	body := strings.ToLower(string(b))
 	st := resp.StatusCode
 	ra := retryAfterSeconds(resp.Header.Get("Retry-After"))
 
 	var ae struct {
-		Error struct{ Type, Message string } `json:"error"`
+		Error struct{ Type, Code, Message string } `json:"error"`
 	}
 	_ = json.Unmarshal(b, &ae)
 	atype := ae.Error.Type
@@ -173,7 +193,7 @@ func classifyHTTPErrorBytes(resp *http.Response, b []byte) failure {
 		// unknown — is treated as a transient hiccup and retried: a temporary
 		// block should be ridden out, not surfaced. Normalize to 502 so the SDK
 		// always honors the retry (it may refuse to retry some 4xx by status).
-		if anyContains(body, requestShapeSigs) {
+		if reqShaped(ae.Error.Type, ae.Error.Code, ae.Error.Message, body) {
 			return failure{transient: false, status: st, atype: atype, code: "request_shape", message: ae.Error.Message}
 		}
 		return failure{transient: true, status: 502, atype: "api_error", code: "retryable_4xx_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
@@ -277,6 +297,25 @@ func surface(f failure) (status int, atype string) {
 		return retryableSurfaceStatus, "api_error"
 	}
 	return statusFor(f), f.atype
+}
+
+// surfaceFor is surface() with the one wire-specific adjustment Codex needs. Codex
+// ignores x-should-retry and decides retryability from the STATUS alone: it treats
+// only 400 (InvalidRequest) and 429 (RetryLimit) as terminal, and RETRIES every
+// other surfaced non-2xx (5xx -> InternalServerError, anything else ->
+// UnexpectedStatus, both retryable in codex-rs error.rs). A transient failure still
+// masks to 503, which Codex retries — the intended outcome. But a NON-transient,
+// can-never-succeed failure surfaced with its real non-400 status (a 404/413/422
+// request-shape, a gateway "permanent", or the proxy's own response_too_large 502)
+// would make Codex loop it to its stream-retry cap; force 400 so Codex stops. This
+// is the single choke point for every non-retryable Responses outcome, wherever it
+// was classified.
+func surfaceFor(path string, f failure) (status int, atype string) {
+	status, atype = surface(f)
+	if !f.transient && isResponsesPath(path) {
+		return http.StatusBadRequest, atype
+	}
+	return status, atype
 }
 
 // writeAnthropicError emits a clean Anthropic-shaped error with the retry signal.

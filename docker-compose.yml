@@ -27,6 +27,7 @@ services:
       PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS: "${PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS:-10000}"
       PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
       PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}" # workflow agents only: SMALL window — commit early + stream live so forwarded deltas feed their ~180s per-agent stall watchdog. Keep small: while buffering nothing is forwarded, so the first gap (~= window + TTFB) must stay under stallMs. A content-silent pause >= stallMs is unfixable here (raise the workflow's stallMs instead).
+      PROXY_RESPONSES_KEEPALIVE_MS: "${PROXY_RESPONSES_KEEPALIVE_MS:-30000}" # /v1/responses (Codex) only: hard-cap window. The stream commits early once output appears, so this only bounds a silent start before committing + streaming keepalives. Keep below Codex's stream_idle_timeout_ms. Start-of-stream errors are caught pre-commit regardless.
       PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
       PROXY_VALIDATE_JSON: "${PROXY_VALIDATE_JSON:-1}"
       PROXY_NORMALIZE_TOOL_JSON: "${PROXY_NORMALIZE_TOOL_JSON:-1}"

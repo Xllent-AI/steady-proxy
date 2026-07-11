@@ -1,9 +1,13 @@
-// cc-retry-proxy — a transactional, self-healing reverse proxy for Claude Code.
+// cc-retry-proxy — a transactional, self-healing reverse proxy for Claude Code
+// (Anthropic Messages, POST /v1/messages) and Codex (OpenAI Responses, POST
+// /v1/responses).
 //
-//	Claude Code (+ subagents) ──HTTP──▶ this proxy (loopback) ──HTTPS──▶ your gateway
+//	Claude Code / Codex (+ subagents) ──HTTP──▶ this proxy (loopback) ──HTTPS──▶ your gateway
 //
 // It makes the agent's API calls survive transient gateway failures WITHOUT the
-// user ever typing "continue", and without any terminal automation.
+// user ever typing "continue", and without any terminal automation. The wire
+// format only affects how a stream is interpreted (terminal event, in-band error,
+// usage) — see wireModel in wire.go; the transactional engine is shared.
 //
 // ── DESIGN PRINCIPLE: a blind stabilizer ─────────────────────────────────────
 //
@@ -27,6 +31,10 @@
 //   - For POST /v1/messages it withholds ALL downstream bytes until it has
 //     captured a complete, valid Anthropic SSE stream ending in `message_stop`.
 //     Only then does it write `200 OK` and replay the buffered stream.
+//   - For POST /v1/responses (Codex) the same engine buffers the OpenAI Responses
+//     SSE stream (terminal `response.completed`); a start-of-stream `error` /
+//     `response.failed` is caught pre-commit and converted to a retry, and once
+//     output appears it commits early and streams live. See wireModel (wire.go).
 //   - Any failure before that commit point (connection error, 5xx, stalled or
 //     truncated stream, mid-stream `error` event, or a retryable status) is
 //     turned into a *retryable* response: it stamps `x-should-retry: true` plus a
@@ -68,27 +76,28 @@ import (
 )
 
 type config struct {
-	listenAddr        string
-	upstream          string // scheme://host[:port], no trailing slash
-	upstreamHost      string
-	maxBufferMem      int64
-	maxResponseBytes  int64
-	maxRequestBytes   int64
-	respHeaderTO      time.Duration
-	upstreamByteIdle  time.Duration
-	keepaliveMs       time.Duration
-	wfKeepaliveMs     time.Duration
-	deadlineMargin    time.Duration
-	maxRequestDur     time.Duration
-	sdkRetryCap       int
-	txLocalRetries    int
-	localBackoffCap   time.Duration
-	spoolDir          string
-	requestLogDir     string // when non-empty, save each request/response to a file here
-	validateJSON      bool
-	normalizeToolJSON bool
-	refusalFallback   string // model to re-issue with when a model refusal/safeguard is detected; "" = feature off
-	verbose           bool
+	listenAddr           string
+	upstream             string // scheme://host[:port], no trailing slash
+	upstreamHost         string
+	maxBufferMem         int64
+	maxResponseBytes     int64
+	maxRequestBytes      int64
+	respHeaderTO         time.Duration
+	upstreamByteIdle     time.Duration
+	keepaliveMs          time.Duration
+	wfKeepaliveMs        time.Duration
+	responsesKeepaliveMs time.Duration
+	deadlineMargin       time.Duration
+	maxRequestDur        time.Duration
+	sdkRetryCap          int
+	txLocalRetries       int
+	localBackoffCap      time.Duration
+	spoolDir             string
+	requestLogDir        string // when non-empty, save each request/response to a file here
+	validateJSON         bool
+	normalizeToolJSON    bool
+	refusalFallback      string // model to re-issue with when a model refusal/safeguard is detected; "" = feature off
+	verbose              bool
 }
 
 func loadConfig() config {
@@ -98,27 +107,28 @@ func loadConfig() config {
 		host = host[i+3:]
 	}
 	return config{
-		listenAddr:        env("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
-		upstream:          up,
-		upstreamHost:      host,
-		maxBufferMem:      envInt64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20),    // 1 MiB in RAM, then temp file
-		maxResponseBytes:  envInt64("PROXY_MAX_RESPONSE_BYTES", 128<<20),    // 128 MiB hard cap
-		maxRequestBytes:   envInt64("PROXY_MAX_REQUEST_BYTES", 64<<20),      // 64 MiB request cap
-		respHeaderTO:      envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
-		upstreamByteIdle:  envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
-		keepaliveMs:       envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
-		wfKeepaliveMs:     envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 10000),     // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
-		deadlineMargin:    envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
-		maxRequestDur:     envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
-		sdkRetryCap:       int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
-		txLocalRetries:    envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
-		localBackoffCap:   envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
-		spoolDir:          env("PROXY_SPOOL_DIR", os.TempDir()),
-		requestLogDir:     env("PROXY_REQUEST_LOG_DIR", ""),              // "" = disabled; set a dir to save each request/response archive
-		validateJSON:      os.Getenv("PROXY_VALIDATE_JSON") != "0",       // default on
-		normalizeToolJSON: os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
-		refusalFallback:   loadRefusalFallback(),                         // default claude-opus-4-8; off/none/empty disables
-		verbose:           os.Getenv("PROXY_VERBOSE") == "1",
+		listenAddr:           env("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
+		upstream:             up,
+		upstreamHost:         host,
+		maxBufferMem:         envInt64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20),    // 1 MiB in RAM, then temp file
+		maxResponseBytes:     envInt64("PROXY_MAX_RESPONSE_BYTES", 128<<20),    // 128 MiB hard cap
+		maxRequestBytes:      envInt64("PROXY_MAX_REQUEST_BYTES", 64<<20),      // 64 MiB request cap
+		respHeaderTO:         envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),    // wait for upstream status line
+		upstreamByteIdle:     envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
+		keepaliveMs:          envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
+		wfKeepaliveMs:        envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 10000),     // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
+		responsesKeepaliveMs: envDur("PROXY_RESPONSES_KEEPALIVE_MS", 30000),    // hard-cap window for the OpenAI Responses route (Codex): the stream commits early as soon as the first output event is buffered, so this only bounds a silent start (reasoning with no output) before committing + streaming keepalives. Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
+		deadlineMargin:       envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
+		maxRequestDur:        envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
+		sdkRetryCap:          int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
+		txLocalRetries:       envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
+		localBackoffCap:      envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
+		spoolDir:             env("PROXY_SPOOL_DIR", os.TempDir()),
+		requestLogDir:        env("PROXY_REQUEST_LOG_DIR", ""),              // "" = disabled; set a dir to save each request/response archive
+		validateJSON:         os.Getenv("PROXY_VALIDATE_JSON") != "0",       // default on
+		normalizeToolJSON:    os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
+		refusalFallback:      loadRefusalFallback(),                         // default claude-opus-4-8; off/none/empty disables
+		verbose:              os.Getenv("PROXY_VERBOSE") == "1",
 	}
 }
 
@@ -158,8 +168,8 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy %s listening on http://%s -> %s  (transactional, keepalive=%s, wf-keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
-		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
+	log.Printf("cc-retry-proxy %s listening on http://%s -> %s  (transactional: /v1/messages + /v1/responses, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
+		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -168,18 +178,26 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reqStart := time.Now()
-	// Only POST /v1/messages gets the full transactional treatment. Everything
-	// else (e.g. /v1/messages/count_tokens, model listing) is forwarded with a
-	// single attempt; transport errors AND upstream HTTP errors there are still
-	// converted to retryable and masked to a generic 503 (see proxyOnce).
+	// The client-facing error shape follows the request's wire (Anthropic Messages
+	// vs OpenAI Responses); resolve it up front so even an early reject renders in
+	// the shape the client expects.
+	writeErr := errorWriterFor(r.URL.Path)
+	// Only streaming POST /v1/messages and POST /v1/responses get the full
+	// transactional treatment. Everything else (e.g. /v1/messages/count_tokens,
+	// model listing) is forwarded with a single attempt; transport errors AND
+	// upstream HTTP errors there are still converted to retryable and masked to a
+	// generic 503 (see proxyOnce).
 	body, tooBig, err := readBody(r)
 	if tooBig {
-		writeAnthropicError(w, false, http.StatusRequestEntityTooLarge, "invalid_request_error",
-			"cc-retry-proxy: request body exceeds limit", 0, "request_too_large")
+		// Deterministic: the same oversized request can never succeed. surfaceFor keeps
+		// 413 for the Anthropic wire but normalizes to 400 for Responses, since Codex
+		// ignores x-should-retry and would re-send a 413 to its retry cap.
+		st, ty := surfaceFor(r.URL.Path, failure{status: http.StatusRequestEntityTooLarge, atype: "invalid_request_error"})
+		writeErr(w, false, st, ty, "cc-retry-proxy: request body exceeds limit", 0, "request_too_large")
 		return
 	}
 	if err != nil {
-		writeAnthropicError(w, false, http.StatusBadGateway, "api_error", "proxy: reading request body", 0, "read_body")
+		writeErr(w, false, http.StatusBadGateway, "api_error", "proxy: reading request body", 0, "read_body")
 		return
 	}
 
@@ -190,12 +208,17 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		defer rec.finish()
 	}
 
-	transactional := r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/messages") &&
-		!strings.Contains(r.URL.Path, "count_tokens") && requestWantsStream(body)
+	transactional := r.Method == http.MethodPost && requestWantsStream(body) &&
+		(isMessagesPath(r.URL.Path) || isResponsesPath(r.URL.Path))
 	if !transactional {
 		proxyOnce(w, r, body, rec)
 		return
 	}
+	// isResp selects the OpenAI Responses (Codex) wire: it commits early (streams
+	// as soon as output appears) and disables the Anthropic-only features (refusal
+	// fallback, Workflow stall gating) that don't apply to it.
+	isResp := isResponsesPath(r.URL.Path)
+	earlyCommit := isResp
 
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 	budgetLeft := func() bool { return retryCount < cfg.sdkRetryCap }
@@ -221,9 +244,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// Workflow agents carry a per-agent stall watchdog; give them a short window
 	// AND gate its commit on real forwarded progress (see captureSSEWindow). Every
 	// other caller keeps the full window and the plain commit-at-window keepalive.
-	gated := isWorkflowAgent(body)
+	gated := !isResp && isWorkflowAgent(body) // Workflow stall gating is Anthropic-only
 	kaWindow := cfg.keepaliveMs
-	if gated {
+	switch {
+	case isResp:
+		kaWindow = cfg.responsesKeepaliveMs
+	case gated:
 		kaWindow = cfg.wfKeepaliveMs
 	}
 	tryLocalRetry := func(f failure) bool {
@@ -285,7 +311,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// again (no recursion). The swap itself is deferred to the refusal branch so
 		// the happy path never marshals a fallback body it won't use.
 		reqModel := modelOf(body)
-		interceptRefusal := cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
+		interceptRefusal := !isResp && cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
 
 		rec.beginAttempt(body, reqWho, proxyRetries)
 		resp, started, rtErr := roundTrip(ctx, r, body)
@@ -310,7 +336,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			respBody := readHTTPErrorBody(resp, rec)
-			last = classifyHTTPErrorBytes(resp, respBody)
+			last = classifyHTTPErrorForPath(r.URL.Path, resp, respBody)
 			last.origStatus = resp.StatusCode
 			rec.noteAttemptFailure(last, "http_error")
 			resp.Body.Close()
@@ -354,7 +380,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if rec != nil {
 			rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 		}
-		wrote, fail := captureSSEWindow(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, interceptRefusal)
+		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wireFor(r.URL.Path, interceptRefusal))
 		resp.Body.Close()
 		rec.noteAttemptStats(&st)
 		if fail == nil {
@@ -417,12 +443,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// Claude Code can't recognize it as overloaded/rate-limit/timeout and bypass
 	// its x-should-retry loop. The log shows the true upstream status arrowed to
 	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
-	sStatus, sType := surface(last)
+	sStatus, sType := surfaceFor(r.URL.Path, last)
 	log.Printf("%-5s %s  %s %s%s  %s%s%s%s",
 		tag, reqWho, last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
 	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
-	writeAnthropicError(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
+	writeErr(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
 }
 
 // readBody reads the request body with a hard cap, reporting overflow rather
@@ -481,6 +507,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
 	defer cancel()
+	writeErr := errorWriterFor(r.URL.Path)
 	reqWho := who(r, body)
 	rec.beginAttempt(body, reqWho, 0)
 	resp, _, err := roundTrip(ctx, r, body)
@@ -498,7 +525,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		rec.noteAttemptFailure(f, "transport_error")
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		respBody := readHTTPErrorBody(resp, rec)
-		f = classifyHTTPErrorBytes(resp, respBody)
+		f = classifyHTTPErrorForPath(r.URL.Path, resp, respBody)
 		f.origStatus = resp.StatusCode
 		rec.noteAttemptFailure(f, "http_error")
 		resp.Body.Close()
@@ -520,10 +547,10 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		if canRetry {
 			tag = "RETRY"
 		}
-		sStatus, sType := surface(f)
+		sStatus, sType := surfaceFor(r.URL.Path, f)
 		log.Printf("%-5s %s  %s %s%s  %s%s%s", tag, reqWho, f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
-		writeAnthropicError(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
+		writeErr(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
 	}
 	defer resp.Body.Close()

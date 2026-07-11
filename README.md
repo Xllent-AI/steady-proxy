@@ -1,12 +1,18 @@
 # cc-retry-proxy
 
 A tiny, transactional, self-healing reverse proxy that sits between **Claude Code**
-and your **gateway**, so transient gateway failures never stop a turn — no tmux,
-no terminal automation, and subagents are covered automatically.
+or **Codex** and your **gateway**, so transient gateway failures never stop a turn
+— no tmux, no terminal automation, and subagents are covered automatically.
 
 ```
-Claude Code (+ subagents)  ──HTTP──▶  cc-retry-proxy (loopback)  ──HTTPS──▶  your gateway
+Claude Code / Codex (+ subagents)  ──HTTP──▶  cc-retry-proxy (loopback)  ──HTTPS──▶  your gateway
 ```
+
+It speaks both wire formats: the **Anthropic Messages** API (`POST /v1/messages`,
+Claude Code) and the **OpenAI Responses** API (`POST /v1/responses`, Codex with
+`wire_api = "responses"`). The transactional engine is shared; only the
+stream interpretation (terminal event, in-band error shape, usage) differs per
+wire — see `wireModel` in `wire.go`.
 
 ## Design principle: a blind stabilizer
 
@@ -37,6 +43,23 @@ is ridden out, not surfaced.
   replays it once a complete, valid `message_stop` is captured. Downstream
   forwarding also coalesces tool/server-tool `input_json_delta` fragments into
   one complete JSON delta, avoiding client-side partial-JSON EOF failures.
+- For `POST /v1/responses` (Codex) the same engine buffers the OpenAI Responses
+  SSE stream, whose terminal is `response.completed`. A start-of-stream `error`
+  or `response.failed` (overload / capacity / rate limit — which Codex otherwise
+  treats as a **fatal turn error** and does not retry) is caught **pre-commit**
+  and converted to a retry (or ridden out by hidden local retries). Once output
+  appears it commits early and streams live, so streaming UX is preserved; a
+  post-commit error truncates the stream so Codex's native stream-retry re-issues.
+  Bytes are forwarded verbatim — Codex's Responses parser is deliberately lenient
+  (it tolerates missing/null fields and skips any frame it can't deserialize
+  without failing the turn), so the proxy does not second-guess individual content
+  frames; its guarantees are at the stream level (a parseable terminal, or a
+  convert-to-retry). During a silent gap the keepalive is a **skippable Responses
+  event** (not an SSE comment, which Codex's reader discards without resetting its
+  idle timer). No tool-JSON coalescing; refusal-fallback and the Workflow stall
+  watchdog are Anthropic-only and stay off. A **non-retryable** error (a
+  deterministic request-shape) surfaces as **HTTP 400** — the one 4xx Codex treats
+  as terminal; every other non-2xx it would retry regardless of `x-should-retry`.
 - Any failure **before** that commit point — connection error, 5xx, a stalled or
   truncated stream, a mid-stream `error` event, any retryable status — is either
   retried inside the proxy when `PROXY_TRANSACTIONAL_LOCAL_RETRIES` is enabled,
@@ -233,6 +256,26 @@ headers unchanged):
 If Claude Code refuses a plain `http://` base URL, serve the proxy over TLS with a
 local cert and set `NODE_EXTRA_CA_CERTS` — but loopback `http` is normally fine.
 
+## Wire Codex to it
+
+Point the Codex provider's `base_url` at the proxy (keep `/v1`) in
+`~/.codex/config.toml`; the proxy holds the real upstream and forwards auth
+unchanged:
+
+```toml
+[model_providers.crs]
+base_url = "http://127.0.0.1:8789/v1"   # was: your real gateway .../v1
+wire_api = "responses"
+# Keep the client's stream-idle timeout above PROXY_RESPONSES_KEEPALIVE_MS (30s):
+stream_idle_timeout_ms = 600000
+# Codex's own retries still apply as a backstop when the proxy surfaces a retryable 503:
+request_max_retries = 10
+stream_max_retries = 10
+```
+
+Enable `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N` so a start-of-stream overload is
+ridden out inside the proxy and Codex never sees it.
+
 ## Verify — reading the log
 
 The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only adds
@@ -304,11 +347,12 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 |---|---|---|
 | `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
 | `PROXY_UPSTREAM_URL` | `https://your-gateway.example.com` | the real gateway (set via `.env`) |
-| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). Claude Code still has its own retry cap |
-| `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional `/v1/messages` attempt. `1` means one extra upstream try before returning a retryable response to Claude Code |
+| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). **Claude/Stainless-specific:** the count comes from the `X-Stainless-Retry-Count` header the Anthropic SDK sends. **Codex does not send it**, so on `/v1/responses` the count is always 0 and any positive cap is effectively unlimited — conversion is bounded instead by Codex's own `request_max_retries`/`stream_max_retries`. Set `0` to disable proxy conversion entirely for a Codex-only deployment |
+| `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional attempt (`/v1/messages` and `/v1/responses`). `1` means one extra upstream try before returning a retryable response to the client. For Codex this is the ideal path — an overload is ridden out and Codex never sees an error |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
 | `PROXY_WORKFLOW_KEEPALIVE_MS` | `10000` | **workflow agents only** — a **small** window so the proxy commits *early* and streams live, feeding Claude Code's Workflow per-agent **stall** watchdog (default ~180 s, no global env override; kills on a forwarded-delta gap ≥ `stallMs`). Keep it small so the first gap (≈ window + TTFB) stays under `stallMs`; it can't fix a mid-turn content-silent pause ≥ `stallMs`. `0` disables (stall returns). Other callers keep `PROXY_KEEPALIVE_MS`. See [Workflow agents](#workflow-agents) |
+| `PROXY_RESPONSES_KEEPALIVE_MS` | `30000` | **`/v1/responses` (Codex) only** — a hard-cap window before committing. The stream commits *early* as soon as output appears, so this only bounds a **silent start** (reasoning with no output) before committing and streaming keepalive events. Keep it below Codex's `stream_idle_timeout_ms` so the commit — after which the proxy emits Codex-visible keepalive events that reset Codex's idle timer — happens before Codex would idle out. Start-of-stream errors arrive before any output, so they're caught pre-commit regardless of this value |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |

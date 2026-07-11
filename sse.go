@@ -284,12 +284,20 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 // be swapped. It requires st!=nil; stop_reason is scraped whenever interception
 // is armed, even if full JSON validation is disabled.
 func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, interceptRefusal bool) (bool, *failure) {
+	return captureSSECore(ctx, cancel, w, upstreamHdr, body, st, keepaliveMs, progressGated, false, newAnthropicWire(interceptRefusal))
+}
+
+// captureSSECore is the wire-agnostic transactional engine. model interprets the
+// stream (terminal / in-band error / usage scrape / downstream bytes) for the
+// request's wire format; every other concern — buffering, the
+// keepalive→commit→live transition, idle/deadline handling, and the wrote/fail
+// contract — is identical across wires. earlyCommit (OpenAI/Codex) commits as
+// soon as the first forwardable content is buffered, without waiting out the
+// window, so streaming UX is preserved while a start-of-stream error is still
+// caught pre-commit and converted to a retry.
+func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, earlyCommit bool, model wireModel) (bool, *failure) {
 	sp := newSpool()
 	parser := &sseParser{}
-	val := &streamValidator{}
-	toolVal := &toolJSONValidator{}
-	toolNorm := &toolJSONReplayNormalizer{}
-	prog := &progressTracker{}
 	committed := false
 	headerWritten := false
 
@@ -352,7 +360,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 	commitLive := func() *failure {
 		writeHead("live")
 		committed = true
-		if err := sp.replayWithNormalizer(w, toolNorm); err != nil {
+		if err := model.replayPrefix(sp, w); err != nil {
 			sp.discard()
 			return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
 		}
@@ -368,7 +376,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 				if st != nil && st.respTee != nil {
 					st.respTee.Write(r.data)
 				}
-				wrote, fail, ret := process(r.data, sp, parser, val, toolVal, toolNorm, prog, w, &committed, writeHead, flush, st, interceptRefusal)
+				wrote, fail, ret := process(r.data, sp, parser, model, w, &committed, writeHead, flush, st)
 				if ret {
 					return wrote, fail
 				}
@@ -384,7 +392,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 			// forwarded content is now buffered — commit immediately instead of
 			// waiting for the next keepalive tick (a full window away, long enough
 			// for the watchdog/TTFB ceiling to fire on a healthy stream).
-			if progressGated && !committed && graceElapsed && prog.sawForwardable {
+			if !committed && model.forwardable() && (earlyCommit || (progressGated && graceElapsed)) {
 				if f := commitLive(); f != nil {
 					return true, f
 				}
@@ -405,7 +413,7 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 				// promptly, and the idle watchdog + deadline still bound a silent
 				// upstream. Ungated callers commit here regardless, so a long
 				// ping-only stream keeps getting keepalives and never times out.
-				if progressGated && !prog.sawForwardable {
+				if progressGated && !model.forwardable() {
 					keepTimer.Reset(keepEvery)
 					continue
 				}
@@ -413,7 +421,13 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 					return true, f
 				}
 			}
-			io.WriteString(w, ": keepalive\n\n")
+			// Keep the client's idle timer alive during a silent gap. The frame is
+			// wire-specific: the Anthropic SDK accepts a spec SSE comment, but Codex's
+			// SSE reader only resets its idle timer on a yielded event and discards
+			// comments — so the Responses wire sends a skippable unknown-type event that
+			// Codex ignores but still counts as activity (see wireModel.keepalive). A
+			// genuinely byte-silent upstream is bounded by idleTimer regardless.
+			w.Write(model.keepalive())
 			flush()
 			keepTimer.Reset(keepEvery)
 		case <-idleTimer.C:
@@ -439,8 +453,11 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 }
 
 // process handles one chunk. ret=true means captureSSE should return (wrote,fail).
-func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, toolVal *toolJSONValidator, toolNorm *toolJSONReplayNormalizer, prog *progressTracker, w http.ResponseWriter,
-	committed *bool, writeHead func(string), flush func(), st *captureStats, interceptRefusal bool) (bool, *failure, bool) {
+// The wire-specific decisions — is this an in-band error, is the stream complete,
+// what bytes to forward, what usage to scrape — are delegated to model; process
+// owns only the engine mechanics (ping tripwire, spool, commit boundary).
+func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.ResponseWriter,
+	committed *bool, writeHead func(string), flush func(), st *captureStats) (bool, *failure, bool) {
 	for _, ev := range parser.feed(data) {
 		if st != nil {
 			st.bytes += int64(len(ev.raw))
@@ -457,66 +474,44 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 			} else {
 				st.curPingRun = 0
 			}
-			if cfg.validateJSON || interceptRefusal {
-				scrapeUsage(ev, st)
-			}
-		}
-		if cfg.validateJSON {
-			if f := validateSSEEventShape(ev); f != nil {
-				sp.discard()
-				if *committed {
-					return true, f, true
-				}
-				return false, f, true
-			}
+			// scrape is best-effort and cheap — it only unmarshals the few events that
+			// carry usage/model/stop, ignoring the rest — so run it unconditionally. That
+			// keeps access-log facts (and the Anthropic wire's own stop_reason==refusal
+			// check) populated even when JSON validation is off (PROXY_VALIDATE_JSON=0),
+			// without the engine needing to know any wire-specific policy.
+			model.scrape(ev, st)
 		}
 		if *committed {
 			// Live mode: headers are already sent, so we can't convert to a
 			// retryable status — but never forward the raw special identity
-			// (overloaded_error / rate_limit_error). End the stream as a DROP so
-			// Claude Code's native truncated-stream retry takes over, and the
-			// access log keeps the true cause instead of a generic truncation.
-			if ev.name == "error" {
-				return true, classifySSEError(ev.data), true
-			}
-			out, err := toolNorm.accept(ev, ev.raw)
-			if err != nil {
-				return true, malformedSSE("invalid tool input JSON in stream event"), true
+			// (overloaded_error / response.failed). model.live ends the stream as a
+			// DROP on an in-band error so the client's native truncated-stream retry
+			// takes over, and the access log keeps the true cause.
+			out, done, fail := model.live(ev, ev.raw, st)
+			if fail != nil {
+				return true, fail, true
 			}
 			for _, p := range out {
 				w.Write(p)
 			}
 			if len(out) == 0 {
-				io.WriteString(w, ": keepalive\n\n")
+				w.Write(model.keepalive())
 			}
 			flush()
-			val.accept(ev)
-			if val.terminal() {
+			if done {
 				return true, nil, true
 			}
 			continue
 		}
-		// uncommitted: validate before spooling/committing anything.
-		if ev.name == "error" {
+		// uncommitted: validate + advance without touching the spool, then buffer.
+		done, fail := model.buffered(ev, st)
+		if fail != nil {
+			// In-band error, malformed/out-of-order event, or the refusal sentinel:
+			// nothing is downstream yet, so discard and let the caller convert to a
+			// retry (or, for the sentinel, swap in the fallback model).
 			sp.discard()
-			return false, classifySSEError(ev.data), true
+			return false, fail, true
 		}
-		if cfg.validateJSON && ev.data != "" && !json.Valid([]byte(ev.data)) {
-			sp.discard()
-			return false, &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: "invalid JSON in stream event"}, true
-		}
-		if cfg.validateJSON {
-			if f := toolVal.accept(ev); f != nil {
-				sp.discard()
-				return false, f, true
-			}
-		}
-		val.accept(ev)
-		if val.invalid {
-			sp.discard()
-			return false, &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: "out-of-order stream event"}, true
-		}
-		prog.accept(ev) // does the buffered prefix now forward incremental progress?
 		if err := sp.write(ev.raw); err != nil {
 			sp.discard()
 			// transient:false is intentional — the same request will always
@@ -524,21 +519,11 @@ func process(data []byte, sp *spool, parser *sseParser, val *streamValidator, to
 			// (not 500) signals an upstream-shaped condition, not a proxy fault.
 			return false, &failure{status: http.StatusBadGateway, atype: "api_error", code: "response_too_large", message: "response exceeded proxy buffer cap"}, true
 		}
-		if val.terminal() {
-			// Complete, valid stream — but if the model refused and the caller armed
-			// refusal interception, do NOT replay it downstream. Discard the buffered
-			// refusal and hand back the sentinel so the caller can re-issue with the
-			// fallback model. Uncommitted path only: this branch runs before any bytes
-			// (headers or buffered prefix) reach the client, so the swap is clean.
-			if interceptRefusal && st != nil && st.stop == "refusal" {
-				sp.discard()
-				// api_error/502 are defensive defaults: the handler keys on
-				// .code and never surfaces this, but a benign shape keeps any
-				// future leak clean rather than an empty error type.
-				return false, &failure{status: http.StatusBadGateway, atype: "api_error", code: refusalFallbackCode, message: "model refused; retrying with fallback model"}, true
-			}
+		if done {
+			// Complete, valid stream: replay the whole buffer downstream. This runs
+			// before any bytes reached the client, so it is still a clean commit.
 			writeHead("buffered")
-			if err := sp.replayWithUsage(w, st); err != nil {
+			if err := model.replayBuffered(sp, w, st); err != nil {
 				sp.discard()
 				return true, &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}, true
 			}
