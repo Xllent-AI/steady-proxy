@@ -337,6 +337,25 @@ func TestE2EAccessLogShowsResolvedModelWhenDifferent(t *testing.T) {
 	}
 }
 
+func TestE2EMessagesAccessLogShowsReasoningEffortWhenSet(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+
+	logs := captureLogs(t, func() {
+		rec := doStream(`{"stream":true,"model":"claude-opus-4-8","output_config":{"effort":"xhigh"}}`)
+		if rec.Code != 200 {
+			t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+	if !strings.Contains(logs, "OK    claude-opus-4-8/main  xhigh  ") {
+		t.Fatalf("access log missing reasoning effort:\n%s", logs)
+	}
+}
+
 func TestE2ETransactionalLocalRetryTruncateThenSuccess(t *testing.T) {
 	var hits atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

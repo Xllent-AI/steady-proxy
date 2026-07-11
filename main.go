@@ -264,6 +264,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	var last failure
 	proxyRetries := 0
 	reqWho := who(r, body)
+	reqEffort := reasoningEffortOf(r.URL.Path, body)
 	// legacyFastUsed tracks whether the CURRENT request body has already spent its
 	// one free fast local retry (the txLocalRetries==0 legacy path). It replaces a
 	// bare localAttempt==0 check so a refusal→fallback model swap — which begins a
@@ -285,11 +286,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 		wait := localRetryDelay(f.retryAfter, proxyRetries)
 		if !canWaitForLocalRetry(ctx, wait) {
-			logLocalRetrySkip(reqWho, f, wait, retryCount, "not-enough-time")
+			logLocalRetrySkip(reqWho, reqEffort, f, wait, retryCount, "not-enough-time")
 			return false
 		}
 		rec.noteAttemptRetry("local_retry", wait)
-		logLocalRetry(reqWho, f, wait, proxyRetries+1, cfg.txLocalRetries, retryCount, "")
+		logLocalRetry(reqWho, reqEffort, f, wait, proxyRetries+1, cfg.txLocalRetries, retryCount, "")
 		if !sleepWithContext(ctx, wait) {
 			return false
 		}
@@ -304,12 +305,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.noteModelSwap(reason, from, cfg.refusalFallback)
 		if st != nil {
-			log.Printf("WARN  %s  %s -> retry with %s  in=%s out=%s tok  %s%s%s",
-				whoWithResolvedModel(reqWho, st.model), reason, cfg.refusalFallback,
+			log.Printf("WARN  %s%s  %s -> retry with %s  in=%s out=%s tok  %s%s%s",
+				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), reason, cfg.refusalFallback,
 				htok(st.inTok), htok(st.outTok), since(reqStart), att(retryCount), rec.idField())
 		} else {
-			log.Printf("WARN  %s  %s -> retry with %s  %s%s",
-				reqWho, reason, cfg.refusalFallback, since(reqStart), rec.idField())
+			log.Printf("WARN  %s%s  %s -> retry with %s  %s%s",
+				reqWho, effortField(reqEffort), reason, cfg.refusalFallback, since(reqStart), rec.idField())
 		}
 		body = swapped
 		reqWho = who(r, body)
@@ -351,7 +352,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
-				logLocalRetry(reqWho, last, wait, 1, 1, retryCount, "legacy-fast")
+				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
 				if !sleepWithContext(ctx, wait) {
 					break
 				}
@@ -378,7 +379,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
-				logLocalRetry(reqWho, last, wait, 1, 1, retryCount, "legacy-fast")
+				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
 				if !sleepWithContext(ctx, wait) {
 					break
 				}
@@ -411,8 +412,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		rec.noteAttemptStats(&st)
 		if fail == nil {
-			log.Printf("OK    %s  in=%s out=%s tok  %s  %s  %s%s%s%s%s",
-				whoWithResolvedModel(reqWho, st.model), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
+			log.Printf("OK    %s%s  in=%s out=%s tok  %s  %s  %s%s%s%s%s",
+				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
 			rec.noteAttemptResult("success")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("OK", http.StatusOK, http.StatusOK, "")
@@ -440,8 +441,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
-			log.Printf("DROP  %s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s%s%s",
-				whoWithResolvedModel(reqWho, st.model), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
+			log.Printf("DROP  %s%s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s%s%s",
+				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
 			rec.noteAttemptResult("drop")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
@@ -471,8 +472,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// its x-should-retry loop. The log shows the true upstream status arrowed to
 	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
 	sStatus, sType := surfaceFor(r.URL.Path, last)
-	log.Printf("%-5s %s  %s %s%s  %s%s%s%s",
-		tag, reqWho, last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
+	log.Printf("%-5s %s%s  %s %s%s  %s%s%s%s",
+		tag, reqWho, effortField(reqEffort), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
 	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
 	writeErr(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
@@ -536,6 +537,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	defer cancel()
 	writeErr := errorWriterFor(r.URL.Path)
 	reqWho := who(r, body)
+	reqEffort := reasoningEffortOf(r.URL.Path, body)
 	rec.beginAttempt(body, reqWho, 0)
 	resp, _, err := roundTrip(ctx, r, body)
 
@@ -575,7 +577,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 			tag = "RETRY"
 		}
 		sStatus, sType := surfaceFor(r.URL.Path, f)
-		log.Printf("%-5s %s  %s %s%s  %s%s%s", tag, reqWho, f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
+		log.Printf("%-5s %s%s  %s %s%s  %s%s%s", tag, reqWho, effortField(reqEffort), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
 		writeErr(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
 		return
@@ -593,7 +595,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	}
 	n, _ := io.Copy(dst, resp.Body)
 	rec.noteAttemptResult("success")
-	log.Printf("OK    %s  %d  %s  %s%s", reqWho, resp.StatusCode, hbytes(n), since(start), rec.idField())
+	log.Printf("OK    %s%s  %d  %s  %s%s", reqWho, effortField(reqEffort), resp.StatusCode, hbytes(n), since(start), rec.idField())
 	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
 }
 
@@ -735,6 +737,13 @@ func whoWithResolvedModel(reqWho, resolvedModel string) string {
 	return reqModel + "->" + resolvedModel + agent
 }
 
+func effortField(effort string) string {
+	if effort == "" {
+		return ""
+	}
+	return "  " + effort
+}
+
 // att renders the SDK attempt number only when it's non-zero (i.e. a retry), so
 // the happy path stays uncluttered.
 func att(n int) string {
@@ -753,15 +762,15 @@ func retryField(secs int) string {
 	return fmt.Sprintf("  retry-after=%ds", secs)
 }
 
-func logLocalRetry(reqWho string, f failure, wait time.Duration, retryNum, retryMax, sdkAttempt int, mode string) {
-	vlog("[local-retry] %s %s %s wait=%s retry=%d/%d%s%s",
-		reqWho, f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond),
+func logLocalRetry(reqWho, effort string, f failure, wait time.Duration, retryNum, retryMax, sdkAttempt int, mode string) {
+	vlog("[local-retry] %s%s %s %s wait=%s retry=%d/%d%s%s",
+		reqWho, effortField(effort), f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond),
 		retryNum, retryMax, att(sdkAttempt), localRetryModeField(mode))
 }
 
-func logLocalRetrySkip(reqWho string, f failure, wait time.Duration, sdkAttempt int, reason string) {
-	vlog("[local-retry] %s %s %s wait=%s skip=%s%s",
-		reqWho, f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond), reason, att(sdkAttempt))
+func logLocalRetrySkip(reqWho, effort string, f failure, wait time.Duration, sdkAttempt int, reason string) {
+	vlog("[local-retry] %s%s %s %s wait=%s skip=%s%s",
+		reqWho, effortField(effort), f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond), reason, att(sdkAttempt))
 }
 
 func localRetryModeField(mode string) string {
@@ -850,6 +859,26 @@ func modelOf(body []byte) string {
 		return "?"
 	}
 	return b.Model
+}
+
+func reasoningEffortOf(path string, body []byte) string {
+	var b struct {
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+		OutputConfig struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}
+	_ = json.Unmarshal(body, &b)
+	switch {
+	case isResponsesPath(path):
+		return strings.TrimSpace(b.Reasoning.Effort)
+	case isMessagesPath(path):
+		return strings.TrimSpace(b.OutputConfig.Effort)
+	default:
+		return ""
+	}
 }
 
 // refusalFallbackCode is the sentinel failure code captureSSE returns when a

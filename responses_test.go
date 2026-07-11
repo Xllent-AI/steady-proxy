@@ -796,6 +796,35 @@ func TestE2EResponsesStreamingSuccess(t *testing.T) {
 	}
 }
 
+func TestE2EResponsesAccessLogShowsReasoningEffortWhenSet(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodResponsesStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+
+	logs := captureLogs(t, func() {
+		rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol","reasoning":{"effort":"high"}}`)
+		if rec.Code != 200 {
+			t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+	if !strings.Contains(logs, "OK    gpt-5.6-sol/main  high  ") {
+		t.Fatalf("access log missing reasoning effort:\n%s", logs)
+	}
+
+	logs = captureLogs(t, func() {
+		rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+		if rec.Code != 200 {
+			t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+	if !strings.Contains(logs, "OK    gpt-5.6-sol/main  in=") {
+		t.Fatalf("access log should omit unset reasoning effort:\n%s", logs)
+	}
+}
+
 func TestE2EResponsesEarlyCommitDisabledBuffers(t *testing.T) {
 	// PROXY_RESPONSES_EARLY_COMMIT=0: a healthy streaming Responses turn is buffered to
 	// the terminal and replayed at once (mode=buffered), like /v1/messages, instead of
