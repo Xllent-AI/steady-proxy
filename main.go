@@ -87,6 +87,8 @@ type config struct {
 	keepaliveMs          time.Duration
 	wfKeepaliveMs        time.Duration
 	responsesKeepaliveMs time.Duration
+	responsesBufferMs    time.Duration
+	responsesEarlyCommit bool // Responses (Codex): commit on first output (default); false = buffer to terminal under responsesBufferMs, like /v1/messages
 	deadlineMargin       time.Duration
 	maxRequestDur        time.Duration
 	sdkRetryCap          int
@@ -117,7 +119,9 @@ func loadConfig() config {
 		upstreamByteIdle:     envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),    // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
 		keepaliveMs:          envDur("PROXY_KEEPALIVE_MS", 600000),             // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
 		wfKeepaliveMs:        envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 10000),     // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
-		responsesKeepaliveMs: envDur("PROXY_RESPONSES_KEEPALIVE_MS", 30000),    // hard-cap window for the OpenAI Responses route (Codex): the stream commits early as soon as the first output event is buffered, so this only bounds a silent start (reasoning with no output) before committing + streaming keepalives. Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
+		responsesKeepaliveMs: envDur("PROXY_RESPONSES_KEEPALIVE_MS", 30000),    // OpenAI Responses route (Codex), applies ONLY in early-commit mode: bounds a silent start (reasoning with no output) before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead (see config.keepaliveWindow). Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
+		responsesBufferMs:    envDur("PROXY_RESPONSES_BUFFER_MS", 600000),      // Responses (Codex) hold used ONLY when early-commit is off: buffer to the terminal, committing live at this window as a safety valve (the /v1/messages policy applied to Responses). Responses-OWNED — independent of PROXY_KEEPALIVE_MS — so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it (nothing is forwarded while buffering).
+		responsesEarlyCommit: os.Getenv("PROXY_RESPONSES_EARLY_COMMIT") != "0", // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
 		deadlineMargin:       envDur("PROXY_DEADLINE_MARGIN_MS", 25000),        // finish before the client's own timeout
 		maxRequestDur:        envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000), // absolute ceiling per attempt (25m)
 		sdkRetryCap:          int(envInt64("PROXY_SDK_RETRY_CAP", 100)),        // backstop only; Claude Code's own retry cap still applies
@@ -168,9 +172,36 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy %s listening on http://%s -> %s  (transactional: /v1/messages + /v1/responses, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
-		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
+	log.Printf("cc-retry-proxy %s listening on http://%s -> %s  (transactional: /v1/messages + /v1/responses, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, responses-early-commit=%v, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
+		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.responsesEarlyCommit, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
 	log.Fatal(srv.ListenAndServe())
+}
+
+// keepaliveWindow picks the transactional buffer->commit window for one request.
+// Each mode owns a distinct, independently-tunable window — no mode borrows another
+// protocol's knob, and no single knob serves two roles:
+//   - Responses, early-commit ON: responsesKeepaliveMs — a short silent-start bound.
+//     The stream commits as soon as output is buffered, so this only caps a
+//     reasoning-only silent start before it goes live.
+//   - Responses, early-commit OFF (full buffer): responsesBufferMs — buffer to the
+//     terminal, committing live at the window only as a safety valve (the /v1/messages
+//     policy applied to Responses). This window is Responses-owned, NOT keepaliveMs,
+//     so a mixed Codex+Claude proxy tunes the two horizons separately.
+//   - Workflow-gated Messages: wfKeepaliveMs — the small stall-watchdog window.
+//   - Ordinary Messages: keepaliveMs.
+//
+// earlyCommit ⇒ isResp and gated ⇒ !isResp, so the case order is unambiguous.
+func (c config) keepaliveWindow(isResp, earlyCommit, gated bool) time.Duration {
+	switch {
+	case earlyCommit:
+		return c.responsesKeepaliveMs
+	case isResp:
+		return c.responsesBufferMs
+	case gated:
+		return c.wfKeepaliveMs
+	default:
+		return c.keepaliveMs
+	}
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
@@ -214,11 +245,15 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		proxyOnce(w, r, body, rec)
 		return
 	}
-	// isResp selects the OpenAI Responses (Codex) wire: it commits early (streams
-	// as soon as output appears) and disables the Anthropic-only features (refusal
-	// fallback, Workflow stall gating) that don't apply to it.
+	// isResp selects the OpenAI Responses (Codex) wire: it disables the
+	// Anthropic-only features (refusal fallback, Workflow stall gating) that don't
+	// apply to it. By default it also commits early — streaming as soon as output
+	// appears; PROXY_RESPONSES_EARLY_COMMIT=0 turns that off so it buffers to the
+	// terminal like /v1/messages (fuller pre-commit protection — mid-stream errors
+	// become hidden retries too — at the cost of a longer initial silence the
+	// client's stream-idle timeout must cover).
 	isResp := isResponsesPath(r.URL.Path)
-	earlyCommit := isResp
+	earlyCommit := isResp && cfg.responsesEarlyCommit
 
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 	budgetLeft := func() bool { return retryCount < cfg.sdkRetryCap }
@@ -237,21 +272,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	legacyFastUsed := false
 
 	// Workflow-tool agents carry a per-agent "stall" watchdog (default 180s, no
-	// global env override) that aborts a turn streaming no assistant/user message
-	// for the window. Full transactional buffering starves it. Give ONLY those
-	// requests a shorter window so the proxy commits + streams real events (=
-	// progress) before the stall fires; every other caller keeps the full window.
-	// Workflow agents carry a per-agent stall watchdog; give them a short window
-	// AND gate its commit on real forwarded progress (see captureSSEWindow). Every
-	// other caller keeps the full window and the plain commit-at-window keepalive.
+	// global env override) that aborts a turn streaming no assistant/tool delta for
+	// the window. Full transactional buffering starves it, so those get a short
+	// commit-early window AND gate the commit on real forwarded progress (see
+	// captureSSEWindow); every other caller keeps the full hold. The window choice
+	// (per wire + mode) lives in config.keepaliveWindow.
 	gated := !isResp && isWorkflowAgent(body) // Workflow stall gating is Anthropic-only
-	kaWindow := cfg.keepaliveMs
-	switch {
-	case isResp:
-		kaWindow = cfg.responsesKeepaliveMs
-	case gated:
-		kaWindow = cfg.wfKeepaliveMs
-	}
+	kaWindow := cfg.keepaliveWindow(isResp, earlyCommit, gated)
 	tryLocalRetry := func(f failure) bool {
 		if cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
 			return false

@@ -47,9 +47,14 @@ is ridden out, not surfaced.
   SSE stream, whose terminal is `response.completed`. A start-of-stream `error`
   or `response.failed` (overload / capacity / rate limit — which Codex otherwise
   treats as a **fatal turn error** and does not retry) is caught **pre-commit**
-  and converted to a retry (or ridden out by hidden local retries). Once output
-  appears it commits early and streams live, so streaming UX is preserved; a
-  post-commit error truncates the stream so Codex's native stream-retry re-issues.
+  and converted to a retry (or ridden out by hidden local retries). By default,
+  once output appears it commits early and streams live, so streaming UX is
+  preserved; a post-commit error truncates the stream so Codex's native
+  stream-retry re-issues. Set `PROXY_RESPONSES_EARLY_COMMIT=0` to instead buffer
+  the whole response like the Messages path (under the Responses-owned
+  `PROXY_RESPONSES_BUFFER_MS` hold) — mid-stream errors then also become hidden
+  retries, at the cost of requiring the client's `stream_idle_timeout_ms` to
+  exceed that hold.
   Bytes are forwarded verbatim — Codex's Responses parser is deliberately lenient
   (it tolerates missing/null fields and skips any frame it can't deserialize
   without failing the turn), so the proxy does not second-guess individual content
@@ -266,15 +271,20 @@ unchanged:
 [model_providers.crs]
 base_url = "http://127.0.0.1:8789/v1"   # was: your real gateway .../v1
 wire_api = "responses"
-# Keep the client's stream-idle timeout above PROXY_RESPONSES_KEEPALIVE_MS (30s):
-stream_idle_timeout_ms = 600000
+# Keep this strictly ABOVE the active proxy commit window: PROXY_RESPONSES_KEEPALIVE_MS
+# (30s) in the default early-commit mode, or PROXY_RESPONSES_BUFFER_MS (600s) if you
+# set PROXY_RESPONSES_EARLY_COMMIT=0. 660000 clears both with margin:
+stream_idle_timeout_ms = 660000
 # Codex's own retries still apply as a backstop when the proxy surfaces a retryable 503:
 request_max_retries = 10
 stream_max_retries = 10
 ```
 
 Enable `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N` so a start-of-stream overload is
-ridden out inside the proxy and Codex never sees it.
+ridden out inside the proxy and Codex never sees it. To extend the proxy's
+hidden-retry protection past the first output event (mid-stream failures too), set
+`PROXY_RESPONSES_EARLY_COMMIT=0` — the turn then buffers under
+`PROXY_RESPONSES_BUFFER_MS` like the Messages path.
 
 ## Verify — reading the log
 
@@ -352,7 +362,9 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
 | `PROXY_WORKFLOW_KEEPALIVE_MS` | `10000` | **workflow agents only** — a **small** window so the proxy commits *early* and streams live, feeding Claude Code's Workflow per-agent **stall** watchdog (default ~180 s, no global env override; kills on a forwarded-delta gap ≥ `stallMs`). Keep it small so the first gap (≈ window + TTFB) stays under `stallMs`; it can't fix a mid-turn content-silent pause ≥ `stallMs`. `0` disables (stall returns). Other callers keep `PROXY_KEEPALIVE_MS`. See [Workflow agents](#workflow-agents) |
-| `PROXY_RESPONSES_KEEPALIVE_MS` | `30000` | **`/v1/responses` (Codex) only** — a hard-cap window before committing. The stream commits *early* as soon as output appears, so this only bounds a **silent start** (reasoning with no output) before committing and streaming keepalive events. Keep it below Codex's `stream_idle_timeout_ms` so the commit — after which the proxy emits Codex-visible keepalive events that reset Codex's idle timer — happens before Codex would idle out. Start-of-stream errors arrive before any output, so they're caught pre-commit regardless of this value |
+| `PROXY_RESPONSES_KEEPALIVE_MS` | `30000` | **`/v1/responses` (Codex), early-commit mode only** — the stream commits *early* as soon as output appears, so this just bounds a **silent start** (reasoning with no output) before committing and streaming keepalive events. (With early-commit **off** the route buffers under `PROXY_RESPONSES_BUFFER_MS` instead.) Keep it below Codex's `stream_idle_timeout_ms` so the commit — after which the proxy emits Codex-visible keepalive events that reset Codex's idle timer — happens before Codex would idle out. Start-of-stream errors arrive before any output, so they're caught pre-commit regardless of this value |
+| `PROXY_RESPONSES_BUFFER_MS` | `600000` | **`/v1/responses` (Codex), full-buffer mode only** (`PROXY_RESPONSES_EARLY_COMMIT=0`) — the max buffering hold before a safety-valve live commit: the `/v1/messages` policy applied to Responses. **Responses-owned** (independent of `PROXY_KEEPALIVE_MS`), so a proxy serving both Codex and Claude tunes the two transactional horizons separately. The Codex client's `stream_idle_timeout_ms` **must strictly exceed** it (nothing is forwarded while buffering) |
+| `PROXY_RESPONSES_EARLY_COMMIT` | `1` | **`/v1/responses` (Codex) only** — `1` (default) commits as soon as the first output event is buffered, then streams live (streaming UX preserved). Set `0` to **buffer the whole response** to `response.completed` like `/v1/messages`, under the `PROXY_RESPONSES_BUFFER_MS` hold: this extends the proxy's hidden-retry protection to **mid-stream** errors (not just start-of-stream), but the proxy forwards nothing until the turn ends, so the Codex client's `stream_idle_timeout_ms` **must exceed that hold** |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |

@@ -171,6 +171,28 @@ data: {"type":"error","error":{"type":"api_error","message":"mid-stream boom"}}
 	}
 }
 
+func TestResponsesBufferedModeCatchesMidStreamError(t *testing.T) {
+	// early-commit OFF (PROXY_RESPONSES_EARLY_COMMIT=0): the Responses wire buffers to
+	// the terminal like /v1/messages. A mid-stream error that arrives AFTER output —
+	// which early-commit DROPs post-commit (TestResponsesPostCommitErrorDrops) — is now
+	// caught PRE-commit and converted to a retry (wrote=false), extending the proxy's
+	// hidden-retry protection to mid-stream failures. This is the whole point of the opt-out.
+	stream := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"mid-stream boom\"}}\n\n"
+	rec, wrote, f := captureResp(t, iotest1byte(stream), nil, time.Hour, false) // early=false -> buffered
+	if wrote || f == nil {
+		t.Fatalf("buffered mode must catch the mid-stream error pre-commit; wrote=%v f=%v", wrote, f)
+	}
+	if !f.transient {
+		t.Fatalf("a mid-stream api_error must convert to a retry, got %+v", *f)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("nothing should be forwarded pre-commit, got %q", rec.Body.String())
+	}
+}
+
 func TestResponsesTruncatedStreamRetryable(t *testing.T) {
 	// EOF before response.completed -> pre-commit truncation -> retryable.
 	trunc := goodResponsesStream[:strings.Index(goodResponsesStream, "response.completed")]
@@ -701,6 +723,31 @@ func TestErrorWriterForPath(t *testing.T) {
 	}
 }
 
+func TestKeepaliveWindow(t *testing.T) {
+	// Every mode owns a distinct window. The values are deliberately all different so
+	// the test proves each mode picks its OWN knob — in particular full-buffer Responses
+	// uses responsesBufferMs, NOT keepaliveMs (decoupled from the Claude horizon).
+	c := config{
+		keepaliveMs:          600 * time.Second,
+		wfKeepaliveMs:        10 * time.Second,
+		responsesKeepaliveMs: 30 * time.Second,
+		responsesBufferMs:    900 * time.Second,
+	}
+	// (isResp, earlyCommit, gated)
+	if got := c.keepaliveWindow(true, true, false); got != c.responsesKeepaliveMs {
+		t.Errorf("Responses early-commit = %v, want responsesKeepaliveMs (%v)", got, c.responsesKeepaliveMs)
+	}
+	if got := c.keepaliveWindow(true, false, false); got != c.responsesBufferMs {
+		t.Errorf("Responses full-buffer = %v, want responsesBufferMs (%v) — must NOT inherit keepaliveMs (%v)", got, c.responsesBufferMs, c.keepaliveMs)
+	}
+	if got := c.keepaliveWindow(false, false, true); got != c.wfKeepaliveMs {
+		t.Errorf("gated Messages = %v, want wfKeepaliveMs (%v)", got, c.wfKeepaliveMs)
+	}
+	if got := c.keepaliveWindow(false, false, false); got != c.keepaliveMs {
+		t.Errorf("ordinary Messages = %v, want keepaliveMs (%v)", got, c.keepaliveMs)
+	}
+}
+
 func TestPathHelpers(t *testing.T) {
 	if !isResponsesPath("/v1/responses") || isResponsesPath("/v1/messages") {
 		t.Fatal("isResponsesPath wrong")
@@ -746,6 +793,31 @@ func TestE2EResponsesStreamingSuccess(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "response.completed") || !strings.Contains(rec.Body.String(), "Hi") {
 		t.Fatalf("replayed body missing content: %q", rec.Body.String())
+	}
+}
+
+func TestE2EResponsesEarlyCommitDisabledBuffers(t *testing.T) {
+	// PROXY_RESPONSES_EARLY_COMMIT=0: a healthy streaming Responses turn is buffered to
+	// the terminal and replayed at once (mode=buffered), like /v1/messages, instead of
+	// committing live. Verifies the config flag reaches the engine through handle().
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodResponsesStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.responsesEarlyCommit = false
+	t.Cleanup(func() { cfg = loadConfig() }) // don't leak the override to later tests
+
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	if rec.Code != 200 {
+		t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if m := rec.Header().Get("X-CC-Retry-Proxy-Mode"); m != "buffered" {
+		t.Fatalf("early-commit disabled must buffer to terminal (mode=buffered), got %q", m)
+	}
+	if !strings.Contains(rec.Body.String(), "response.completed") {
+		t.Fatalf("buffered replay missing terminal: %q", rec.Body.String())
 	}
 }
 
