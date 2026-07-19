@@ -55,11 +55,14 @@ is ridden out, not surfaced.
   `PROXY_RESPONSES_BUFFER_MS` hold) — mid-stream errors then also become hidden
   retries, at the cost of requiring the client's `stream_idle_timeout_ms` to
   exceed that hold.
-  Bytes are forwarded verbatim — Codex's Responses parser is deliberately lenient
-  (it tolerates missing/null fields and skips any frame it can't deserialize
-  without failing the turn), so the proxy does not second-guess individual content
-  frames; its guarantees are at the stream level (a parseable terminal, or a
-  convert-to-retry). During a silent gap the keepalive is a **skippable Responses
+  Live bytes and non-text frames are forwarded verbatim. Buffered/prefix replay
+  combines only adjacent compatible text deltas (bounded by
+  `PROXY_RESPONSES_REPLAY_DELTA_BYTES`) so a completed buffered turn cannot burst
+  thousands of tiny notifications into Codex. Codex's Responses parser is
+  deliberately lenient (it tolerates missing/null fields and skips any frame it
+  can't deserialize without failing the turn), so every other content frame is
+  left alone; the proxy's guarantees are at the stream level (a parseable
+  terminal, or a convert-to-retry). During a silent gap the keepalive is a **skippable Responses
   event** (not an SSE comment, which Codex's reader discards without resetting its
   idle timer). No tool-JSON coalescing; refusal-fallback and the Workflow stall
   watchdog are Anthropic-only and stay off. A **non-retryable** error (a
@@ -369,6 +372,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_RESPONSES_KEEPALIVE_MS` | `30000` | **`/v1/responses` (Codex), early-commit mode only** — the stream commits *early* as soon as output appears, so this just bounds a **silent start** (reasoning with no output) before committing and streaming keepalive events. (With early-commit **off** the route buffers under `PROXY_RESPONSES_BUFFER_MS` instead.) Keep it below Codex's `stream_idle_timeout_ms` so the commit — after which the proxy emits Codex-visible keepalive events that reset Codex's idle timer — happens before Codex would idle out. Start-of-stream errors arrive before any output, so they're caught pre-commit regardless of this value |
 | `PROXY_RESPONSES_BUFFER_MS` | `600000` | **`/v1/responses` (Codex), full-buffer mode only** (`PROXY_RESPONSES_EARLY_COMMIT=0`) — the max buffering hold before a safety-valve live commit: the `/v1/messages` policy applied to Responses. **Responses-owned** (independent of `PROXY_KEEPALIVE_MS`), so a proxy serving both Codex and Claude tunes the two transactional horizons separately. The Codex client's `stream_idle_timeout_ms` **must strictly exceed** it (nothing is forwarded while buffering) |
 | `PROXY_RESPONSES_EARLY_COMMIT` | `1` | **`/v1/responses` (Codex) only** — `1` (default) commits as soon as the first output event is buffered, then streams live (streaming UX preserved). Set `0` to **buffer the whole response** to `response.completed` like `/v1/messages`, under the `PROXY_RESPONSES_BUFFER_MS` hold: this extends the proxy's hidden-retry protection to **mid-stream** errors (not just start-of-stream), but the proxy forwards nothing until the turn ends, so the Codex client's `stream_idle_timeout_ms` **must exceed that hold** |
+| `PROXY_RESPONSES_REPLAY_DELTA_BYTES` | `65536` | **`/v1/responses` buffered/prefix replay only** — combine adjacent `response.output_text.delta` events for the same item/output/content route up to this many accumulated source-JSON bytes before replay. Counting the complete payload (including logprobs) keeps replay memory bounded as well as preventing full-buffer mode from dumping thousands of token-sized events into Codex's bounded app-server notification queue at completion. Text, routing fields, ordering barriers, and terminal/error events are preserved; normal live deltas are untouched. Events with non-empty logprobs and oversized, malformed, or ambiguous frames stay raw; `0` restores byte-for-byte replay |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |

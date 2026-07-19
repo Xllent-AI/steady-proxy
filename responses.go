@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ─────────────────────────────────────────────────────── openai responses wire ──
@@ -27,11 +29,14 @@ import (
 // fallback (it targets GPT models), so the model just tracks completion, catches
 // in-band errors, scrapes usage, and forwards raw bytes.
 type openaiWire struct {
-	sawCompleted bool // a valid response.completed seen -> deliverable (incomplete is a retry, not this)
-	sawContent   bool // a real output/reasoning/tool event seen -> early commit OK
+	sawCompleted     bool // a valid response.completed seen -> deliverable (incomplete is a retry, not this)
+	sawContent       bool // a real output/reasoning/tool event seen -> early commit OK
+	replayDeltaBytes int  // buffered/prefix replay coalescing target; 0 preserves raw frames
 }
 
-func newOpenAIWire() *openaiWire { return &openaiWire{} }
+func newOpenAIWire() *openaiWire {
+	return &openaiWire{replayDeltaBytes: cfg.responsesReplayBytes}
+}
 
 func (o *openaiWire) scrape(ev event, st *captureStats) {
 	if st == nil {
@@ -145,10 +150,522 @@ func (o *openaiWire) live(ev event, raw []byte, st *captureStats) ([][]byte, boo
 }
 
 func (o *openaiWire) replayBuffered(sp *spool, w io.Writer, st *captureStats) error {
-	return sp.replayRaw(w)
+	return o.replay(sp, w)
 }
 
-func (o *openaiWire) replayPrefix(sp *spool, w io.Writer) error { return sp.replayRaw(w) }
+func (o *openaiWire) replayPrefix(sp *spool, w io.Writer) error { return o.replay(sp, w) }
+
+// replay preserves the transactional guarantee while preventing its successful
+// commit from becoming an event storm. Some Responses gateways emit one
+// response.output_text.delta per token fragment (often only 1-15 bytes). A fully
+// buffered turn would otherwise replay thousands of those frames in one write;
+// Codex turns each frame into an in-process app-server notification, whose bounded
+// queue can overflow before the TUI drains it.
+//
+// Only adjacent, structurally compatible text deltas for the same item/output/
+// content route are combined. Non-text events are ordering barriers. Live events
+// are still forwarded verbatim by live(), and setting the limit to 0 restores raw
+// replay. The coalescer is streaming, so a spool that spilled to disk is not read
+// wholesale back into memory.
+func (o *openaiWire) replay(sp *spool, w io.Writer) error {
+	if o.replayDeltaBytes <= 0 {
+		return sp.replayRaw(w)
+	}
+	r, err := sp.reader()
+	if err != nil {
+		return err
+	}
+	return replayResponsesReader(r, w, o.replayDeltaBytes)
+}
+
+// replayResponsesReader frames only events small enough to coalesce. Once a
+// frame exceeds the grouping budget it flushes any pending text and copies the
+// rest of that frame as it is read. This is deliberately separate from
+// sseParser: that parser must materialize a complete event for live validation,
+// whereas replay already holds a validated stream on disk and must not pull a
+// 128 MiB response.completed frame back into RAM merely to pass it through.
+func replayResponsesReader(r io.Reader, w io.Writer, maxGroupBytes int) error {
+	if maxGroupBytes <= 0 {
+		_, err := io.Copy(w, r)
+		return err
+	}
+	c := responsesReplayCoalescer{w: w, maxGroupBytes: maxGroupBytes}
+	br := bufio.NewReaderSize(r, 32*1024)
+	initialFrameCap := maxGroupBytes
+	if initialFrameCap > 32*1024 {
+		initialFrameCap = 32 * 1024
+	}
+	frame := make([]byte, 0, initialFrameCap)
+	passthrough := false
+	for {
+		chunk, readErr := br.ReadSlice('\n')
+		if len(chunk) > 0 {
+			frameDone := readErr != bufio.ErrBufferFull && responsesBlankSSELine(chunk)
+			switch {
+			case passthrough:
+				if err := writeResponsesReplayBytes(w, chunk); err != nil {
+					return err
+				}
+			case len(frame)+len(chunk) > maxGroupBytes:
+				if err := c.flush(); err != nil {
+					return err
+				}
+				if err := writeResponsesReplayBytes(w, frame); err != nil {
+					return err
+				}
+				frame = frame[:0]
+				if err := writeResponsesReplayBytes(w, chunk); err != nil {
+					return err
+				}
+				passthrough = true
+			default:
+				frame = append(frame, chunk...)
+			}
+			if frameDone {
+				if !passthrough {
+					if err := c.acceptFrame(frame); err != nil {
+						return err
+					}
+				}
+				frame = frame[:0]
+				passthrough = false
+			}
+		}
+		if readErr != nil {
+			switch readErr {
+			case bufio.ErrBufferFull:
+				continue
+			case io.EOF:
+				// A spool normally ends on an SSE blank line because it contains only
+				// events emitted by sseParser. Preserve a defensive unterminated tail
+				// as an opaque barrier instead of dropping it.
+				if len(frame) > 0 {
+					if err := c.flush(); err != nil {
+						return err
+					}
+					if err := writeResponsesReplayBytes(w, frame); err != nil {
+						return err
+					}
+				}
+				return c.flush()
+			default:
+				return readErr
+			}
+		}
+	}
+}
+
+func (c *responsesReplayCoalescer) acceptFrame(raw []byte) error {
+	events := (&sseParser{}).feed(raw)
+	if len(events) != 1 || len(events[0].raw) != len(raw) {
+		if err := c.flush(); err != nil {
+			return err
+		}
+		return writeResponsesReplayBytes(c.w, raw)
+	}
+	return c.accept(events[0])
+}
+
+func responsesBlankSSELine(line []byte) bool {
+	return len(line) == 1 && line[0] == '\n' ||
+		len(line) == 2 && line[0] == '\r' && line[1] == '\n'
+}
+
+func writeResponsesReplayBytes(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err == nil && n != len(p) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+type responsesReplayCoalescer struct {
+	w             io.Writer
+	maxGroupBytes int
+	pending       *responsesTextDeltaGroup
+}
+
+type responsesTextDeltaGroup struct {
+	eventName      string
+	fields         map[string]json.RawMessage
+	raw            []byte
+	delta          strings.Builder
+	payloadBytes   int
+	count          int
+	itemID         string
+	outputIndex    int64
+	contentIndex   int64
+	hasLogprobs    bool
+	hasSequence    bool
+	hasObfuscation bool
+}
+
+func (c *responsesReplayCoalescer) accept(ev event) error {
+	// Do not decode a single event larger than the grouping budget. Apart from
+	// being impossible to combine within the bound, retaining its decoded map and
+	// logprobs alongside the raw frame would needlessly pull a potentially huge
+	// disk-spooled payload back into memory.
+	if len(ev.data) > c.maxGroupBytes {
+		if err := c.flush(); err != nil {
+			return err
+		}
+		_, err := c.w.Write(ev.raw)
+		return err
+	}
+	d, ok := parseResponsesTextDelta(ev)
+	if !ok {
+		if err := c.flush(); err != nil {
+			return err
+		}
+		_, err := c.w.Write(ev.raw)
+		return err
+	}
+	if c.pending == nil {
+		c.pending = d
+		return nil
+	}
+	if !c.pending.compatible(d) || c.pending.payloadBytes+d.payloadBytes > c.maxGroupBytes {
+		if err := c.flush(); err != nil {
+			return err
+		}
+		c.pending = d
+		return nil
+	}
+	c.pending.merge(d)
+	return nil
+}
+
+func (c *responsesReplayCoalescer) flush() error {
+	g := c.pending
+	if g == nil {
+		return nil
+	}
+	c.pending = nil
+	if g.count == 1 {
+		_, err := c.w.Write(g.raw)
+		return err
+	}
+	delta, err := json.Marshal(g.delta.String())
+	if err != nil {
+		return err
+	}
+	g.fields["delta"] = delta
+	data, err := json.Marshal(g.fields)
+	if err != nil {
+		return err
+	}
+	if g.eventName != "" {
+		if _, err := io.WriteString(c.w, "event: "+g.eventName+"\n"); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(c.w, "data: "); err != nil {
+		return err
+	}
+	if _, err := c.w.Write(data); err != nil {
+		return err
+	}
+	_, err = io.WriteString(c.w, "\n\n")
+	return err
+}
+
+func parseResponsesTextDelta(ev event) (*responsesTextDeltaGroup, bool) {
+	if responsesEventType(ev) != "response.output_text.delta" || !simpleResponsesSSEFrame(ev) {
+		return nil, false
+	}
+	fields, ok := decodeUniqueResponsesObject(ev.data)
+	if !ok {
+		return nil, false
+	}
+	for key := range fields {
+		switch key {
+		case "type", "item_id", "output_index", "content_index", "delta", "logprobs", "sequence_number", "obfuscation":
+		default:
+			// Unknown fields may gain semantics in a future Responses revision. Keep
+			// such an event byte-for-byte instead of guessing how to aggregate it.
+			return nil, false
+		}
+	}
+	var itemID, delta string
+	var outputIndex, contentIndex int64
+	if raw, ok := fields["item_id"]; !ok || json.Unmarshal(raw, &itemID) != nil {
+		return nil, false
+	}
+	if raw, ok := fields["output_index"]; !ok || json.Unmarshal(raw, &outputIndex) != nil {
+		return nil, false
+	}
+	if raw, ok := fields["content_index"]; !ok || json.Unmarshal(raw, &contentIndex) != nil {
+		return nil, false
+	}
+	if raw, ok := fields["delta"]; !ok || json.Unmarshal(raw, &delta) != nil {
+		return nil, false
+	}
+	g := &responsesTextDeltaGroup{
+		eventName: ev.name, fields: fields, raw: ev.raw,
+		payloadBytes: len(ev.data), count: 1, itemID: itemID,
+		outputIndex: outputIndex, contentIndex: contentIndex,
+	}
+	g.delta.WriteString(delta)
+	if raw, ok := fields["logprobs"]; ok {
+		var logprobs []json.RawMessage
+		if json.Unmarshal(raw, &logprobs) != nil || logprobs == nil || len(logprobs) != 0 {
+			// Codex ignores logprobs for text delivery, but other Responses clients
+			// validate their nested schema. Keep every non-empty (or non-array)
+			// payload raw rather than let one malformed entry invalidate valid text
+			// that would otherwise be combined into the same synthesized event.
+			return nil, false
+		}
+		g.hasLogprobs = true
+	}
+	if raw, ok := fields["sequence_number"]; ok {
+		var sequence int64
+		if json.Unmarshal(raw, &sequence) != nil {
+			return nil, false
+		}
+		g.hasSequence = true
+	}
+	if raw, ok := fields["obfuscation"]; ok {
+		var obfuscation string
+		if json.Unmarshal(raw, &obfuscation) != nil {
+			return nil, false
+		}
+		g.hasObfuscation = true
+	}
+	return g, true
+}
+
+// decodeUniqueResponsesObject deliberately does not use json.Unmarshal into a
+// map: that silently accepts duplicate object keys and keeps the last value,
+// while Codex's serde event structs reject duplicate known fields and skip the
+// whole frame. The same applies to typed nested objects such as logprobs:
+// combining one malformed frame with valid neighbors could make Codex skip all
+// of their text. Treat a duplicate key at any depth as an opaque ordering
+// barrier instead.
+func decodeUniqueResponsesObject(data string) (map[string]json.RawMessage, bool) {
+	if !validResponsesJSONUnicode(data) {
+		return nil, false
+	}
+	dec := json.NewDecoder(strings.NewReader(data))
+	dec.UseNumber()
+	opening, err := dec.Token()
+	if err != nil || opening != json.Delim('{') {
+		return nil, false
+	}
+	fields := make(map[string]json.RawMessage)
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, false
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, false
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, false
+		}
+		if !uniqueResponsesJSONValue(string(value)) {
+			return nil, false
+		}
+		fields[key] = value
+	}
+	closing, err := dec.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, false
+	}
+	return fields, true
+}
+
+// encoding/json deliberately replaces invalid UTF-8 and lone UTF-16 surrogate
+// escapes with U+FFFD. serde_json, which Codex uses, rejects those strings and
+// skips the event. Reject them before decoding so coalescing cannot turn a frame
+// Codex would ignore into visible replacement text.
+func validResponsesJSONUnicode(data string) bool {
+	if !utf8.ValidString(data) {
+		return false
+	}
+	inString := false
+	for i := 0; i < len(data); i++ {
+		switch data[i] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString || i+1 >= len(data) {
+				continue
+			}
+			i++
+			if data[i] != 'u' {
+				continue
+			}
+			if i+4 >= len(data) {
+				return false
+			}
+			code, ok := responsesHex4(data[i+1 : i+5])
+			if !ok {
+				return false
+			}
+			i += 4
+			switch {
+			case code >= 0xd800 && code <= 0xdbff:
+				if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+					return false
+				}
+				low, ok := responsesHex4(data[i+3 : i+7])
+				if !ok || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				i += 6
+			case code >= 0xdc00 && code <= 0xdfff:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func responsesHex4(s string) (uint16, bool) {
+	if len(s) != 4 {
+		return 0, false
+	}
+	var value uint16
+	for i := 0; i < 4; i++ {
+		value <<= 4
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			value |= uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			value |= uint16(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			value |= uint16(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
+}
+
+func uniqueResponsesJSONValue(data string) bool {
+	dec := json.NewDecoder(strings.NewReader(data))
+	dec.UseNumber()
+	if !consumeUniqueResponsesJSONValue(dec) {
+		return false
+	}
+	_, err := dec.Token()
+	return err == io.EOF
+}
+
+func consumeUniqueResponsesJSONValue(dec *json.Decoder) bool {
+	tok, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return true
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			keyToken, err := dec.Token()
+			if err != nil {
+				return false
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return false
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return false
+			}
+			seen[key] = struct{}{}
+			if !consumeUniqueResponsesJSONValue(dec) {
+				return false
+			}
+		}
+		closing, err := dec.Token()
+		return err == nil && closing == json.Delim('}')
+	case '[':
+		for dec.More() {
+			if !consumeUniqueResponsesJSONValue(dec) {
+				return false
+			}
+		}
+		closing, err := dec.Token()
+		return err == nil && closing == json.Delim(']')
+	default:
+		return false
+	}
+}
+
+func (g *responsesTextDeltaGroup) compatible(next *responsesTextDeltaGroup) bool {
+	return g.eventName == next.eventName &&
+		g.itemID == next.itemID &&
+		g.outputIndex == next.outputIndex &&
+		g.contentIndex == next.contentIndex &&
+		g.hasLogprobs == next.hasLogprobs &&
+		g.hasSequence == next.hasSequence &&
+		g.hasObfuscation == next.hasObfuscation
+}
+
+func (g *responsesTextDeltaGroup) merge(next *responsesTextDeltaGroup) {
+	g.delta.WriteString(next.delta.String())
+	g.payloadBytes += next.payloadBytes
+	g.count += next.count
+	// The combined event represents the stream through the last constituent
+	// delta, so retain that event's monotonic sequence and opaque padding value.
+	if g.hasSequence {
+		g.fields["sequence_number"] = next.fields["sequence_number"]
+	}
+	if g.hasObfuscation {
+		g.fields["obfuscation"] = next.fields["obfuscation"]
+	}
+}
+
+// simpleResponsesSSEFrame makes synthesis conservative: if an upstream frame
+// carries id/retry/custom SSE fields or multiline data, keep it raw. Normal
+// Responses frames contain exactly one optional event field and one data field.
+func simpleResponsesSSEFrame(ev event) bool {
+	raw := strings.ReplaceAll(string(ev.raw), "\r\n", "\n")
+	eventLines, dataLines := 0, 0
+	for _, line := range strings.Split(raw, "\n") {
+		if line == "" {
+			continue
+		}
+		field, value, found := strings.Cut(line, ":")
+		if !found {
+			return false
+		}
+		if strings.HasPrefix(value, " ") {
+			value = value[1:]
+		}
+		switch field {
+		case "event":
+			eventLines++
+			if value != ev.name {
+				return false
+			}
+		case "data":
+			dataLines++
+			if value != ev.data {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	if ev.name == "" {
+		return eventLines == 0 && dataLines == 1
+	}
+	return eventLines == 1 && dataLines == 1
+}
 
 func (o *openaiWire) forwardable() bool { return o.sawContent }
 

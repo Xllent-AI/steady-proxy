@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +44,70 @@ func captureResp(t *testing.T, r io.Reader, st *captureStats, window time.Durati
 	return rec, wrote, f
 }
 
+func responsesDeltaFrame(item string, output, content int, delta string, sequence int, obfuscation string, logprobs []any) string {
+	data, _ := json.Marshal(map[string]any{
+		"type":            "response.output_text.delta",
+		"item_id":         item,
+		"output_index":    output,
+		"content_index":   content,
+		"delta":           delta,
+		"logprobs":        logprobs,
+		"sequence_number": sequence,
+		"obfuscation":     obfuscation,
+	})
+	return "event: response.output_text.delta\ndata: " + string(data) + "\n\n"
+}
+
+func replayResponsesForTest(t *testing.T, input string, limit int) string {
+	t.Helper()
+	sp := newSpool()
+	t.Cleanup(sp.discard)
+	if err := sp.write([]byte(input)); err != nil {
+		t.Fatalf("spool write: %v", err)
+	}
+	var out bytes.Buffer
+	if err := (&openaiWire{replayDeltaBytes: limit}).replay(sp, &out); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	return out.String()
+}
+
+func parsedResponsesEvents(s string) []event {
+	return (&sseParser{}).feed([]byte(s))
+}
+
+type replayWriteAwareReader struct {
+	data            []byte
+	wrote           *bool
+	readBeforeWrite int
+	maxBeforeWrite  int
+}
+
+func (r *replayWriteAwareReader) Read(p []byte) (int, error) {
+	if !*r.wrote && r.readBeforeWrite >= r.maxBeforeWrite {
+		return 0, errors.New("replay consumed an oversized frame before writing it")
+	}
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if !*r.wrote {
+		r.readBeforeWrite += n
+	}
+	return n, nil
+}
+
+type replayWriteAwareBuffer struct {
+	bytes.Buffer
+	wrote *bool
+}
+
+func (w *replayWriteAwareBuffer) Write(p []byte) (int, error) {
+	*w.wrote = true
+	return w.Buffer.Write(p)
+}
+
 func TestResponsesCaptureSuccessBuffered(t *testing.T) {
 	var st captureStats
 	// One read (strings.Reader) + no early commit -> pure buffered path.
@@ -61,6 +127,186 @@ func TestResponsesCaptureSuccessBuffered(t *testing.T) {
 	// usage/model/stop scraped for the access log.
 	if st.model != "gpt-5.6-sol" || st.inTok != 1234 || st.cacheReadTok != 34 || st.outTok != 56 || st.stop != "completed" {
 		t.Fatalf("scrape mismatch: model=%q inTok=%d cacheRead=%d outTok=%d stop=%q", st.model, st.inTok, st.cacheReadTok, st.outTok, st.stop)
+	}
+}
+
+func TestResponsesBufferedReplayCoalescesBurstWithoutChangingSemantics(t *testing.T) {
+	var input strings.Builder
+	for i := 0; i < 2750; i++ {
+		input.WriteString(responsesDeltaFrame("msg_1", 3, 4, "x", i+10, "padding", []any{}))
+	}
+	input.WriteString("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"output_index\":3,\"content_index\":4,\"text\":\"done\"}\n\n")
+
+	out := replayResponsesForTest(t, input.String(), 64<<10)
+	events := parsedResponsesEvents(out)
+	var deltas []event
+	for _, ev := range events {
+		if responsesEventType(ev) == "response.output_text.delta" {
+			deltas = append(deltas, ev)
+		}
+	}
+	if len(deltas) <= 1 || len(deltas) >= 20 {
+		t.Fatalf("2750 tiny deltas should replay as a small set of bounded groups, got %d", len(deltas))
+	}
+	var mergedText strings.Builder
+	lastSequence := 0
+	for _, deltaEvent := range deltas {
+		var merged struct {
+			Delta          string            `json:"delta"`
+			ItemID         string            `json:"item_id"`
+			OutputIndex    int               `json:"output_index"`
+			ContentIndex   int               `json:"content_index"`
+			SequenceNumber int               `json:"sequence_number"`
+			Obfuscation    string            `json:"obfuscation"`
+			Logprobs       []json.RawMessage `json:"logprobs"`
+		}
+		if err := json.Unmarshal([]byte(deltaEvent.data), &merged); err != nil {
+			t.Fatalf("merged delta JSON: %v", err)
+		}
+		if merged.ItemID != "msg_1" || merged.OutputIndex != 3 || merged.ContentIndex != 4 {
+			t.Fatalf("merged routing mismatch: item=%q output=%d content=%d", merged.ItemID, merged.OutputIndex, merged.ContentIndex)
+		}
+		if merged.Obfuscation != "padding" || len(merged.Logprobs) != 0 {
+			t.Fatalf("merged metadata mismatch: obfuscation=%q logprobs=%d", merged.Obfuscation, len(merged.Logprobs))
+		}
+		mergedText.WriteString(merged.Delta)
+		lastSequence = merged.SequenceNumber
+	}
+	if mergedText.String() != strings.Repeat("x", 2750) {
+		t.Fatalf("merged text mismatch: bytes=%d", mergedText.Len())
+	}
+	if lastSequence != 2759 {
+		t.Fatalf("final merged sequence mismatch: got %d want 2759", lastSequence)
+	}
+	if len(events) != len(deltas)+1 || responsesEventType(events[len(events)-1]) != "response.output_text.done" {
+		t.Fatalf("non-delta ordering barrier was not preserved: %#v", events)
+	}
+}
+
+func TestResponsesBufferedReplayKeepsNonEmptyLogprobsAsRawBarriers(t *testing.T) {
+	validLogprob := responsesDeltaFrame("msg_1", 0, 0, "a", 1, "a", []any{map[string]any{
+		"token": "a", "logprob": -0.1,
+	}})
+	malformedLogprob := responsesDeltaFrame("msg_1", 0, 0, "b", 2, "b", []any{map[string]any{
+		"token": "missing-required-logprob",
+	}})
+	empty1 := responsesDeltaFrame("msg_1", 0, 0, "c", 3, "c", []any{})
+	empty2 := responsesDeltaFrame("msg_1", 0, 0, "d", 4, "d", []any{})
+	input := validLogprob + malformedLogprob + empty1 + empty2
+
+	out := replayResponsesForTest(t, input, 64<<10)
+	if !strings.HasPrefix(out, validLogprob+malformedLogprob) {
+		t.Fatalf("non-empty logprob frames must remain byte-exact barriers\n got: %q", out)
+	}
+	events := parsedResponsesEvents(out)
+	if len(events) != 3 {
+		t.Fatalf("want two raw logprob barriers plus one empty-logprob group, got %d", len(events))
+	}
+	var merged struct {
+		Delta          string            `json:"delta"`
+		SequenceNumber int               `json:"sequence_number"`
+		Logprobs       []json.RawMessage `json:"logprobs"`
+	}
+	if err := json.Unmarshal([]byte(events[2].data), &merged); err != nil {
+		t.Fatalf("empty-logprob group JSON: %v", err)
+	}
+	if merged.Delta != "cd" || merged.SequenceNumber != 4 || len(merged.Logprobs) != 0 {
+		t.Fatalf("empty-logprob group mismatch: %+v", merged)
+	}
+}
+
+func TestResponsesReplayLeavesDuplicateKeyFramesRaw(t *testing.T) {
+	tests := map[string]string{
+		"top-level known field": "event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":null,\"delta\":\"invented\"}\n\n",
+		"nested logprob field": "event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"bad\",\"logprobs\":[{\"token\":\"bad\",\"token\":\"still-bad\"}]}\n\n",
+	}
+	for name, duplicate := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Codex's serde event structs reject duplicate known fields. The proxy
+			// must not normalize the frame or combine it with valid neighboring text.
+			input := duplicate + responsesDeltaFrame("msg_1", 0, 0, "real", 2, "padding", []any{})
+			if got := replayResponsesForTest(t, input, 64<<10); got != input {
+				t.Fatalf("duplicate-key frame must remain a raw ordering barrier\n got: %q\nwant: %q", got, input)
+			}
+		})
+	}
+}
+
+func TestResponsesReplayStreamsOversizedFramesIncrementally(t *testing.T) {
+	input := "event: response.completed\ndata: {\"type\":\"response.completed\",\"blob\":\"" +
+		strings.Repeat("x", 256<<10) + "\"}\n\n"
+	wrote := false
+	r := &replayWriteAwareReader{
+		data: []byte(input), wrote: &wrote,
+		// The framing reader may fill its 32 KiB buffer once. It must begin
+		// passthrough before asking for a second buffer, rather than wait for EOF.
+		maxBeforeWrite: 48 << 10,
+	}
+	w := &replayWriteAwareBuffer{wrote: &wrote}
+	if err := replayResponsesReader(r, w, 1024); err != nil {
+		t.Fatalf("incremental oversized replay: %v", err)
+	}
+	if w.String() != input {
+		t.Fatalf("oversized frame changed during passthrough: got %d bytes, want %d", w.Len(), len(input))
+	}
+}
+
+func TestResponsesReplayLeavesInvalidUnicodeFramesRaw(t *testing.T) {
+	frame := func(deltaJSON, sequence string) string {
+		return "event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"" + deltaJSON +
+			"\",\"logprobs\":[],\"sequence_number\":" + sequence + ",\"obfuscation\":\"padding\"}\n\n"
+	}
+	validNeighbor := frame("real", "2")
+	for name, invalid := range map[string]string{
+		"lone high surrogate": frame(`\ud800`, "1"),
+		"lone low surrogate":  frame(`\udc00`, "1"),
+		"unpaired high":       frame(`\ud800x`, "1"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := invalid + validNeighbor
+			if got := replayResponsesForTest(t, input, 64<<10); got != input {
+				t.Fatalf("invalid-Unicode frame must remain a raw ordering barrier\n got: %q\nwant: %q", got, input)
+			}
+		})
+	}
+
+	// A correctly paired surrogate remains eligible and decodes to one scalar.
+	events := parsedResponsesEvents(replayResponsesForTest(t, frame(`\ud83d\ude00`, "1")+validNeighbor, 64<<10))
+	if len(events) != 1 {
+		t.Fatalf("valid surrogate pair should coalesce, got %d events", len(events))
+	}
+	var merged struct {
+		Delta string `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(events[0].data), &merged); err != nil || merged.Delta != "😀real" {
+		t.Fatalf("valid surrogate pair mismatch: delta=%q err=%v", merged.Delta, err)
+	}
+}
+
+func TestResponsesReplayCoalescingCanBeDisabled(t *testing.T) {
+	input := responsesDeltaFrame("msg_1", 0, 0, "a", 1, "a", []any{}) +
+		responsesDeltaFrame("msg_1", 0, 0, "b", 2, "b", []any{})
+	if got := replayResponsesForTest(t, input, 0); got != input {
+		t.Fatalf("zero limit must preserve byte-for-byte replay\n got: %q\nwant: %q", got, input)
+	}
+}
+
+func TestResponsesLiveStreamingRemainsByteExactWithReplayCoalescing(t *testing.T) {
+	stream := responsesDeltaFrame("msg_1", 0, 0, "a", 1, "a", []any{}) +
+		responsesDeltaFrame("msg_1", 0, 0, "b", 2, "b", []any{}) +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_live\",\"status\":\"completed\"}}\n\n"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, iotest1byte(stream), nil, time.Hour, false, true, &openaiWire{replayDeltaBytes: 64 << 10})
+	if f != nil || !wrote {
+		t.Fatalf("live stream failed: wrote=%v f=%+v", wrote, f)
+	}
+	if rec.Body.String() != stream {
+		t.Fatalf("live stream must stay byte-for-byte exact\n got: %q\nwant: %q", rec.Body.String(), stream)
 	}
 }
 
