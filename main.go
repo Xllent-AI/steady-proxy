@@ -133,7 +133,7 @@ func loadConfig() config {
 		requestLogDir:        env("PROXY_REQUEST_LOG_DIR", ""),              // "" = disabled; set a dir to save each request/response archive
 		validateJSON:         os.Getenv("PROXY_VALIDATE_JSON") != "0",       // default on
 		normalizeToolJSON:    os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
-		refusalFallback:      loadRefusalFallback(),                         // default claude-opus-4-8; off/none/empty disables
+		refusalFallback:      loadRefusalFallback(),                         // default claude-opus-5; off/none/empty disables
 		verbose:              os.Getenv("PROXY_VERBOSE") == "1",
 	}
 }
@@ -912,13 +912,13 @@ func isModelSafeguardRefusal(f failure) bool {
 }
 
 // loadRefusalFallback resolves the model to re-issue with when a response
-// completes with stop_reason "refusal". Unset -> default claude-opus-4-8. Set to
+// completes with stop_reason "refusal". Unset -> default claude-opus-5. Set to
 // empty / "off" / "none" / "disabled" -> the feature is off and a refusal is
 // delivered to the client unchanged (the historical behavior).
 func loadRefusalFallback() string {
 	v, ok := os.LookupEnv("PROXY_REFUSAL_FALLBACK_MODEL")
 	if !ok {
-		return "claude-opus-4-8"
+		return "claude-opus-5"
 	}
 	v = strings.TrimSpace(v)
 	if v == "" || strings.EqualFold(v, "off") || strings.EqualFold(v, "none") || strings.EqualFold(v, "disabled") {

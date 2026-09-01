@@ -295,7 +295,7 @@ The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only add
 extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 
 ```text
-2026/06/21 16:34:00  cc-retry-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-4-8; one log line per request)
+2026/06/21 16:34:00  cc-retry-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-5; one log line per request)
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
 2026/06/21 16:34:31  OK    gpt-5.6-sol/main  high  in=1.1k out=223 tok  completed  live  2.37s
@@ -304,7 +304,7 @@ RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
 [local-retry] claude-opus-4-8/main http_503 503 wait=1s retry=1/6
 OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
-WARN  claude-fable-5/main  refusal -> retry with claude-opus-4-8  in=258.8k out=2.8k tok  40.7s
+WARN  claude-fable-5/main  refusal -> retry with claude-opus-5  in=258.8k out=2.8k tok  40.7s
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
 OK    /v1/messages/count_tokens  200  730B  2ms
@@ -376,7 +376,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |
-| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-4-8` | when a request completes with `stop_reason: "refusal"` or Fable returns a pre-stream safeguards block, silently re-issue the same request with this model instead of returning the refusal (logs a `WARN`). Fires at most once per request (a refusal from the fallback model is delivered as-is) and only before anything is committed downstream; every non-model field is preserved. Set to `off`/`none`/empty to disable. Stream refusal detection still works with `PROXY_VALIDATE_JSON=0`; full JSON validation is still recommended |
+| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | when a request completes with `stop_reason: "refusal"` or Fable returns a pre-stream safeguards block, silently re-issue the same request with this model instead of returning the refusal (logs a `WARN`). Fires at most once per request (a refusal from the fallback model is delivered as-is) and only before anything is committed downstream; every non-model field is preserved. Set to `off`/`none`/empty to disable. Stream refusal detection still works with `PROXY_VALIDATE_JSON=0`; full JSON validation is still recommended |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a single buffered response |

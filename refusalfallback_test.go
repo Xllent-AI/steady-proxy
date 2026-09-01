@@ -55,8 +55,8 @@ func TestLoadRefusalFallback(t *testing.T) {
 				os.Unsetenv("PROXY_REFUSAL_FALLBACK_MODEL")
 			}
 		})
-		if got := loadRefusalFallback(); got != "claude-opus-4-8" {
-			t.Fatalf("default = %q, want claude-opus-4-8", got)
+		if got := loadRefusalFallback(); got != "claude-opus-5" {
+			t.Fatalf("default = %q, want claude-opus-5", got)
 		}
 	})
 	for _, off := range []string{"", "off", "None", "disabled", "  "} {
