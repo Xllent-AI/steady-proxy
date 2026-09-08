@@ -1,22 +1,23 @@
 # Test stack: proxy in front of the fault-injecting mock upstream.
 #   docker compose -f docker-compose.test.yml up -d --build
-# Then drive `claude -p` (or the in-repo runner) at http://127.0.0.1:8789.
+# Find the isolated endpoint with: docker compose -f docker-compose.test.yml port proxy 8789
+name: cc-retry-proxy-test
 services:
   mock:
     build: .
-    image: cc-retry-proxy:latest
+    image: cc-retry-proxy:test
     entrypoint: ["/testupstream"]
     environment:
       MOCK_ADDR: "0.0.0.0:9099"
     ports:
-      - "127.0.0.1:9099:9099" # for /__stats and /__reset
+      - "127.0.0.1::9099" # random host port for /__stats and /__reset
 
   proxy:
     build: .
-    image: cc-retry-proxy:latest
+    image: cc-retry-proxy:test
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"
-      PROXY_UPSTREAM_URL: "http://mock:9099"
+      PROXY_UPSTREAM_URL: "${TEST_UPSTREAM_URL:-http://mock:9099}"
       PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-100}"
       PROXY_TRANSACTIONAL_LOCAL_RETRIES: "${PROXY_TRANSACTIONAL_LOCAL_RETRIES:-0}"
       PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS: "${PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS:-10000}"
@@ -27,5 +28,5 @@ services:
       PROXY_REFUSAL_FALLBACK_MODEL: "${PROXY_REFUSAL_FALLBACK_MODEL-claude-opus-5}"
       PROXY_VERBOSE: "1"
     ports:
-      - "127.0.0.1:8789:8789"
+      - "127.0.0.1::8789"
     depends_on: [mock]

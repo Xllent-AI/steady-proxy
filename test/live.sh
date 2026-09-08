@@ -12,14 +12,18 @@
 set -uo pipefail
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
-PROXY="http://127.0.0.1:8789"
-MOCK="http://127.0.0.1:9099"
+PROXY=""
+MOCK=""
+TEST_PROJECT="cc-retry-proxy-test-$$"
+TEST_DIR="$(mktemp -d /tmp/cc-live.XXXXXX)"
 MODEL="${MODEL:-sonnet}"
-HOME_T="$(mktemp -d /tmp/cc-live-home.XXXX)"
+HOME_T="$TEST_DIR/home"
+mkdir -p "$HOME_T"
 REAL_TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
 DO_REAL="${DO_REAL:-1}"; [ -z "$REAL_TOKEN" ] && DO_REAL=0
 DO_LONG="${DO_LONG:-1}"
-OUT=/tmp/cc_live_out; ERR=/tmp/cc_live_err
+OUT="$TEST_DIR/out"; ERR="$TEST_DIR/err"
+COMPOSE_LOG="$TEST_DIR/compose.log"
 fails=0
 
 c_pass(){ printf '  \033[32mPASS\033[0m  %-16s %s\n' "$1" "$2"; }
@@ -28,14 +32,30 @@ c_fail(){ printf '  \033[31mFAIL\033[0m  %-16s %s\n' "$1" "$2"; fails=$((fails+1
 run_claude(){ # $1 prompt  $2 timeout  $3 base  $4 token
   timeout "$2" env -i PATH="$PATH" HOME="$HOME_T" \
     ANTHROPIC_BASE_URL="$3" ANTHROPIC_AUTH_TOKEN="$4" \
-    API_FORCE_IDLE_TIMEOUT=0 API_TIMEOUT_MS=600000 CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000 \
+    API_FORCE_IDLE_TIMEOUT=0 API_TIMEOUT_MS=720000 CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000 \
     DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     claude -p "$1" --model "$MODEL" --dangerously-skip-permissions >"$OUT" 2>"$ERR"
 }
 
-compose(){ docker compose -f "$DIR/$1" "${@:2}"; }
+compose(){ docker compose --env-file /dev/null -p "$TEST_PROJECT" -f "$DIR/docker-compose.test.yml" "$@"; }
+cleanup(){
+  local status=$?
+  compose down >>"$COMPOSE_LOG" 2>&1
+  if [ "$status" -eq 0 ]; then rm -rf "$TEST_DIR"
+  else printf 'Test logs: %s\n' "$TEST_DIR"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+refresh_endpoints(){
+  local proxy_addr mock_addr
+  proxy_addr="$(compose port proxy 8789)" || return 1
+  mock_addr="$(compose port mock 9099)" || return 1
+  PROXY="http://$proxy_addr"
+  MOCK="http://$mock_addr"
+}
 wait_ready(){ for _ in $(seq 1 40); do curl -s -m2 -o /dev/null "$MOCK/__stats" 2>/dev/null && \
-  curl -s -m2 -o /dev/null -X POST "$PROXY/v1/messages" -d '{}' 2>/dev/null && return 0; sleep 1; done; return 1; }
+  curl -fsS -m2 -o /dev/null "$PROXY/__version" 2>/dev/null && return 0; sleep 1; done; return 1; }
 
 # --- mock-backed scenarios (deterministic, no real tokens) -------------------
 mock_ok(){ # name  fault  min_attempts  timeout
@@ -51,8 +71,8 @@ mock_ok(){ # name  fault  min_attempts  timeout
 }
 
 echo "==> Bringing up test stack (proxy -> mock)"
-compose docker-compose.test.yml up -d --build >/tmp/cc_compose.log 2>&1
-wait_ready || { echo "stack not ready; see /tmp/cc_compose.log"; exit 2; }
+compose up -d --build >"$COMPOSE_LOG" 2>&1 || { echo "test stack failed to start"; exit 2; }
+refresh_endpoints && wait_ready || { echo "test stack not ready"; exit 2; }
 
 echo "==> Mock scenarios"
 mock_ok "normal"            "normal"             1 60
@@ -78,21 +98,17 @@ if [ "$DO_LONG" = 1 ]; then
   else c_fail "long-gen-310s" "exit=$ec out=$(head -c70 "$OUT" | tr -d '\n')"; fi
 fi
 
-compose docker-compose.test.yml down >/dev/null 2>&1
-
 # --- real-gateway smoke (one real sonnet call) -------------------------------
 if [ "$DO_REAL" = 1 ]; then
   echo "==> Real-gateway smoke (proxy -> real gateway, sonnet)"
-  PROXY_UPSTREAM_URL="${PROXY_UPSTREAM_URL:?set PROXY_UPSTREAM_URL to your real gateway for the real smoke}" \
-    compose docker-compose.yml up -d --build >>/tmp/cc_compose.log 2>&1
-  for _ in $(seq 1 40); do curl -s -m2 -o /dev/null -X POST "$PROXY/v1/messages" -d '{}' 2>/dev/null && break; sleep 1; done
+  TEST_UPSTREAM_URL="${PROXY_UPSTREAM_URL:?set PROXY_UPSTREAM_URL to your real gateway for the real smoke}" \
+    compose up -d --no-deps proxy >>"$COMPOSE_LOG" 2>&1 || { echo "real smoke proxy failed to start"; exit 2; }
+  refresh_endpoints && wait_ready || { echo "real smoke proxy not ready"; exit 2; }
   run_claude "Reply with exactly this token and nothing else: LIVEOK" 90 "$PROXY" "$REAL_TOKEN"; ec=$?
   if [ $ec -eq 0 ] && grep -q LIVEOK "$OUT"; then c_pass "real-sonnet" "real model replied through the proxy"
   else c_fail "real-sonnet" "exit=$ec out=$(head -c80 "$OUT" | tr -d '\n') err=$(tail -c120 "$ERR" | tr -d '\n')"; fi
-  compose docker-compose.yml down >/dev/null 2>&1
 fi
 
-rm -rf "$HOME_T"
 echo
 if [ $fails -eq 0 ]; then echo "ALL LIVE TESTS PASSED"; else echo "$fails LIVE TEST(S) FAILED"; fi
 exit $fails

@@ -118,6 +118,13 @@ is ridden out, not surfaced.
 The full situation catalog — derived from real session transcripts — and how each
 is handled is in [docs/ERROR-SITUATIONS.md](docs/ERROR-SITUATIONS.md).
 
+The active buffering window is measured from the start of the **client request**.
+Upstream header waits, hidden retries, backoff, and fallback attempts share that
+one window. A pending header/error-body read is cancelled at its end and returned
+as a retryable response; an SSE stream already being captured switches to live
+output. Hidden retries never restart the clock. Claude's `X-Stainless-Timeout`
+header is read in **seconds**, with the configured deadline margin subtracted.
+
 Trade-off of transactional mode: you lose live token-by-token streaming for turns
 that complete within the grace window — the reply appears in a burst, then
 completes. In exchange you get "complete reply or automatic retry, never a stuck
@@ -156,11 +163,12 @@ These requests show as `/wf` in the access log. Everything else keeps
 it aborts when `stallMs` passes with no real delta reaching the client (keepalive
 comments and `ping` do not count) — i.e. at `(last forwarded delta) + stallMs`.
 While the proxy buffers it forwards nothing, so the **first gap** — query start to
-the first forwarded delta — is roughly `window + upstream TTFB`. A small window
-keeps that first gap under `stallMs`; that first-gap stall is the one this proxy
-prevents. A large window (e.g. 120 000) is not *automatically* fatal — if the
-upstream then streams steadily the turn can still survive — but it pushes the
-first gap toward `stallMs` and delays going live, so small is the safe default.
+the first forwarded delta — includes time spent waiting for upstream output. The
+window runs from request start; if response headers have not arrived by then,
+the proxy returns a retryable response. After SSE headers arrive, a workflow
+commit still waits for real forwardable content. A small window removes buffering
+delay once that content arrives. A large window (e.g. 120 000) pushes the first
+gap toward `stallMs`, so small is the safe default.
 **What the proxy cannot fix:** once past the first gap the stream is governed by
 the upstream's own content-delta gaps, which the proxy cannot change — a genuine
 mid-turn content-silent pause ≥ `stallMs` (server-side reasoning emitting only
@@ -195,6 +203,11 @@ make build                  # stamps VERSION + git commit + build date
 go test -race ./...          # unit + integration tests
 ./test/live.sh               # live: real `claude -p` -> proxy -> mock + real gateway
 ```
+
+The live harness uses a separate Compose project, test image, and random loopback
+ports. Its real-gateway smoke test also uses that isolated stack. Cleanup removes
+only the test project, including on interruption; failed-run logs are retained in
+the printed temporary directory.
 
 Run the binary directly instead of compose:
 
@@ -364,7 +377,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 |---|---|---|
 | `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
 | `PROXY_UPSTREAM_URL` | `https://your-gateway.example.com` | the real gateway (set via `.env`) |
-| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). **Claude/Stainless-specific:** the count comes from the `X-Stainless-Retry-Count` header the Anthropic SDK sends. **Codex does not send it**, so on `/v1/responses` the count is always 0 and any positive cap is effectively unlimited — conversion is bounded instead by Codex's own `request_max_retries`/`stream_max_retries`. Set `0` to disable proxy conversion entirely for a Codex-only deployment |
+| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). **Claude/Stainless-specific:** the count comes from the `X-Stainless-Retry-Count` header the Anthropic SDK sends. **Codex does not send it**, so on `/v1/responses` the count is always 0 and any positive cap is effectively unlimited — conversion is bounded instead by Codex's own `request_max_retries`/`stream_max_retries`. With `0`, Responses failures surface as terminal HTTP 400 because Codex ignores `X-Should-Retry: false` |
 | `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional attempt (`/v1/messages` and `/v1/responses`). `1` means one extra upstream try before returning a retryable response to the client. For Codex this is the ideal path — an overload is ridden out and Codex never sees an error |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
 | `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
@@ -379,8 +392,8 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | when a request completes with `stop_reason: "refusal"` or Fable returns a pre-stream safeguards block, silently re-issue the same request with this model instead of returning the refusal (logs a `WARN`). Fires at most once per request (a refusal from the fallback model is delivered as-is) and only before anything is committed downstream; every non-model field is preserved. Set to `off`/`none`/empty to disable. Stream refusal detection still works with `PROXY_VALIDATE_JSON=0`; full JSON validation is still recommended |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
-| `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a single buffered response |
-| `PROXY_DEADLINE_MARGIN_MS` | `25000` | finish before the client's own timeout |
+| `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a buffered response; also bounds each SSE event, including unfinished lines, before parsing |
+| `PROXY_DEADLINE_MARGIN_MS` | `25000` | finish before the client's `X-Stainless-Timeout` (seconds); for short timeouts, reserve at most half the client's budget |
 | `PROXY_SPOOL_DIR` | `$TMPDIR` | where large responses spill (use tmpfs for sensitive prompts) |
 | `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save each request/response JSON archive there (see below) |
 | `PROXY_VERBOSE` | off | set `1` for per-decision logs |
@@ -419,8 +432,10 @@ stats, and any model-swap decision.
   `client_secret`/`clientSecret` are written redacted and listed in `redactions`.
   Non-forwarded `Proxy-Authorization` is also redacted. Other headers and query
   params are preserved for debugging/restoration.
-- **Bodies are not truncated.** Full request and response bodies are archived for
-  restoration. This can use significant disk for large requests or long streams.
+- **Bodies are not deliberately truncated.** Captured request and response bytes
+  are archived for restoration. Error-body reads obey the byte-idle and request
+  deadlines; interrupted captures carry `capture_error`. This can use significant
+  disk for large requests or long streams.
 - **Bodies are preserved verbatim.** The request body (your conversation) and
   response bodies land on disk unencrypted and are not inspected/redacted; point
   the dir at a tmpfs or a path you control, and keep it out of version control
@@ -431,6 +446,11 @@ stats, and any model-swap decision.
 
 ## Caveats
 
+- Upstream redirects are classified as responses; the proxy does not follow them
+  or forward credentials to a redirect destination.
+- Non-streaming successful responses pass through without transactional buffering.
+  If copying the body fails, the proxy logs `DROP` and aborts the downstream HTTP
+  response so truncation cannot look like a clean success.
 - **Server-side / remote MCP tools:** re-issuing a request is safe for
   *client-local* tool execution (Claude runs tools only after a complete reply),
   but it is **not** provider-level idempotency. If you enable server-side or

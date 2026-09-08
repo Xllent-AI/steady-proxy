@@ -344,6 +344,15 @@ func (rec *reqRecorder) respWriter() io.Writer {
 	return rec.cur.responseCapture
 }
 
+func (rec *reqRecorder) noteResponseReadError(err error) {
+	if rec == nil || rec.cur == nil || rec.cur.responseCapture == nil || err == nil {
+		return
+	}
+	if rec.cur.responseCapture.err == nil {
+		rec.cur.responseCapture.err = err
+	}
+}
+
 func (rec *reqRecorder) noteAttemptResponseHeaders(status int, h http.Header) {
 	if rec == nil || rec.cur == nil {
 		return

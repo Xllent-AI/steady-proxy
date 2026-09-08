@@ -55,6 +55,27 @@ Because the proxy is **transactional** (buffers + validates the whole stream
 before committing `200`), Claude never receives the partial body — so it never
 hits the parse error. The truncation becomes a clean pre-body retryable error.
 
+For Codex's `/v1/responses`, the gateway can report a disconnect inside a
+`response.failed` event instead of closing the connection. One observed error
+carried `code: "request_timeout"`, `type: "invalid_request_error"`, and the message
+`stream error: stream disconnected before completion: stream closed before response.completed`.
+Known timeout, rate-limit, and overload codes take precedence over generic types
+and message signatures: before commit, the
+proxy retries locally or returns a retryable `503`; after commit, it drops the
+stream for Codex's native retry. The same classification applies to HTTP errors.
+Actual request-shape errors retain their existing non-retryable behavior.
+
+Unfinished SSE lines/events are bounded before parsing so a malformed stream
+cannot bypass the buffering cap. Disk-spooled buffers are released on every
+exit, including EOF and live completion. Storage I/O errors retain their cause
+and remain retryable; only an actual total-size overflow is `response_too_large`.
+Responses completion frames with duplicate keys or invalid Unicode do not count
+as successful terminals.
+
+Non-streaming body-copy failures log `DROP` and abort the downstream HTTP
+response. Error-body archiving observes byte-idle/request deadlines and records
+`capture_error` when reading is interrupted.
+
 ## 2. Malformed (but complete) stream  → convert
 
 The stream is structurally complete (reaches `message_stop`) but an event's
@@ -153,7 +174,10 @@ abort-loop). So the **client** ceiling, not the proxy, caps the transactional
 window — the two must move together.
 
 How the proxy handles it (**tuned default: ~600 s**):
-- It stays fully transactional up to `PROXY_KEEPALIVE_MS` (default **600 000 ms**).
+- It stays fully transactional up to `PROXY_KEEPALIVE_MS` (default **600 000 ms**),
+  measured from client request start, including header waits and hidden retries.
+  If headers or an error body are still pending at the end, it returns a retryable
+  response. Backoff and retries cannot restart this deadline.
   **Both** client-side abort timers must exceed that window, because the proxy
   sends no response headers during the hold: set
   **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** (TTFB ceiling, default ~60 s) **and

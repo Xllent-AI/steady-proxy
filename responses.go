@@ -740,6 +740,12 @@ func responsesCompletedValid(ev event) bool {
 	if json.Unmarshal([]byte(ev.data), &m) != nil || m.Response == nil || m.Response.ID == "" {
 		return false
 	}
+	// Unmarshal above enforces JSON's nesting bound before the recursive key
+	// check. Go otherwise accepts duplicate keys and replaces malformed Unicode;
+	// Codex's typed Serde parser rejects them.
+	if !validResponsesJSONUnicode(ev.data) || !uniqueResponsesJSONValue(ev.data) {
+		return false
+	}
 	if u := m.Response.Usage; u != nil {
 		if u.Input == nil || u.Output == nil || u.Total == nil {
 			return false
@@ -911,16 +917,30 @@ func classifyResponsesError(errType, errCode, message string) *failure {
 	t := strings.ToLower(strings.TrimSpace(errType))
 	c := strings.ToLower(strings.TrimSpace(errCode))
 	msg := strings.ToLower(message)
+	// A specific, recognized code owns the classification. Gateways sometimes
+	// attach a generic invalid_request_error type to capacity and timeout faults.
 	switch {
-	case t == "invalid_request_error" || isResponsesRequestShapeCode(c) || anyContains(msg, requestShapeSigs):
-		return &failure{transient: false, status: 400, atype: "invalid_request_error", code: "responses_request_shape", message: message}
-	case t == "rate_limit_error" || c == "rate_limit_exceeded":
+	case isResponsesRequestShapeCode(c):
+		t = "invalid_request_error"
+	case c == "request_timeout":
+		t = "timeout_error"
+	case c == "rate_limit_exceeded":
+		t = "rate_limit_error"
+	case c == "server_is_overloaded" || c == "overloaded":
+		t = "overloaded_error"
+	}
+	switch {
+	case t == "timeout_error":
+		return &failure{transient: true, status: 504, atype: "timeout_error", code: "responses_timeout", message: message}
+	case t == "rate_limit_error":
 		// The advertised delay is commonly only in the message ("Please try again
 		// in 11.054s"). Preserve it so both hidden local retries and the surfaced
 		// 503 wait the real amount instead of the proxy's short fallback backoff.
 		return &failure{transient: true, status: 429, atype: "rate_limit_error", code: "responses_rate_limit", message: message, retryAfter: parseRetryAfterFromMessage(message)}
-	case t == "overloaded_error" || t == "service_unavailable_error" || c == "server_is_overloaded" || c == "overloaded":
+	case t == "overloaded_error" || t == "service_unavailable_error":
 		return &failure{transient: true, status: 529, atype: "overloaded_error", code: "responses_overloaded", message: message}
+	case t == "invalid_request_error" || anyContains(msg, requestShapeSigs):
+		return &failure{transient: false, status: 400, atype: "invalid_request_error", code: "responses_request_shape", message: message}
 	default:
 		// api_error, server_error, timeout, authentication, permission, not_found,
 		// unknown -> transient: a temporary block is ridden out, not surfaced.

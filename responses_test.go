@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -40,7 +41,7 @@ func captureResp(t *testing.T, r io.Reader, st *captureStats, window time.Durati
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rec := httptest.NewRecorder()
-	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, r, st, window, false, early, newOpenAIWire())
+	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, r, st, window, false, early, newOpenAIWire(), bufferDeadline(time.Now(), window))
 	return rec, wrote, f
 }
 
@@ -301,7 +302,7 @@ func TestResponsesLiveStreamingRemainsByteExactWithReplayCoalescing(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rec := httptest.NewRecorder()
-	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, iotest1byte(stream), nil, time.Hour, false, true, &openaiWire{replayDeltaBytes: 64 << 10})
+	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, iotest1byte(stream), nil, time.Hour, false, true, &openaiWire{replayDeltaBytes: 64 << 10}, time.Now().Add(time.Hour))
 	if f != nil || !wrote {
 		t.Fatalf("live stream failed: wrote=%v f=%+v", wrote, f)
 	}
@@ -845,7 +846,7 @@ func TestResponsesKeepaliveEmitsEventNotComment(t *testing.T) {
 	defer cancel()
 	rec := httptest.NewRecorder()
 	r := &gapReader{ctx: ctx, chunks: eventsOf(goodResponsesStream), gap: 60 * time.Millisecond}
-	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, r, nil, 25*time.Millisecond, false, true, newOpenAIWire())
+	wrote, f := captureSSECore(ctx, cancel, rec, http.Header{}, r, nil, 25*time.Millisecond, false, true, newOpenAIWire(), time.Now().Add(25*time.Millisecond))
 	if f != nil || !wrote {
 		t.Fatalf("want committed live success, got wrote=%v f=%+v", wrote, f)
 	}
@@ -888,6 +889,9 @@ func TestClassifyResponsesError(t *testing.T) {
 		{"overload-by-type", "overloaded_error", "", "", true, "responses_overloaded"},
 		{"rate-limit", "rate_limit_error", "", "slow down", true, "responses_rate_limit"},
 		{"rate-limit-code", "", "rate_limit_exceeded", "", true, "responses_rate_limit"},
+		{"timeout-mislabeled-as-invalid-request", "invalid_request_error", "request_timeout", "stream error: stream disconnected before completion: stream closed before response.completed", true, "responses_timeout"},
+		{"timeout-code-only", "", "request_timeout", "upstream timed out", true, "responses_timeout"},
+		{"timeout-code-normalized", "invalid_request_error", " REQUEST_TIMEOUT ", "upstream timed out", true, "responses_timeout"},
 		{"request-shape-type", "invalid_request_error", "", "bad tool schema", false, "responses_request_shape"},
 		{"request-shape-msg", "api_error", "", "prompt is too long for context", false, "responses_request_shape"},
 		{"request-shape-code-only", "", "context_length_exceeded", "input exceeds the context window", false, "responses_request_shape"},
@@ -1124,5 +1128,79 @@ func TestE2EResponsesRequestShapeNotRetried(t *testing.T) {
 	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
 	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
 		t.Fatalf("request-shape must NOT be retried; want false, got %q", got)
+	}
+}
+
+func TestE2EResponsesRequestTimeoutRetries(t *testing.T) {
+	// The gateway labeled a dropped stream as invalid_request_error despite its
+	// request_timeout code. It must remain retryable on both HTTP and SSE paths.
+	const errorJSON = `{"code":"request_timeout","message":"stream error: stream disconnected before completion: stream closed before response.completed","type":"invalid_request_error"}`
+	const partial = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discard this failed attempt\"}\n\n"
+	for _, wire := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"response.failed", 200, partial + "event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":0,\"response\":{\"status\":\"failed\",\"error\":" + errorJSON + "}}\n\n"},
+		{"error", 200, partial + "event: error\ndata: {\"type\":\"error\",\"error\":" + errorJSON + "}\n\n"},
+		{"http", 400, `{"error":` + errorJSON + `}`},
+	} {
+		for _, outcome := range []struct {
+			name         string
+			localRetries int
+			recover      bool
+		}{
+			{"local-recovery", 1, true},
+			{"client-retry", 0, false},
+			{"local-budget-exhausted", 1, false},
+		} {
+			t.Run(wire.name+"/"+outcome.name, func(t *testing.T) {
+				const requestBody = `{"stream":true,"model":"gpt-5.6-sol"}`
+				var attempts atomic.Int32
+				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil || string(body) != requestBody {
+						t.Errorf("retry must preserve request body: body=%q err=%v", body, err)
+					}
+					if attempts.Add(1) > 1 && outcome.recover {
+						w.Header().Set("Content-Type", "text/event-stream")
+						io.WriteString(w, goodResponsesStream)
+						return
+					}
+					if wire.status == 200 {
+						w.Header().Set("Content-Type", "text/event-stream")
+					}
+					w.WriteHeader(wire.status)
+					io.WriteString(w, wire.body)
+				}))
+				defer up.Close()
+				setupForTest(up.URL)
+				t.Cleanup(func() { cfg = loadConfig() })
+				cfg.responsesEarlyCommit = false
+				cfg.responsesBufferMs = time.Hour
+				cfg.txLocalRetries = outcome.localRetries
+				cfg.localBackoffCap = time.Millisecond
+
+				rec := doStreamResponses(requestBody)
+				if got := int(attempts.Load()); got != outcome.localRetries+1 {
+					t.Fatalf("upstream attempts=%d, want %d", got, outcome.localRetries+1)
+				}
+				if strings.Contains(rec.Body.String(), "discard this failed attempt") {
+					t.Fatalf("failed attempt leaked to client: %q", rec.Body.String())
+				}
+				if outcome.recover {
+					if rec.Code != 200 || rec.Body.String() != goodResponsesStream {
+						t.Fatalf("want only the successful retry's stream: status=%d body=%q", rec.Code, rec.Body.String())
+					}
+					return
+				}
+				if rec.Code != 503 || rec.Header().Get("X-Should-Retry") != "true" || atoiSafe(rec.Header().Get("Retry-After")) < 1 {
+					t.Fatalf("want retryable 503 with backoff: status=%d headers=%v body=%q", rec.Code, rec.Header(), rec.Body.String())
+				}
+				if !strings.Contains(rec.Body.String(), `"type":"api_error"`) || !strings.Contains(rec.Body.String(), "stream disconnected before completion") {
+					t.Fatalf("retry response must normalize the type and preserve the cause: %q", rec.Body.String())
+				}
+			})
+		}
 	}
 }

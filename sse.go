@@ -120,26 +120,40 @@ type curEvent struct {
 }
 
 type sseParser struct {
-	pending []byte
-	curRaw  []byte
-	cur     curEvent
+	maxEventBytes int64 // 0 for already bounded/trusted replay input
+	err           error
+	pending       []byte
+	curRaw        []byte
+	cur           curEvent
 }
 
 func (p *sseParser) feed(b []byte) []event {
-	p.pending = append(p.pending, b...)
 	var out []event
-	for {
-		i := bytes.IndexByte(p.pending, '\n')
+	for len(b) > 0 && p.err == nil {
+		// Consume only one line fragment at a time, checking before allocation.
+		// A transport chunk can contain many small events; its total size is not
+		// an event-size violation.
+		i := bytes.IndexByte(b, '\n')
+		n := len(b)
+		if i >= 0 {
+			n = i + 1
+		}
+		if p.maxEventBytes > 0 && int64(len(p.curRaw))+int64(len(p.pending))+int64(n) > p.maxEventBytes {
+			p.err = errTooLarge
+			break
+		}
+		p.pending = append(p.pending, b[:n]...)
+		b = b[n:]
 		if i < 0 {
 			break
 		}
-		p.curRaw = append(p.curRaw, p.pending[:i+1]...) // keep exact bytes incl '\n'
-		line := p.pending[:i]
-		p.pending = p.pending[i+1:]
+		p.curRaw = append(p.curRaw, p.pending...)
+		line := p.pending[:len(p.pending)-1]
+		p.pending = p.pending[:0]
 		if n := len(line); n > 0 && line[n-1] == '\r' {
 			line = line[:n-1]
 		}
-		if len(line) == 0 { // event terminator
+		if len(line) == 0 {
 			if p.cur.has {
 				out = append(out, event{name: p.cur.name, data: p.cur.data, raw: append([]byte(nil), p.curRaw...)})
 				p.cur = curEvent{}
@@ -147,7 +161,7 @@ func (p *sseParser) feed(b []byte) []event {
 			p.curRaw = p.curRaw[:0]
 			continue
 		}
-		if line[0] == ':' { // comment / keepalive
+		if line[0] == ':' {
 			continue
 		}
 		field, value := line, []byte(nil)
@@ -168,11 +182,6 @@ func (p *sseParser) feed(b []byte) []event {
 			}
 			p.cur.data += string(value)
 		}
-	}
-	if len(p.pending) == 0 {
-		p.pending = p.pending[:0]
-	} else if cap(p.pending) > 1<<16 && cap(p.pending) > 4*len(p.pending) {
-		p.pending = append([]byte(nil), p.pending...)
 	}
 	return out
 }
@@ -284,7 +293,7 @@ func captureSSE(ctx context.Context, cancel context.CancelFunc, w http.ResponseW
 // be swapped. It requires st!=nil; stop_reason is scraped whenever interception
 // is armed, even if full JSON validation is disabled.
 func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, interceptRefusal bool) (bool, *failure) {
-	return captureSSECore(ctx, cancel, w, upstreamHdr, body, st, keepaliveMs, progressGated, false, newAnthropicWire(interceptRefusal))
+	return captureSSECore(ctx, cancel, w, upstreamHdr, body, st, keepaliveMs, progressGated, false, newAnthropicWire(interceptRefusal), bufferDeadline(time.Now(), keepaliveMs))
 }
 
 // captureSSECore is the wire-agnostic transactional engine. model interprets the
@@ -295,9 +304,10 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 // soon as the first forwardable content is buffered, without waiting out the
 // window, so streaming UX is preserved while a start-of-stream error is still
 // caught pre-commit and converted to a retry.
-func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, earlyCommit bool, model wireModel) (bool, *failure) {
+func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, earlyCommit bool, model wireModel, commitBy time.Time) (bool, *failure) {
 	sp := newSpool()
-	parser := &sseParser{}
+	defer sp.discard()
+	parser := &sseParser{maxEventBytes: max(cfg.maxResponseBytes, 1)}
 	committed := false
 	headerWritten := false
 
@@ -350,7 +360,11 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 	}()
 
 	keepEvery := keepaliveMs
-	keepTimer := time.NewTimer(timerOr(keepEvery))
+	firstKeepalive := timerOr(keepEvery)
+	if !commitBy.IsZero() {
+		firstKeepalive = max(time.Until(commitBy), 0)
+	}
+	keepTimer := time.NewTimer(firstKeepalive)
 	defer keepTimer.Stop()
 	idleTimer := time.NewTimer(cfg.upstreamByteIdle)
 	defer idleTimer.Stop()
@@ -364,6 +378,7 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 			sp.discard()
 			return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
 		}
+		sp.discard()
 		return nil
 	}
 	graceElapsed := false // the transactional window has fired at least once
@@ -514,10 +529,7 @@ func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.
 		}
 		if err := sp.write(ev.raw); err != nil {
 			sp.discard()
-			// transient:false is intentional — the same request will always
-			// overflow PROXY_MAX_RESPONSE_BYTES, so retrying cannot help. 502
-			// (not 500) signals an upstream-shaped condition, not a proxy fault.
-			return false, &failure{status: http.StatusBadGateway, atype: "api_error", code: "response_too_large", message: "response exceeded proxy buffer cap"}, true
+			return false, classifyBufferError(err), true
 		}
 		if done {
 			// Complete, valid stream: replay the whole buffer downstream. This runs
@@ -531,6 +543,9 @@ func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.
 			sp.discard()
 			return true, nil, true
 		}
+	}
+	if parser.err != nil {
+		return *committed, classifyBufferError(parser.err), true
 	}
 	return false, nil, false
 }

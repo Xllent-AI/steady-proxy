@@ -67,6 +67,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -151,6 +152,7 @@ func main() {
 	cfg = loadConfig()
 
 	client = &http.Client{
+		CheckRedirect: stopRedirect,
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -260,7 +262,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 	budgetLeft := func() bool { return retryCount < cfg.sdkRetryCap }
 
-	ctx, cancel := context.WithDeadline(r.Context(), time.Now().Add(deriveDuration(r.Header.Get("X-Stainless-Timeout"))))
+	ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(deriveDuration(r.Header.Get("X-Stainless-Timeout"))))
 	defer cancel()
 
 	var last failure
@@ -282,12 +284,16 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// (per wire + mode) lives in config.keepaliveWindow.
 	gated := !isResp && isWorkflowAgent(body) // Workflow stall gating is Anthropic-only
 	kaWindow := cfg.keepaliveWindow(isResp, earlyCommit, gated)
+	commitBy := bufferDeadline(reqStart, kaWindow)
+	canWait := func(wait time.Duration) bool {
+		return canWaitForLocalRetry(ctx, wait) && (commitBy.IsZero() || time.Until(commitBy) > wait)
+	}
 	tryLocalRetry := func(f failure) bool {
 		if cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
 			return false
 		}
 		wait := localRetryDelay(f.retryAfter, proxyRetries)
-		if !canWaitForLocalRetry(ctx, wait) {
+		if !canWait(wait) {
 			logLocalRetrySkip(reqWho, reqEffort, f, wait, retryCount, "not-enough-time")
 			return false
 		}
@@ -344,14 +350,14 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		interceptRefusal := !isResp && cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
 
 		rec.beginAttempt(body, reqWho, proxyRetries)
-		resp, started, rtErr := roundTrip(ctx, r, body)
+		resp, started, stopDeadline, rtErr := roundTripBefore(ctx, r, body, commitBy)
 		if rtErr != nil {
 			last = classifyTransport(rtErr, ctx)
 			rec.noteAttemptFailure(last, "transport_error")
 			if tryLocalRetry(last) {
 				continue
 			}
-			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second {
+			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second && canWait(250*time.Millisecond) {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
@@ -378,7 +384,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			if tryLocalRetry(last) {
 				continue
 			}
-			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second {
+			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second && canWait(250*time.Millisecond) {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
@@ -410,7 +416,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if rec != nil {
 			rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 		}
-		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wireFor(r.URL.Path, interceptRefusal))
+		// The stream engine now owns the same absolute commit deadline; it can
+		// switch to live output without the pre-stream timer killing the body.
+		stopDeadline()
+		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wireFor(r.URL.Path, interceptRefusal), commitBy)
 		resp.Body.Close()
 		rec.noteAttemptStats(&st)
 		if fail == nil {
@@ -461,9 +470,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// (or we've hit the backstop). On retry, supply a Retry-After backoff so the
 	// client waits before re-sending.
 	canRetry := last.transient && budgetLeft()
-	retryAfter := last.retryAfter
-	if canRetry && retryAfter == 0 {
-		retryAfter = retryAfterFor(retryCount)
+	retryAfter := 0
+	if canRetry {
+		retryAfter = last.retryAfter
+		if retryAfter == 0 {
+			retryAfter = retryAfterFor(retryCount)
+		}
 	}
 	tag := "RETRY" // converted to x-should-retry=true; the SDK will re-send
 	if !canRetry {
@@ -473,7 +485,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// Claude Code can't recognize it as overloaded/rate-limit/timeout and bypass
 	// its x-should-retry loop. The log shows the true upstream status arrowed to
 	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
-	sStatus, sType := surfaceFor(r.URL.Path, last)
+	sStatus, sType := retrySurfaceFor(r.URL.Path, last, canRetry)
 	log.Printf("%-5s %s%s  %s %s%s  %s%s%s%s",
 		tag, reqWho, effortField(reqEffort), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
 	rec.noteProxyRetries(proxyRetries)
@@ -511,14 +523,17 @@ func (p *prefixCapture) Write(b []byte) (int, error) {
 }
 
 func readHTTPErrorBody(resp *http.Response, rec *reqRecorder) []byte {
+	body := withByteIdle(resp.Body, cfg.upstreamByteIdle)
+	defer body.stop()
 	if rec == nil {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, httpErrorClassifyBytes))
+		b, _ := io.ReadAll(io.LimitReader(body, httpErrorClassifyBytes))
 		return b
 	}
 	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 	prefix := &prefixCapture{max: httpErrorClassifyBytes}
 	dst := io.MultiWriter(prefix, rec.respWriter())
-	_, _ = io.Copy(dst, resp.Body)
+	_, err := io.Copy(dst, body)
+	rec.noteResponseReadError(err)
 	return prefix.buf.Bytes()
 }
 
@@ -528,7 +543,10 @@ func copyResponseBodyToArchive(resp *http.Response, rec *reqRecorder) {
 	}
 	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 	if sink := rec.respWriter(); sink != nil {
-		_, _ = io.Copy(sink, resp.Body)
+		body := withByteIdle(resp.Body, cfg.upstreamByteIdle)
+		defer body.stop()
+		_, err := io.Copy(sink, body)
+		rec.noteResponseReadError(err)
 	}
 }
 
@@ -578,7 +596,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		if canRetry {
 			tag = "RETRY"
 		}
-		sStatus, sType := surfaceFor(r.URL.Path, f)
+		sStatus, sType := retrySurfaceFor(r.URL.Path, f, canRetry)
 		log.Printf("%-5s %s%s  %s %s%s  %s%s%s", tag, reqWho, effortField(reqEffort), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
 		writeErr(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
@@ -595,7 +613,20 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	if sink := rec.respWriter(); sink != nil {
 		dst = io.MultiWriter(w, sink)
 	}
-	n, _ := io.Copy(dst, resp.Body)
+	n, copyErr := io.Copy(dst, resp.Body)
+	if copyErr != nil {
+		f := failure{transient: true, status: 502, atype: "api_error", code: "response_read_error", message: copyErr.Error()}
+		if ctx.Err() != nil {
+			f = classifyTransport(copyErr, ctx)
+		}
+		rec.noteResponseReadError(copyErr)
+		rec.noteAttemptFailure(f, "drop")
+		rec.note("DROP", resp.StatusCode, resp.StatusCode, f.code)
+		log.Printf("DROP  %s%s  %s  %d  %s  %s%s", reqWho, effortField(reqEffort), f.code, resp.StatusCode, hbytes(n), since(start), rec.idField())
+		// Headers may already be committed. Abort the HTTP response so a short
+		// upstream body cannot become a clean, shorter downstream success.
+		panic(http.ErrAbortHandler)
+	}
 	rec.noteAttemptResult("success")
 	log.Printf("OK    %s%s  %d  %s  %s%s", reqWho, effortField(reqEffort), resp.StatusCode, hbytes(n), since(start), rec.idField())
 	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
@@ -683,11 +714,11 @@ func requestWantsStream(body []byte) bool {
 // deriveDuration picks an attempt deadline below the client's own timeout.
 func deriveDuration(stainlessTimeout string) time.Duration {
 	d := cfg.maxRequestDur
-	if ms := atoiSafe(stainlessTimeout); ms > 0 {
-		clientDur := time.Duration(ms) * time.Millisecond
-		if clientDur-cfg.deadlineMargin > 0 && clientDur-cfg.deadlineMargin < d {
-			d = clientDur - cfg.deadlineMargin
-		}
+	seconds, err := strconv.ParseFloat(strings.TrimSpace(stainlessTimeout), 64)
+	if err == nil && seconds > 0 && !math.IsInf(seconds, 0) && seconds < float64(math.MaxInt64)/float64(time.Second) {
+		clientDur := time.Duration(seconds * float64(time.Second))
+		margin := min(cfg.deadlineMargin, clientDur/2)
+		d = min(d, clientDur-margin)
 	}
 	return d
 }

@@ -13,6 +13,13 @@ import (
 
 var errTooLarge = errors.New("response too large to buffer")
 
+func classifyBufferError(err error) *failure {
+	if errors.Is(err, errTooLarge) {
+		return &failure{status: http.StatusBadGateway, atype: "api_error", code: "response_too_large", message: "response exceeded proxy buffer cap"}
+	}
+	return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "spool_error", message: "buffering upstream response: " + err.Error()}
+}
+
 // failure describes a non-success outcome and how to surface it to the SDK.
 type failure struct {
 	transient  bool   // true => eligible to convert into an SDK retry
@@ -316,6 +323,16 @@ func surfaceFor(path string, f failure) (status int, atype string) {
 		return http.StatusBadRequest, atype
 	}
 	return status, atype
+}
+
+// Codex ignores X-Should-Retry, so exhausting/disabling the proxy retry budget
+// must also produce its terminal HTTP status. Keep the original failure intact
+// for diagnostics, and preserve Claude's generic error shape with its false header.
+func retrySurfaceFor(path string, f failure, canRetry bool) (int, string) {
+	if isResponsesPath(path) && !canRetry {
+		f.transient = false
+	}
+	return surfaceFor(path, f)
 }
 
 // writeAnthropicError emits a clean Anthropic-shaped error with the retry signal.

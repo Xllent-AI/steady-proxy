@@ -21,7 +21,7 @@ func setupForTest(upURL string) {
 	}
 	cfg.upstreamHost = h
 	cfg.upstreamByteIdle = 3 * time.Second
-	client = &http.Client{Transport: &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Second}}
+	client = &http.Client{CheckRedirect: stopRedirect, Transport: &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Second}}
 }
 
 func useDefaultConfig(t *testing.T) {
