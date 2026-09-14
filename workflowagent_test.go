@@ -10,13 +10,13 @@ import (
 	"time"
 )
 
-// Real-shape request bodies (system prompt structure taken from captured
-// 2.1.198 traffic). Only the Workflow-tool agent carries the runtime's injected
-// prologue in its `system` field.
+// Request bodies shaped like Claude Code traffic: `system` is an array of text
+// blocks, and only the Workflow-tool agent carries the runtime's injected
+// prologue among them.
 var (
-	// Workflow agent: full CC system + the workflow prologue as a system block.
+	// Workflow agent: ordinary system blocks + the workflow prologue as one block.
 	wfAgentBody = []byte(`{"model":"gpt-5.5","system":[` +
-		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.198; cc_entrypoint=cli; cc_is_subagent=true;"},` +
+		`{"type":"text","text":"preamble block"},` +
 		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},` +
 		`{"type":"text","text":"You are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task."}` +
 		`],"messages":[{"role":"user","content":"write an essay"}]}`)
@@ -28,7 +28,7 @@ var (
 
 	// Regular Task/SDK subagent: Agent-SDK identity, no workflow prologue.
 	taskAgentBody = []byte(`{"model":"claude-opus-4-8","system":[` +
-		`{"type":"text","text":"x-anthropic-billing-header: cc_is_subagent=true;"},` +
+		`{"type":"text","text":"preamble block"},` +
 		`{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},` +
 		`{"type":"text","text":"You are an agent for Claude Code, Anthropic's official CLI."}` +
 		`],"messages":[{"role":"user","content":"probe"}]}`)

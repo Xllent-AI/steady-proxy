@@ -307,13 +307,15 @@ hidden-retry protection past the first output event (mid-stream failures too), s
 ## Verify — reading the log
 
 The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only adds
-extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
+extra internal retry chatter). Tail it with `docker compose logs -f proxy`. The
+sample below was taken with `PROXY_TRANSACTIONAL_LOCAL_RETRIES=6` and
+`PROXY_VERBOSE=1`:
 
 ```text
 2026/06/21 16:34:00  steady-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-5; one log line per request)
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
-2026/06/21 16:34:31  OK    gpt-5.6-sol/main  high  in=1.1k out=223 tok  completed  live  2.37s
+2026/06/21 16:34:31  OK    gpt-5.6/main  high  in=1.1k out=223 tok  completed  live  2.37s
    (timestamp prefix elided on the lines below for readability)
 RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
@@ -400,6 +402,18 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save each request/response JSON archive there (see below) |
 | `PROXY_VERBOSE` | off | set `1` for per-decision logs |
 
+### Optional upstream headers
+
+A gateway can override the proxy's error classification by setting a response
+header on a non-2xx reply: `x-gateway-retryable: true` forces a retryable
+conversion, `x-gateway-retryable: false` surfaces the error as-is (on
+`/v1/responses` it surfaces as `400`, Codex's terminal status). The Anthropic
+API's own `x-should-retry` header is honored the same way, at lower precedence.
+Neither is required — without them the proxy classifies by status and error body
+as described above. The `x-gateway-*` names (including `x-gateway-error-stage`
+and `x-gateway-error-code`) are stripped from client requests so a client cannot
+assert them.
+
 ## Saving request/response data
 
 The one-line access log tells you *what happened*; sometimes you need to see
@@ -460,9 +474,10 @@ stats, and any model-swap decision.
   `PROXY_SDK_RETRY_CAP=0` to disable conversion, or don't proxy those.
 - **Live streaming is lost** for turns that finish within the grace window (by
   design). Turns longer than `PROXY_KEEPALIVE_MS` commit early and stream live but
-  then can't cleanly convert a late drop. To keep live streaming *and* full
-  robustness for long turns, add resumable responses in your in-house shim
-  (OpenAI/Azure `background:true` + `starting_after=<sequence>`).
+  then can't cleanly convert a late drop. Keeping live streaming *and* full
+  robustness for long turns needs resumable responses on the gateway side
+  (OpenAI/Azure `background:true` + `starting_after=<sequence>`), which this
+  proxy does not implement.
 - Bind to loopback only; this is an unauthenticated local proxy.
 
 ## License

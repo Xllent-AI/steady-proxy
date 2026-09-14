@@ -659,7 +659,9 @@ var hopByHop = map[string]bool{
 	"content-length": true, "proxy-authorization": true, "proxy-authenticate": true,
 }
 var stripFromClient = map[string]bool{
-	// Don't let a client assert provenance our shim is meant to assert.
+	// Reserved for gateway->proxy hints on responses (x-gateway-retryable is
+	// read in classifyHTTPErrorBytesShaped). Never forwarded from a client, so a
+	// gateway that echoes request headers cannot be tricked into a verdict.
 	"x-gateway-error-stage": true, "x-gateway-error-code": true, "x-gateway-retryable": true,
 }
 
@@ -1013,7 +1015,7 @@ func agentKind(r *http.Request) string {
 // injects into every workflow agent()'s system prompt: "You are a subagent
 // spawned by a workflow orchestration script. Use the tools available to
 // complete the task." ONLY these agents carry the Workflow tool's per-agent
-// stall watchdog (default 180000ms = Rkf in the CLI, retried CIl=5×, with no
+// stall watchdog (observed default 180000ms, retried a few times, with no
 // global env override) that aborts a turn which streams no assistant/user
 // message for the window. Regular Task/SDK subagents (system prompt "You are a
 // Claude agent, built on … the Agent SDK") and the interactive main session do

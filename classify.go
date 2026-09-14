@@ -91,7 +91,7 @@ var requestShapeSigs = []string{
 	"tool_use", "tool_result", "tool use concurrency",
 	"missing tool result", "duplicate tool_use", "unexpected tool_use_id",
 	"thinking blocks", "thinking.budget_tokens", "max_tokens must be",
-	// schema / header mismatches (often shim translation bugs — deterministic).
+	// schema / header mismatches (often gateway translation bugs — deterministic).
 	// Note: no bare "must be"/"unsupported"/"is required" — those match transient
 	// or auth messages ("token must be provided", "unsupported region") that the
 	// policy wants to retry. model_not_found stays a code match only: a plain
@@ -173,7 +173,11 @@ func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, reqShaped reque
 		atype = "api_error"
 	}
 
-	// Trust explicit signals first.
+	// Trust explicit signals first. x-gateway-retryable is an optional hint a
+	// gateway may set on error responses (true = retry, false = surface); it
+	// beats every heuristic below. x-should-retry is the Anthropic API's own near-
+	// equivalent. Both are absent from a plain provider, which falls through
+	// to status/body classification.
 	switch strings.ToLower(resp.Header.Get("x-gateway-retryable")) {
 	case "true":
 		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "gateway_retryable_" + itoa(st), message: ae.Error.Message, retryAfter: ra}

@@ -269,7 +269,7 @@ func TestToolUseInputJSONDeltaNormalizedAcrossLiveHandoff(t *testing.T) {
 
 func TestServerToolUseInputJSONDeltaNormalized(t *testing.T) {
 	useDefaultConfig(t)
-	input := `{"query":"OEIS A048625 Pisot sequence P(4,6) linear recurrence proof Boyd"}`
+	input := `{"query":"a search query long enough to be split across many small deltas"}`
 	rec, f := capture(t, inputJSONStream(inputJSONStreamSpec{
 		blockType: "server_tool_use",
 		toolID:    "srvtoolu_1",

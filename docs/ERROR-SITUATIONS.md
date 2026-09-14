@@ -1,7 +1,7 @@
 # Error situations the proxy must cover
 
-This catalog is derived from **real Claude Code session transcripts** on this
-machine (1916 sessions under `~/.claude/projects`). Each row lists how the error
+This catalog is derived from the error messages observed across a large sample
+of **real Claude Code session transcripts**. Each row lists how the error
 surfaces, its root cause, whether a blind retry can fix it, and what
 `steady-proxy` does. The Go tests in `*_test.go` target every row.
 
@@ -44,7 +44,7 @@ retried natively, which is the bug we fix.
 
 | Real message | Where it breaks | Proxy action |
 |---|---|---|
-| `API Error: JSON Parse error: Unexpected EOF` | `JSON.parse` on a truncated SSE `data:`/body (Bun phrasing) | **convert** — capture hits EOF before `message_stop` → `502 truncated_stream` + retry |
+| `API Error: JSON Parse error: Unexpected EOF` | `JSON.parse` on a truncated SSE `data:`/body (Bun phrasing) | **convert** — capture hits EOF before `message_stop` → classified `truncated_stream`, surfaced as a retryable `503` |
 | `API Error: Request was aborted.` | stream aborted mid-flight | **convert** (truncated_stream / transport) |
 | `API Error: The socket connection was closed unexpectedly.` | socket closed mid-body | **convert** |
 | `API Error: Connection closed mid-response. The response above may be incomplete.` | upstream closed after partial content | **convert** |
@@ -80,12 +80,12 @@ response. Error-body archiving observes byte-idle/request deadlines and records
 
 The stream is structurally complete (reaches `message_stop`) but an event's
 payload is invalid JSON — or a stream of valid events accumulates to invalid
-tool/server-tool input JSON. These are gateway/shim serialization bugs, not cuts.
+tool/server-tool input JSON. These are gateway serialization bugs, not cuts.
 
 | Real message | Cause | Proxy action |
 |---|---|---|
-| `API Error: JSON Parse error: Unexpected identifier` | a fully-framed `data:` line with broken JSON | **convert** — per-event `json.Valid` check fails → `502 malformed_sse` + retry |
-| `API Error: JSON Parse error: Unexpected EOF` | valid outer SSE events but incomplete accumulated tool/server-tool `input_json_delta` | **convert** — accumulated tool input validation fails before commit → `502 malformed_sse` + retry |
+| `API Error: JSON Parse error: Unexpected identifier` | a fully-framed `data:` line with broken JSON | **convert** — per-event `json.Valid` check fails → classified `malformed_sse`, surfaced as a retryable `503` |
+| `API Error: JSON Parse error: Unexpected EOF` | valid outer SSE events but incomplete accumulated tool/server-tool `input_json_delta` | **convert** — accumulated tool input validation fails before commit → classified `malformed_sse`, surfaced as a retryable `503` |
 
 This is the edge case plain truncation-detection misses; the proxy validates the
 JSON of every data event and each accumulated tool/server-tool input object (toggle:
@@ -122,7 +122,7 @@ request would loop forever. These are matched by `requestShapeSigs` in
 | `… duplicate tool_use ID in conversation history` | malformed conversation | **surface** |
 | `… unexpected tool_use_id found in tool_result blocks` | malformed conversation | **surface** |
 | `… N due to tool use concurrency issues. Run /rewind …` | conversation state | **surface** |
-| `… Extra inputs are not permitted … context_management` / `input_examples` | schema mismatch (shim) | **surface** |
+| `… Extra inputs are not permitted … context_management` / `input_examples` | schema mismatch (gateway rejects a field) | **surface** |
 | `… Unexpected value(s) for the anthropic-beta header` | header/beta mismatch | **surface** |
 | `… max_tokens must be greater than thinking.budget_tokens` | invalid request | **surface** |
 | `… thinking blocks … cannot be modified` | invalid request | **surface** |
@@ -130,10 +130,11 @@ request would loop forever. These are matched by `requestShapeSigs` in
 | `… prompt is too long` / context length exceeded | too large | **surface** |
 
 Any other `4xx` — including a bare `invalid_request_error` with no recognized
-request-shape signature — **defaults to retry** (normalized to `502` +
+request-shape signature — **defaults to retry** (normalized to `503` +
 `x-should-retry: true`), because "retry might work" and the upstream owns the
-real verdict. An explicit `x-gateway-retryable: true|false` (or `x-should-retry`)
-from the shim still overrides everything.
+real verdict. If your gateway sends an explicit `x-gateway-retryable: true|false`
+(or `x-should-retry`) response header, that verdict overrides everything else
+(see [Optional upstream headers](../README.md#optional-upstream-headers)).
 
 ## 4b. Auth / billing / policy  → retry (was permanent, now ridden out)
 

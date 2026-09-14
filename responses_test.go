@@ -17,7 +17,7 @@ import (
 
 // A minimal but structurally faithful OpenAI Responses SSE stream (Codex wire).
 const goodResponsesStream = `event: response.created
-data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-sol","status":"in_progress"}}
+data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6","status":"in_progress"}}
 
 event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}
@@ -32,7 +32,7 @@ event: response.output_text.done
 data: {"type":"response.output_text.done","item_id":"msg_1","output_index":0,"content_index":0,"text":"Hi"}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":1234,"output_tokens":56,"total_tokens":1290,"input_tokens_details":{"cached_tokens":34}}}}
+data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6","status":"completed","usage":{"input_tokens":1234,"output_tokens":56,"total_tokens":1290,"input_tokens_details":{"cached_tokens":34}}}}
 
 `
 
@@ -126,7 +126,7 @@ func TestResponsesCaptureSuccessBuffered(t *testing.T) {
 		t.Fatalf("buffered replay must be byte-for-byte identical.\n got: %q", rec.Body.String())
 	}
 	// usage/model/stop scraped for the access log.
-	if st.model != "gpt-5.6-sol" || st.inTok != 1234 || st.cacheReadTok != 34 || st.outTok != 56 || st.stop != "completed" {
+	if st.model != "gpt-5.6" || st.inTok != 1234 || st.cacheReadTok != 34 || st.outTok != 56 || st.stop != "completed" {
 		t.Fatalf("scrape mismatch: model=%q inTok=%d cacheRead=%d outTok=%d stop=%q", st.model, st.inTok, st.cacheReadTok, st.outTok, st.stop)
 	}
 }
@@ -754,7 +754,7 @@ func TestE2EResponsesHTTPRequestShapeNotRetried(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
 		t.Fatalf("deterministic HTTP request-shape must NOT be retried; want false, got %q (code %d)", got, rec.Code)
 	}
@@ -772,7 +772,7 @@ func TestE2EResponsesNonRetryableSurfaces400(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if rec.Header().Get("X-Should-Retry") != "false" {
 		t.Fatalf("deterministic error must not be retried; got %q", rec.Header().Get("X-Should-Retry"))
 	}
@@ -792,7 +792,7 @@ func TestE2EResponsesProxyOnceNonRetryable422Surfaces400(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":false,"model":"gpt-5.6-sol"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"stream":false,"model":"gpt-5.6"}`))
 	rec := httptest.NewRecorder()
 	handle(rec, req)
 	if rec.Code != 400 {
@@ -870,7 +870,7 @@ func TestE2EResponsesHTTP503Retryable(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if got := rec.Header().Get("X-Should-Retry"); got != "true" {
 		t.Fatalf("HTTP 503 must be retryable; want true, got %q", got)
 	}
@@ -1037,7 +1037,7 @@ func TestE2EResponsesStreamingSuccess(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -1055,22 +1055,22 @@ func TestE2EResponsesAccessLogShowsReasoningEffortWhenSet(t *testing.T) {
 	setupForTest(up.URL)
 
 	logs := captureLogs(t, func() {
-		rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol","reasoning":{"effort":"high"}}`)
+		rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6","reasoning":{"effort":"high"}}`)
 		if rec.Code != 200 {
 			t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
 		}
 	})
-	if !strings.Contains(logs, "OK    gpt-5.6-sol/main  high  ") {
+	if !strings.Contains(logs, "OK    gpt-5.6/main  high  ") {
 		t.Fatalf("access log missing reasoning effort:\n%s", logs)
 	}
 
 	logs = captureLogs(t, func() {
-		rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+		rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 		if rec.Code != 200 {
 			t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
 		}
 	})
-	if !strings.Contains(logs, "OK    gpt-5.6-sol/main  in=") {
+	if !strings.Contains(logs, "OK    gpt-5.6/main  in=") {
 		t.Fatalf("access log should omit unset reasoning effort:\n%s", logs)
 	}
 }
@@ -1088,7 +1088,7 @@ func TestE2EResponsesEarlyCommitDisabledBuffers(t *testing.T) {
 	cfg.responsesEarlyCommit = false
 	t.Cleanup(func() { cfg = loadConfig() }) // don't leak the override to later tests
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -1108,7 +1108,7 @@ func TestE2EResponsesStartErrorBecomesRetryable(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if rec.Code == 200 {
 		t.Fatalf("in-band start error must not commit 200; body=%s", rec.Body.String())
 	}
@@ -1125,7 +1125,7 @@ func TestE2EResponsesRequestShapeNotRetried(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 
-	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6-sol"}`)
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
 		t.Fatalf("request-shape must NOT be retried; want false, got %q", got)
 	}
@@ -1155,7 +1155,7 @@ func TestE2EResponsesRequestTimeoutRetries(t *testing.T) {
 			{"local-budget-exhausted", 1, false},
 		} {
 			t.Run(wire.name+"/"+outcome.name, func(t *testing.T) {
-				const requestBody = `{"stream":true,"model":"gpt-5.6-sol"}`
+				const requestBody = `{"stream":true,"model":"gpt-5.6"}`
 				var attempts atomic.Int32
 				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					body, err := io.ReadAll(r.Body)

@@ -23,7 +23,7 @@ func TestAgentKind(t *testing.T) {
 		},
 		{
 			name:    "nested subagent via parent header",
-			headers: map[string]string{ua: "claude-cli/2.1.185 (external, sdk-cli)", "X-Claude-Code-Parent-Agent-Id": "ab6b76b6be6f95284"},
+			headers: map[string]string{ua: "claude-cli/2.1.185 (external, sdk-cli)", "X-Claude-Code-Parent-Agent-Id": "parent-agent-1"},
 			want:    "sub",
 		},
 		{
@@ -33,7 +33,7 @@ func TestAgentKind(t *testing.T) {
 		},
 		{
 			name:    "parent header alone (no UA) is sub",
-			headers: map[string]string{"X-Claude-Code-Parent-Agent-Id": "ab6b76b6be6f95284"},
+			headers: map[string]string{"X-Claude-Code-Parent-Agent-Id": "parent-agent-1"},
 			want:    "sub",
 		},
 		{
