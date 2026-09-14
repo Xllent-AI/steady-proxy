@@ -36,5 +36,10 @@ COPY --from=build /src/LICENSE /LICENSE
 # Relative paths in env (e.g. PROXY_REQUEST_LOG_DIR=./logs) resolve against /,
 # where docker-compose.yml bind-mounts ./logs.
 WORKDIR /
+# Never run as root: `docker run` without --user gets distroless's nonroot
+# (uid 65532); docker-compose.yml overrides this with the host user so
+# PROXY_REQUEST_LOG_DIR files are owned by you. /tmp (the default spool dir)
+# is world-writable in this image.
+USER nonroot:nonroot
 EXPOSE 8789
 ENTRYPOINT ["/steady-proxy"]
