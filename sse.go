@@ -52,10 +52,6 @@ func (s *spool) write(p []byte) error {
 	return err
 }
 
-func (s *spool) replay(w io.Writer) error {
-	return s.replayWithUsage(w, nil)
-}
-
 func (s *spool) replayWithUsage(w io.Writer, st *captureStats) error {
 	if (st == nil || !st.shouldBackfillMessageStartUsage()) && !normalizeToolJSONEnabled() {
 		return s.replayRaw(w)

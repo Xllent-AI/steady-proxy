@@ -360,16 +360,6 @@ func (rec *reqRecorder) noteAttemptResponseHeaders(status int, h http.Header) {
 	rec.ensureAttemptResponse(status, h)
 }
 
-func (rec *reqRecorder) noteAttemptResponse(status int, h http.Header, body []byte) {
-	if rec == nil || rec.cur == nil {
-		return
-	}
-	rec.ensureAttemptResponse(status, h)
-	rec.cur.responseCapture = newBodyCapture()
-	rec.cur.responseCapture.Write(body)
-	rec.cur.Response.Body = rec.cur.responseCapture.archiveBody()
-}
-
 func (rec *reqRecorder) ensureAttemptResponse(status int, h http.Header) {
 	if rec.cur.Response == nil {
 		rec.cur.Response = &archiveResponse{}
@@ -993,11 +983,6 @@ var apiSecretQueryNames = map[string]bool{
 	"clientsecret":      true,
 	"client-secret":     true,
 	"authorization":     true,
-}
-
-func redactQuery(raw string) string {
-	q, _ := redactQueryWithNames(raw)
-	return q
 }
 
 func redactQueryWithNames(raw string) (string, []string) {

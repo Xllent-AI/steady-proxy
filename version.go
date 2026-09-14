@@ -186,7 +186,3 @@ func handleVersionRequest(w http.ResponseWriter, r *http.Request) bool {
 	}
 	return true
 }
-
-func proxyVersionField() string {
-	return "   proxy-version=" + currentVersion().token()
-}
