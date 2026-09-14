@@ -209,8 +209,8 @@ func TestKeepaliveCommitThenLive(t *testing.T) {
 	if !strings.Contains(body, "message_stop") || !strings.Contains(body, "Hi") {
 		t.Fatalf("missing streamed content: %q", body)
 	}
-	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "live" {
-		t.Fatalf("want live mode header, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	if rec.Header().Get("X-Steady-Proxy-Mode") != "live" {
+		t.Fatalf("want live mode header, got %q", rec.Header().Get("X-Steady-Proxy-Mode"))
 	}
 }
 

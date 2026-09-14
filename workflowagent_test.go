@@ -113,7 +113,7 @@ func TestCaptureSSEWindowEarlyCommit(t *testing.T) {
 		rec := httptest.NewRecorder()
 		r := &gapReader{ctx: ctx, chunks: chunks, gap: 40 * time.Millisecond}
 		wrote, f = captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, window, true, false)
-		return rec.Header().Get("X-CC-Retry-Proxy-Mode"), wrote, f
+		return rec.Header().Get("X-Steady-Proxy-Mode"), wrote, f
 	}
 
 	t.Run("short window commits live before completion", func(t *testing.T) {
@@ -168,7 +168,7 @@ func TestWindowCommitGatedOnProgress(t *testing.T) {
 	if f == nil || !f.transient || f.code != "sse_overloaded" {
 		t.Fatalf("want transient sse_overloaded pre-commit retry, got %+v", f)
 	}
-	if mode := rec.Header().Get("X-CC-Retry-Proxy-Mode"); mode != "" {
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "" {
 		t.Fatalf("no bytes should be committed, but mode=%q", mode)
 	}
 }
@@ -202,7 +202,7 @@ func TestWindowGateIgnoresWithheldToolDelta(t *testing.T) {
 	if f == nil || !f.transient || f.code != "sse_overloaded" {
 		t.Fatalf("want transient sse_overloaded pre-commit retry, got %+v", f)
 	}
-	if mode := rec.Header().Get("X-CC-Retry-Proxy-Mode"); mode != "" {
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "" {
 		t.Fatalf("no bytes should be committed, but mode=%q", mode)
 	}
 }
@@ -238,7 +238,7 @@ func TestWindowGateOpensOnToolBlockStop(t *testing.T) {
 	if !wrote {
 		t.Fatalf("expected a committed write")
 	}
-	if mode := rec.Header().Get("X-CC-Retry-Proxy-Mode"); mode != "live" {
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
 		t.Fatalf("a completed tool block after grace should commit live, got %q", mode)
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "message_stop") {
@@ -295,7 +295,7 @@ func TestGatedCommitSkippedOnDataPlusEOF(t *testing.T) {
 	if f == nil || !f.transient || f.code != "truncated_stream" {
 		t.Fatalf("want transient truncated_stream pre-commit retry, got %+v", f)
 	}
-	if mode := rec.Header().Get("X-CC-Retry-Proxy-Mode"); mode != "" {
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "" {
 		t.Fatalf("no bytes should be committed, but mode=%q", mode)
 	}
 }
@@ -334,7 +334,7 @@ func TestWindowCommitsLiveOnDelayedContent(t *testing.T) {
 	if !wrote {
 		t.Fatalf("expected a committed write")
 	}
-	if mode := rec.Header().Get("X-CC-Retry-Proxy-Mode"); mode != "live" {
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
 		t.Fatalf("delayed content after grace must commit live promptly, got %q", mode)
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "message_stop") {
@@ -356,7 +356,7 @@ func TestCaptureSSEWrapperUsesConfiguredKeepalive(t *testing.T) {
 	if _, f := captureSSE(ctx, cancel, rec, http.Header{}, r, nil); f != nil {
 		t.Fatalf("expected success, got %+v", *f)
 	}
-	if mode := rec.Header().Get("X-CC-Retry-Proxy-Mode"); mode != "live" {
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
 		t.Fatalf("wrapper should honor cfg.keepaliveMs (live), got %q", mode)
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "message_stop") {

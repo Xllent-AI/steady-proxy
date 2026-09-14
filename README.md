@@ -1,11 +1,11 @@
-# cc-retry-proxy
+# steady-proxy
 
 A tiny, transactional, self-healing reverse proxy that sits between **Claude Code**
 or **Codex** and your **gateway**, so transient gateway failures never stop a turn
 — no tmux, no terminal automation, and subagents are covered automatically.
 
 ```
-Claude Code / Codex (+ subagents)  ──HTTP──▶  cc-retry-proxy (loopback)  ──HTTPS──▶  your gateway
+Claude Code / Codex (+ subagents)  ──HTTP──▶  steady-proxy (loopback)  ──HTTPS──▶  your gateway
 ```
 
 It speaks both wire formats: the **Anthropic Messages** API (`POST /v1/messages`,
@@ -197,9 +197,9 @@ Then point Claude Code at it (next section). Logs: `docker compose logs -f proxy
 ## Build / test from source
 
 ```bash
-cd cc-retry-proxy
+cd steady-proxy
 make build                  # stamps VERSION + git commit + build date
-./cc-retry-proxy --version
+./steady-proxy --version
 go test -race ./...          # unit + integration tests
 ./test/live.sh               # live: real `claude -p` -> proxy -> mock + real gateway
 ```
@@ -212,7 +212,7 @@ the printed temporary directory.
 Run the binary directly instead of compose:
 
 ```bash
-PROXY_UPSTREAM_URL=https://your-gateway.example.com PROXY_LISTEN_ADDR=127.0.0.1:8789 ./cc-retry-proxy
+PROXY_UPSTREAM_URL=https://your-gateway.example.com PROXY_LISTEN_ADDR=127.0.0.1:8789 ./steady-proxy
 ```
 
 `docker compose up -d --build` stamps the binary with `VERSION`, the current Git
@@ -232,13 +232,13 @@ curl -s http://127.0.0.1:8789/__version
 Background / persistent (systemd user unit, survives logout):
 
 ```ini
-# ~/.config/systemd/user/cc-retry-proxy.service
+# ~/.config/systemd/user/steady-proxy.service
 [Unit]
-Description=cc-retry-proxy for Claude Code
+Description=steady-proxy for Claude Code
 After=network-online.target
 
 [Service]
-ExecStart=/opt/cc-retry-proxy/cc-retry-proxy
+ExecStart=/opt/steady-proxy/steady-proxy
 Environment=PROXY_UPSTREAM_URL=https://your-gateway.example.com
 Environment=PROXY_KEEPALIVE_MS=600000
 Environment=PROXY_LISTEN_ADDR=127.0.0.1:8789
@@ -250,7 +250,7 @@ WantedBy=default.target
 ```
 
 ```bash
-systemctl --user daemon-reload && systemctl --user enable --now cc-retry-proxy
+systemctl --user daemon-reload && systemctl --user enable --now steady-proxy
 ```
 
 ## Wire Claude Code to it
@@ -308,7 +308,7 @@ The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only add
 extra internal retry chatter). Tail it with `docker compose logs -f proxy`:
 
 ```text
-2026/06/21 16:34:00  cc-retry-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-5; one log line per request)
+2026/06/21 16:34:00  steady-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-5; one log line per request)
 2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.41s
 2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
 2026/06/21 16:34:31  OK    gpt-5.6-sol/main  high  in=1.1k out=223 tok  completed  live  2.37s
@@ -359,8 +359,8 @@ Reading a line:
   proxy's hidden in-request retries and include the same `model/agent`, the true
   cause/status, wait time, hidden retry index, and SDK `attempt=N` when present.
 
-Responses also carry headers: `X-CC-Retry-Proxy-Mode` (`buffered`/`live`) on
-success, `X-CC-Retry-Proxy-Reason` on a synthesized error.
+Responses also carry headers: `X-Steady-Proxy-Mode` (`buffered`/`live`) on
+success, `X-Steady-Proxy-Reason` on a synthesized error.
 
 Live smoke test (sends one real request through the proxy to your gateway):
 
@@ -406,11 +406,11 @@ stream, or a surfaced request-shape 4xx. Set `PROXY_REQUEST_LOG_DIR` to a direct
 proxy writes **one JSON archive per client request** into it:
 
 ```
-PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./cc-retry-proxy
+PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./steady-proxy
 # ./logs/v1-messages-20260621t143005-a1b2c3d4.json   (a1b2c3d4 = the correlation id)
 ```
 
-Each archive uses the versioned schema `cc-retry-proxy.payload.v2`. Bodies are
+Each archive uses the versioned schema `steady-proxy.payload.v2`. Bodies are
 stored as JSON `data_base64` fields with `encoding`, byte `size`, and `sha256`, so
 request and response payload bytes can be restored exactly, including binary or
 image payloads. The archive records the original client request envelope, the

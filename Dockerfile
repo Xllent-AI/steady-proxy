@@ -25,12 +25,12 @@ RUN set -eu; \
     d="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
     dirty_flag="${DIRTY:-unknown}"; \
     ldflags="-s -w -X main.version=$v -X main.commit=$c -X main.buildDate=$d -X main.dirty=$dirty_flag"; \
-    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$ldflags" -o /out/cc-retry-proxy .; \
+    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$ldflags" -o /out/steady-proxy .; \
     CGO_ENABLED=0 go build -trimpath -buildvcs=false -o /out/testupstream ./testupstream
 
 # Minimal runtime; distroless/static ships CA certs (needed for upstream TLS).
 FROM gcr.io/distroless/static-debian12
-COPY --from=build /out/cc-retry-proxy /cc-retry-proxy
+COPY --from=build /out/steady-proxy /steady-proxy
 COPY --from=build /out/testupstream /testupstream
 EXPOSE 8789
-ENTRYPOINT ["/cc-retry-proxy"]
+ENTRYPOINT ["/steady-proxy"]

@@ -14,7 +14,7 @@ services:
         COMMIT: "${PROXY_COMMIT:-}"
         BUILD_DATE: "${PROXY_BUILD_DATE:-}"
         DIRTY: "${PROXY_DIRTY:-unknown}"
-    image: cc-retry-proxy:latest
+    image: steady-proxy:latest
     # Run as the host user so PROXY_REQUEST_LOG_DIR dumps are owned by you, not
     # root (readable without sudo). Falls back to 1000:1000; override by exporting
     # UID/GID or setting them in .env if your host user differs.

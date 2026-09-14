@@ -1,11 +1,11 @@
 # Test stack: proxy in front of the fault-injecting mock upstream.
 #   docker compose -f docker-compose.test.yml up -d --build
 # Find the isolated endpoint with: docker compose -f docker-compose.test.yml port proxy 8789
-name: cc-retry-proxy-test
+name: steady-proxy-test
 services:
   mock:
     build: .
-    image: cc-retry-proxy:test
+    image: steady-proxy:test
     entrypoint: ["/testupstream"]
     environment:
       MOCK_ADDR: "0.0.0.0:9099"
@@ -14,7 +14,7 @@ services:
 
   proxy:
     build: .
-    image: cc-retry-proxy:test
+    image: steady-proxy:test
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"
       PROXY_UPSTREAM_URL: "${TEST_UPSTREAM_URL:-http://mock:9099}"

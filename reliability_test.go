@@ -253,7 +253,7 @@ func TestHTTP2HeaderDeadlineRemainsRetryable(t *testing.T) {
 	if protocol.Load() != 2 {
 		t.Fatalf("test did not negotiate HTTP/2: %d", protocol.Load())
 	}
-	if rec.Code != 503 || rec.Header().Get("X-Should-Retry") != "true" || rec.Header().Get("X-CC-Retry-Proxy-Reason") != "deadline" {
+	if rec.Code != 503 || rec.Header().Get("X-Should-Retry") != "true" || rec.Header().Get("X-Steady-Proxy-Reason") != "deadline" {
 		t.Fatalf("HTTP/2 deadline became a terminal cancellation: status=%d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
 	}
 }

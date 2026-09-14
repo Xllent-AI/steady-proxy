@@ -40,9 +40,9 @@ func statusFor(f failure) int {
 }
 func msgFor(f failure) string {
 	if f.message == "" {
-		return "cc-retry-proxy: upstream failure"
+		return programName + ": upstream failure"
 	}
-	return "cc-retry-proxy: " + f.message
+	return programName + ": " + f.message
 }
 
 // statusField renders the upstream status for the logs, annotating the
@@ -347,7 +347,7 @@ func writeAnthropicError(w http.ResponseWriter, canRetry bool, status int, atype
 	if retryAfter > 0 {
 		h.Set("Retry-After", itoa(retryAfter))
 	}
-	h.Set("X-CC-Retry-Proxy-Reason", code)
+	h.Set("X-Steady-Proxy-Reason", code)
 	if status <= 0 {
 		status = http.StatusBadGateway
 	}

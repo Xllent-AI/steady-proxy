@@ -1058,7 +1058,7 @@ func writeOpenAIError(w http.ResponseWriter, canRetry bool, status int, atype, m
 	if retryAfter > 0 {
 		h.Set("Retry-After", itoa(retryAfter))
 	}
-	h.Set("X-CC-Retry-Proxy-Reason", code)
+	h.Set("X-Steady-Proxy-Reason", code)
 	if status <= 0 {
 		status = http.StatusBadGateway
 	}

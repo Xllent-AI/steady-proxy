@@ -1,5 +1,5 @@
 # compiled binary
-/cc-retry-proxy
+/steady-proxy
 *.test
 # local Go build cache (GOCACHE=./.gocache) — generated artifacts, never commit
 /.gocache/

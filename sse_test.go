@@ -51,8 +51,8 @@ func TestCaptureSuccess(t *testing.T) {
 	if !strings.Contains(body, "message_stop") || !strings.Contains(body, "Hi") {
 		t.Fatalf("replayed body missing content: %q", body)
 	}
-	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "buffered" {
-		t.Fatalf("want buffered mode, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	if rec.Header().Get("X-Steady-Proxy-Mode") != "buffered" {
+		t.Fatalf("want buffered mode, got %q", rec.Header().Get("X-Steady-Proxy-Mode"))
 	}
 }
 
@@ -255,8 +255,8 @@ func TestToolUseInputJSONDeltaNormalizedAcrossLiveHandoff(t *testing.T) {
 	if f != nil || !wrote {
 		t.Fatalf("expected live handoff success, wrote=%v failure=%+v", wrote, f)
 	}
-	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "live" {
-		t.Fatalf("want live mode, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	if rec.Header().Get("X-Steady-Proxy-Mode") != "live" {
+		t.Fatalf("want live mode, got %q", rec.Header().Get("X-Steady-Proxy-Mode"))
 	}
 	deltas := inputJSONDeltas(t, rec.Body.String())
 	if len(deltas) != 1 {

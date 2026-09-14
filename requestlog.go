@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-const requestArchiveSchema = "cc-retry-proxy.payload.v2"
+const requestArchiveSchema = "steady-proxy.payload.v2"
 
 func requestLogEnabled() bool { return cfg.requestLogDir != "" }
 
@@ -68,7 +68,7 @@ func (c *bodyCapture) Write(p []byte) (int, error) {
 		c.buf.Write(p)
 		return len(p), nil
 	}
-	f, err := os.CreateTemp(cfg.spoolDir, "ccrp-archive-*.body")
+	f, err := os.CreateTemp(cfg.spoolDir, "steady-proxy-archive-*.body")
 	if err != nil {
 		c.err = err
 		return len(p), nil

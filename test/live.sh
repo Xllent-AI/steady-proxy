@@ -14,7 +14,7 @@ set -uo pipefail
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 PROXY=""
 MOCK=""
-TEST_PROJECT="cc-retry-proxy-test-$$"
+TEST_PROJECT="steady-proxy-test-$$"
 TEST_DIR="$(mktemp -d /tmp/cc-live.XXXXXX)"
 MODEL="${MODEL:-sonnet}"
 HOME_T="$TEST_DIR/home"

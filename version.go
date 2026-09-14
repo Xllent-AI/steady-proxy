@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const programName = "steady-proxy"
+
 var (
 	version   = "dev"
 	commit    = ""
@@ -26,7 +28,7 @@ type versionInfo struct {
 
 func currentVersion() versionInfo {
 	vi := versionInfo{
-		Program: "cc-retry-proxy",
+		Program: programName,
 		Version: defaultString(version, "dev"),
 	}
 	if c := strings.TrimSpace(commit); c != "" {
@@ -98,7 +100,7 @@ func (vi versionInfo) token() string {
 
 func (vi versionInfo) line() string {
 	parts := []string{
-		defaultString(vi.Program, "cc-retry-proxy"),
+		defaultString(vi.Program, programName),
 		"version=" + defaultString(vi.Version, "dev"),
 	}
 	if vi.Commit != "" {

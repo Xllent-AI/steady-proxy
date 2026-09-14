@@ -119,8 +119,8 @@ func TestResponsesCaptureSuccessBuffered(t *testing.T) {
 	if !wrote {
 		t.Fatalf("expected wrote=true")
 	}
-	if rec.Header().Get("X-CC-Retry-Proxy-Mode") != "buffered" {
-		t.Fatalf("want buffered mode, got %q", rec.Header().Get("X-CC-Retry-Proxy-Mode"))
+	if rec.Header().Get("X-Steady-Proxy-Mode") != "buffered" {
+		t.Fatalf("want buffered mode, got %q", rec.Header().Get("X-Steady-Proxy-Mode"))
 	}
 	if rec.Body.String() != goodResponsesStream {
 		t.Fatalf("buffered replay must be byte-for-byte identical.\n got: %q", rec.Body.String())
@@ -324,7 +324,7 @@ func TestResponsesCaptureSuccessChunkedEarlyCommit(t *testing.T) {
 	if rec.Body.String() != goodResponsesStream {
 		t.Fatalf("live stream must be byte-for-byte identical.\n got: %q", rec.Body.String())
 	}
-	if m := rec.Header().Get("X-CC-Retry-Proxy-Mode"); m != "live" {
+	if m := rec.Header().Get("X-Steady-Proxy-Mode"); m != "live" {
 		t.Fatalf("want live mode after early commit, got %q", m)
 	}
 }
@@ -954,7 +954,7 @@ func TestResponsesGenericEventNamesStillComplete(t *testing.T) {
 
 func TestErrorWriterForPath(t *testing.T) {
 	rec := httptest.NewRecorder()
-	errorWriterFor("/v1/responses")(rec, true, 503, "api_error", "cc-retry-proxy: overloaded", 3, "responses_overloaded")
+	errorWriterFor("/v1/responses")(rec, true, 503, "api_error", "steady-proxy: overloaded", 3, "responses_overloaded")
 	if rec.Header().Get("X-Should-Retry") != "true" || rec.Header().Get("Retry-After") != "3" {
 		t.Fatalf("retry headers missing: %v", rec.Header())
 	}
@@ -1092,7 +1092,7 @@ func TestE2EResponsesEarlyCommitDisabledBuffers(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if m := rec.Header().Get("X-CC-Retry-Proxy-Mode"); m != "buffered" {
+	if m := rec.Header().Get("X-Steady-Proxy-Mode"); m != "buffered" {
 		t.Fatalf("early-commit disabled must buffer to terminal (mode=buffered), got %q", m)
 	}
 	if !strings.Contains(rec.Body.String(), "response.completed") {

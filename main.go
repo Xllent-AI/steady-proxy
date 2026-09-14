@@ -1,4 +1,4 @@
-// cc-retry-proxy — a transactional, self-healing reverse proxy for Claude Code
+// steady-proxy — a transactional, self-healing reverse proxy for Claude Code
 // (Anthropic Messages, POST /v1/messages) and Codex (OpenAI Responses, POST
 // /v1/responses).
 //
@@ -57,7 +57,7 @@
 // re-send cannot double-execute client-local tools. (Do NOT enable auto-retry if
 // you use server-side / remote MCP tools without their own idempotency keys.)
 //
-// Stdlib only. Build: `go build -o cc-retry-proxy .`
+// Stdlib only. Build: `go build -o steady-proxy .`
 package main
 
 import (
@@ -176,7 +176,7 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf("cc-retry-proxy %s listening on http://%s -> %s  (transactional: /v1/messages + /v1/responses, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
+	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: /v1/messages + /v1/responses, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
 		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
 	log.Fatal(srv.ListenAndServe())
 }
@@ -228,7 +228,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// 413 for the Anthropic wire but normalizes to 400 for Responses, since Codex
 		// ignores x-should-retry and would re-send a 413 to its retry cap.
 		st, ty := surfaceFor(r.URL.Path, failure{status: http.StatusRequestEntityTooLarge, atype: "invalid_request_error"})
-		writeErr(w, false, st, ty, "cc-retry-proxy: request body exceeds limit", 0, "request_too_large")
+		writeErr(w, false, st, ty, programName+": request body exceeds limit", 0, "request_too_large")
 		return
 	}
 	if err != nil {

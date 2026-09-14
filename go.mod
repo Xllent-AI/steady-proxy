@@ -1,3 +1,3 @@
-module cc-retry-proxy
+module steady-proxy
 
 go 1.26

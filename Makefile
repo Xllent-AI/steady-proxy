@@ -8,7 +8,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.bui
 .PHONY: build docker-build test version
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o cc-retry-proxy .
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o steady-proxy .
 
 docker-build:
 	docker build \
@@ -16,11 +16,11 @@ docker-build:
 		--build-arg COMMIT="$(COMMIT)" \
 		--build-arg BUILD_DATE="$(BUILD_DATE)" \
 		--build-arg DIRTY="$(DIRTY)" \
-		-t cc-retry-proxy:$(VERSION) \
-		-t cc-retry-proxy:latest .
+		-t steady-proxy:$(VERSION) \
+		-t steady-proxy:latest .
 
 test:
 	go test ./...
 
 version: build
-	./cc-retry-proxy --version
+	./steady-proxy --version

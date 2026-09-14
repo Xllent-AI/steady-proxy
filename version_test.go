@@ -37,7 +37,7 @@ func TestVersionInfoPrefersStampedValues(t *testing.T) {
 }
 
 func TestApplyVCSBuildSettingsFillsMissingValues(t *testing.T) {
-	vi := versionInfo{Program: "cc-retry-proxy", Version: "dev"}
+	vi := versionInfo{Program: "steady-proxy", Version: "dev"}
 	applyVCSBuildSettings(&vi, []debug.BuildSetting{
 		{Key: "vcs.revision", Value: "1234567890abcdef"},
 		{Key: "vcs.time", Value: "2026-07-05T05:01:00Z"},
@@ -59,7 +59,7 @@ func TestVersionCLIOutput(t *testing.T) {
 	if !ok {
 		t.Fatalf("--version not recognized")
 	}
-	if !strings.Contains(out, "cc-retry-proxy version=1.2.3") || !strings.Contains(out, "commit=abcdef1234567890") {
+	if !strings.Contains(out, "steady-proxy version=1.2.3") || !strings.Contains(out, "commit=abcdef1234567890") {
 		t.Fatalf("unexpected version output: %q", out)
 	}
 	if _, ok := versionCLIOutput([]string{"--help"}); ok {
@@ -82,7 +82,7 @@ func TestVersionEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode version response: %v", err)
 	}
-	if got.Program != "cc-retry-proxy" || got.Version != "1.2.3" || got.Commit != "abcdef1234567890" {
+	if got.Program != "steady-proxy" || got.Version != "1.2.3" || got.Commit != "abcdef1234567890" {
 		t.Fatalf("unexpected version response: %+v", got)
 	}
 

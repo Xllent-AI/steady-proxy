@@ -3,7 +3,7 @@
 This catalog is derived from **real Claude Code session transcripts** on this
 machine (1916 sessions under `~/.claude/projects`). Each row lists how the error
 surfaces, its root cause, whether a blind retry can fix it, and what
-`cc-retry-proxy` does. The Go tests in `*_test.go` target every row.
+`steady-proxy` does. The Go tests in `*_test.go` target every row.
 
 **Design principle (blind stabilizer):** the upstream gateway owns retry
 intelligence; this proxy only keeps the client alive. The policy is one rule —
@@ -107,7 +107,7 @@ via `code`; the client always sees `503`.
 | `API Error: N Internal server error` | 500 | **convert** → `503` |
 | `API Error: Server is temporarily limiting requests … Rate limited` | 429 | **convert** → `503`, preserve `Retry-After` |
 | `API Error: Request rejected (N) · temporary capacity issue` | 5xx | **convert** → `503` |
-| `cc-retry-proxy: No available providers` and similar capacity 5xx | 5xx | **convert** → `503` |
+| `steady-proxy: No available providers` and similar capacity 5xx | 5xx | **convert** → `503` |
 | mid-stream `event: error` with `overloaded_error` / `rate_limit_error` | after 200 | **convert** → `503` (classified 529/429 for logs, masked on the wire) |
 
 ## 4. Request-shape errors  → surface (the ONLY things we don't retry)

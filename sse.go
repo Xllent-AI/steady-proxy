@@ -35,7 +35,7 @@ func (s *spool) write(p []byte) error {
 			s.mem.Write(p)
 			return nil
 		}
-		f, err := os.CreateTemp(cfg.spoolDir, "ccrp-*.sse")
+		f, err := os.CreateTemp(cfg.spoolDir, "steady-proxy-*.sse")
 		if err != nil {
 			return err
 		}
@@ -324,7 +324,7 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 			w.Header()[k] = v
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("X-CC-Retry-Proxy-Mode", mode)
+		w.Header().Set("X-Steady-Proxy-Mode", mode)
 		if st != nil {
 			st.mode = mode
 		}
