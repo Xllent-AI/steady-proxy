@@ -4,20 +4,22 @@
 # guards against future files accidentally leaking into the image.
 *
 
-# Allow only what's required to compile the two binaries: the root Go sources
-# and the single testupstream source. Re-include the directory so Docker
-# descends into it, then re-exclude its contents and allow only main.go — so a
-# future file dropped under testupstream/ can't silently enter the context.
+# Allow only what's required to compile the two binaries (plus the LICENSE,
+# which ships in the image): the root Go sources and the single testupstream
+# source. Re-include the directory so Docker descends into it, then re-exclude
+# its contents and allow only main.go — so a future file dropped under
+# testupstream/ can't silently enter the context.
 !go.mod
 !VERSION
+!LICENSE
 !*.go
 !testupstream/
 testupstream/*
 !testupstream/main.go
 
 # Copy only enough Git metadata for Dockerfile to stamp the binary with the
-# current commit. Do not include .git/config, hooks, objects, or logs.
-!.git/
+# current commit. Do not include .git/config, hooks, objects, or logs — do NOT
+# add a bare `!.git/` here: it re-includes the whole directory.
 !.git/HEAD
 !.git/refs/
 !.git/refs/**

@@ -6,21 +6,34 @@
 # env, so we isolate with `env -i HOME=<temp>` to force ANTHROPIC_BASE_URL at the
 # proxy. Credentials for the real smoke come from the host's $ANTHROPIC_AUTH_TOKEN.
 #
-# Usage:  ./test/live.sh            # mock + (real if token present) + long-gen
-#         DO_REAL=0 ./test/live.sh  # skip the real-gateway smoke
+# Requires: docker (compose v2), curl, and the `claude` CLI on PATH.
+# Runs ~10 minutes with the default long-generation case.
+#
+# Usage:  ./test/live.sh            # mock faults + long-gen (no real requests)
 #         DO_LONG=0 ./test/live.sh  # skip the >300s long-generation case
+#         DO_REAL=1 PROXY_UPSTREAM_URL=https://... ./test/live.sh
+#                                   # also send ONE real (billed) request through
+#                                   # the proxy to your gateway using
+#                                   # $ANTHROPIC_AUTH_TOKEN
 set -uo pipefail
+
+for tool in docker curl claude; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool"; exit 2; }
+done
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 PROXY=""
 MOCK=""
 TEST_PROJECT="steady-proxy-test-$$"
-TEST_DIR="$(mktemp -d /tmp/cc-live.XXXXXX)"
+TEST_DIR="$(mktemp -d /tmp/steady-live.XXXXXX)"
 MODEL="${MODEL:-sonnet}"
 HOME_T="$TEST_DIR/home"
 mkdir -p "$HOME_T"
 REAL_TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
-DO_REAL="${DO_REAL:-1}"; [ -z "$REAL_TOKEN" ] && DO_REAL=0
+DO_REAL="${DO_REAL:-0}"
+if [ "$DO_REAL" = 1 ] && { [ -z "$REAL_TOKEN" ] || [ -z "${PROXY_UPSTREAM_URL:-}" ]; }; then
+  echo "DO_REAL=1 needs ANTHROPIC_AUTH_TOKEN and PROXY_UPSTREAM_URL"; exit 2
+fi
 DO_LONG="${DO_LONG:-1}"
 OUT="$TEST_DIR/out"; ERR="$TEST_DIR/err"
 COMPOSE_LOG="$TEST_DIR/compose.log"

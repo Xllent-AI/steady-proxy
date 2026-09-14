@@ -20,7 +20,7 @@ docker-build:
 		-t steady-proxy:latest .
 
 test:
-	go test ./...
+	go test -race ./...
 
 version: build
 	./steady-proxy --version

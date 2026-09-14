@@ -32,5 +32,6 @@ RUN set -eu; \
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/steady-proxy /steady-proxy
 COPY --from=build /out/testupstream /testupstream
+COPY --from=build /src/LICENSE /LICENSE
 EXPOSE 8789
 ENTRYPOINT ["/steady-proxy"]
