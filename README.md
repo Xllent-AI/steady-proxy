@@ -196,8 +196,10 @@ Then point Claude Code at it (next section). Logs: `docker compose logs -f proxy
 
 ## Build / test from source
 
+Requires Go 1.23+ (standard library only, no third-party dependencies).
+
 ```bash
-cd steady-proxy
+git clone https://github.com/Xllent-AI/steady-proxy && cd steady-proxy
 make build                  # stamps VERSION + git commit + build date
 ./steady-proxy --version
 go test -race ./...          # unit + integration tests
@@ -462,3 +464,7 @@ stats, and any model-swap decision.
   robustness for long turns, add resumable responses in your in-house shim
   (OpenAI/Azure `background:true` + `starting_after=<sequence>`).
 - Bind to loopback only; this is an unauthenticated local proxy.
+
+## License
+
+[MIT](LICENSE) © Xllent AI.

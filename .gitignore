@@ -1,8 +1,9 @@
 # compiled binary
 /steady-proxy
 *.test
-# local Go build cache (GOCACHE=./.gocache) — generated artifacts, never commit
+# local Go build cache / temp (GOCACHE=./.gocache, GOTMPDIR=./.gotmp) — generated artifacts, never commit
 /.gocache/
+/.gotmp/
 # logs from the live harness
 test/*.log
 # saved request/response dumps (PROXY_REQUEST_LOG_DIR) — may contain prompts.
