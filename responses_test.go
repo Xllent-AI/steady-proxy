@@ -1086,7 +1086,7 @@ func TestE2EResponsesEarlyCommitDisabledBuffers(t *testing.T) {
 	defer up.Close()
 	setupForTest(up.URL)
 	cfg.responsesEarlyCommit = false
-	t.Cleanup(func() { cfg = loadConfig() }) // don't leak the override to later tests
+	t.Cleanup(func() { cfg = testConfig() }) // don't leak the override to later tests
 
 	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
 	if rec.Code != 200 {
@@ -1175,7 +1175,7 @@ func TestE2EResponsesRequestTimeoutRetries(t *testing.T) {
 				}))
 				defer up.Close()
 				setupForTest(up.URL)
-				t.Cleanup(func() { cfg = loadConfig() })
+				t.Cleanup(func() { cfg = testConfig() })
 				cfg.responsesEarlyCommit = false
 				cfg.responsesBufferMs = time.Hour
 				cfg.txLocalRetries = outcome.localRetries

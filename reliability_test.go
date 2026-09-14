@@ -147,7 +147,7 @@ func TestSpoolStorageFailureCanRecover(t *testing.T) {
 	}))
 	defer up.Close()
 	setupForTest(up.URL)
-	t.Cleanup(func() { cfg = loadConfig() })
+	t.Cleanup(func() { cfg = testConfig() })
 	cfg.maxBufferMem = 1
 	cfg.spoolDir = dir
 	cfg.responsesEarlyCommit = false
@@ -199,7 +199,7 @@ func TestBufferWindowIncludesHeadersAndLocalRetries(t *testing.T) {
 			}))
 			defer up.Close()
 			setupForTest(up.URL)
-			t.Cleanup(func() { cfg = loadConfig() })
+			t.Cleanup(func() { cfg = testConfig() })
 			cfg.responsesEarlyCommit = false
 			cfg.responsesBufferMs = 120 * time.Millisecond
 			cfg.txLocalRetries = 1
@@ -244,7 +244,7 @@ func TestHTTP2HeaderDeadlineRemainsRetryable(t *testing.T) {
 	up.StartTLS()
 	defer up.Close()
 	setupForTest(up.URL)
-	t.Cleanup(func() { cfg = loadConfig() })
+	t.Cleanup(func() { cfg = testConfig() })
 	client = up.Client()
 	client.CheckRedirect = stopRedirect
 	cfg.responsesBufferMs = 100 * time.Millisecond
@@ -265,7 +265,7 @@ func TestProxyOnceAbortsTruncatedBody(t *testing.T) {
 	}))
 	defer up.Close()
 	setupForTest(up.URL)
-	t.Cleanup(func() { cfg = loadConfig() })
+	t.Cleanup(func() { cfg = testConfig() })
 	proxy := httptest.NewServer(http.HandlerFunc(handle))
 	defer proxy.Close()
 	logs := captureLogs(t, func() {
@@ -306,7 +306,7 @@ func TestUpstreamRedirectIsNotFollowed(t *testing.T) {
 	}))
 	defer up.Close()
 	setupForTest(up.URL)
-	t.Cleanup(func() { cfg = loadConfig() })
+	t.Cleanup(func() { cfg = testConfig() })
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	r.Header.Set("X-Api-Key", "test-sentinel")
 	resp, _, err := roundTrip(r.Context(), r, []byte(`{}`))
@@ -330,7 +330,7 @@ func TestCodexDisabledRetriesAreTerminal(t *testing.T) {
 			}))
 			defer up.Close()
 			setupForTest(up.URL)
-			t.Cleanup(func() { cfg = loadConfig() })
+			t.Cleanup(func() { cfg = testConfig() })
 			cfg.sdkRetryCap = 0
 			cfg.txLocalRetries = 3
 			rec := doStreamResponses(`{"stream":` + stream + `,"model":"test"}`)
@@ -353,7 +353,7 @@ func TestErrorArchiveObeysByteIdle(t *testing.T) {
 			}))
 			defer up.Close()
 			setupForTest(up.URL)
-			t.Cleanup(func() { cfg = loadConfig() })
+			t.Cleanup(func() { cfg = testConfig() })
 			cfg.requestLogDir = t.TempDir()
 			cfg.txLocalRetries = 0
 			cfg.upstreamByteIdle = 30 * time.Millisecond

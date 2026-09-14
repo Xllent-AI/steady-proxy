@@ -12,22 +12,37 @@ import (
 	"time"
 )
 
-func setupForTest(upURL string) {
-	cfg = loadConfig()
-	cfg.upstream = strings.TrimRight(upURL, "/")
-	h := cfg.upstream
-	if i := strings.Index(h, "://"); i >= 0 {
-		h = h[i+3:]
+// testConfig is the binary's default configuration with a placeholder upstream.
+// It reads no real environment, so a developer's exported PROXY_* variables
+// cannot change what the suite tests.
+func testConfig() config {
+	c, err := parseConfig(func(k string) (string, bool) {
+		if k == "PROXY_UPSTREAM_URL" {
+			return "http://upstream.invalid", true
+		}
+		return "", false
+	})
+	if err != nil {
+		panic(err)
 	}
-	cfg.upstreamHost = h
+	return c
+}
+
+func setupForTest(upURL string) {
+	cfg = testConfig()
+	up, host, err := parseUpstream(upURL)
+	if err != nil {
+		panic(err)
+	}
+	cfg.upstream, cfg.upstreamHost = up, host
 	cfg.upstreamByteIdle = 3 * time.Second
 	client = &http.Client{CheckRedirect: stopRedirect, Transport: &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Second}}
 }
 
 func useDefaultConfig(t *testing.T) {
 	t.Helper()
-	cfg = loadConfig()
-	t.Cleanup(func() { cfg = loadConfig() })
+	cfg = testConfig()
+	t.Cleanup(func() { cfg = testConfig() })
 }
 
 func doStream(body string) *httptest.ResponseRecorder {

@@ -55,21 +55,21 @@ func TestLoadRefusalFallback(t *testing.T) {
 				os.Unsetenv("PROXY_REFUSAL_FALLBACK_MODEL")
 			}
 		})
-		if got := loadRefusalFallback(); got != "claude-opus-5" {
+		if got := loadRefusalFallback(os.LookupEnv); got != "claude-opus-5" {
 			t.Fatalf("default = %q, want claude-opus-5", got)
 		}
 	})
 	for _, off := range []string{"", "off", "None", "disabled", "  "} {
 		t.Run("disabled="+off, func(t *testing.T) {
 			t.Setenv("PROXY_REFUSAL_FALLBACK_MODEL", off)
-			if got := loadRefusalFallback(); got != "" {
+			if got := loadRefusalFallback(os.LookupEnv); got != "" {
 				t.Fatalf("%q should disable the feature, got %q", off, got)
 			}
 		})
 	}
 	t.Run("custom", func(t *testing.T) {
 		t.Setenv("PROXY_REFUSAL_FALLBACK_MODEL", "claude-sonnet-5")
-		if got := loadRefusalFallback(); got != "claude-sonnet-5" {
+		if got := loadRefusalFallback(os.LookupEnv); got != "claude-sonnet-5" {
 			t.Fatalf("custom = %q, want claude-sonnet-5", got)
 		}
 	})

@@ -288,7 +288,7 @@ func TestRequestLogDisabledWritesNothing(t *testing.T) {
 		io.WriteString(w, goodStream)
 	}))
 	defer up.Close()
-	setupForTest(up.URL) // loadConfig leaves requestLogDir == ""
+	setupForTest(up.URL) // testConfig leaves requestLogDir == ""
 
 	rec := doStream(`{"stream":true,"model":"m"}`)
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "message_stop") {

@@ -31,7 +31,7 @@ data: {"type":"message_stop"}
 
 `
 
-func init() { cfg = loadConfig() }
+func init() { cfg = testConfig() }
 
 func capture(t *testing.T, s string) (*httptest.ResponseRecorder, *failure) {
 	t.Helper()

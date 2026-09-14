@@ -408,7 +408,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | Var | Default | Meaning |
 |---|---|---|
 | `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
-| `PROXY_UPSTREAM_URL` | `https://your-gateway.example.com` | the real gateway (set via `.env`) |
+| `PROXY_UPSTREAM_URL` | *(required)* | the real gateway: `http(s)://host[:port][/prefix]`, set via `.env`. The proxy refuses to start without it |
 | `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). **Claude/Stainless-specific:** the count comes from the `X-Stainless-Retry-Count` header the Anthropic SDK sends. **Codex does not send it**, so on `/v1/responses` the count is always 0 and any positive cap is effectively unlimited — conversion is bounded instead by Codex's own `request_max_retries`/`stream_max_retries`. With `0`, Responses failures surface as terminal HTTP 400 because Codex ignores `X-Should-Retry: false` |
 | `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional attempt (`/v1/messages` and `/v1/responses`). `1` means one extra upstream try before returning a retryable response to the client. For Codex this is the ideal path — an overload is ridden out and Codex never sees an error |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
@@ -422,7 +422,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
 | `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |
 | `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | when a request completes with `stop_reason: "refusal"` or Fable returns a pre-stream safeguards block, silently re-issue the same request with this model instead of returning the refusal (logs a `WARN`). Fires at most once per request (a refusal from the fallback model is delivered as-is) and only before anything is committed downstream; every non-model field is preserved. Set to `off`/`none`/empty to disable. Stream refusal detection still works with `PROXY_VALIDATE_JSON=0`; full JSON validation is still recommended |
-| `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
+| `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line; `0` = no header timeout (the attempt is still bounded by `PROXY_MAX_REQUEST_DURATION_MS`) |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a buffered response; also bounds each SSE event, including unfinished lines, before parsing |
 | `PROXY_MAX_REQUEST_BYTES` | `67108864` | hard cap on a client request body; a larger request is rejected with `413` (`400` on `/v1/responses`) rather than truncated |
@@ -431,6 +431,10 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_SPOOL_DIR` | `$TMPDIR` | where large responses spill (use tmpfs for sensitive prompts) |
 | `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save each request/response JSON archive there (see below) |
 | `PROXY_VERBOSE` | off | set `1` for per-decision logs |
+
+A value that is not an integer, or is below its knob's minimum (for example
+`PROXY_UPSTREAM_BYTE_IDLE_MS=0`), stops the proxy at startup with a message
+naming every offending variable — nothing silently falls back to a default.
 
 Under `docker-compose.yml` three of these differ from the binary defaults.
 `PROXY_LISTEN_ADDR` is fixed to `0.0.0.0:8789` — the container's own interface;

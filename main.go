@@ -64,12 +64,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -104,39 +106,71 @@ type config struct {
 	verbose              bool
 }
 
-func loadConfig() config {
-	up := strings.TrimRight(env("PROXY_UPSTREAM_URL", "https://your-gateway.example.com"), "/")
-	host := up
-	if i := strings.Index(host, "://"); i >= 0 {
-		host = host[i+3:]
+// loadConfig reads every PROXY_* variable from the process environment. It
+// fails on a missing upstream or any malformed value instead of running on a
+// default the operator did not choose.
+func loadConfig() (config, error) { return parseConfig(os.LookupEnv) }
+
+// parseConfig is loadConfig over an arbitrary environment (tests inject one).
+// Every problem is collected so one startup failure names all of them.
+func parseConfig(lookup func(string) (string, bool)) (config, error) {
+	e := &envReader{lookup: lookup}
+	up, host, err := parseUpstream(e.str("PROXY_UPSTREAM_URL", ""))
+	if err != nil {
+		e.errs = append(e.errs, err.Error())
 	}
-	return config{
-		listenAddr:           env("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
+	c := config{
 		upstream:             up,
 		upstreamHost:         host,
-		maxBufferMem:         envInt64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20),              // 1 MiB in RAM, then temp file
-		maxResponseBytes:     envInt64("PROXY_MAX_RESPONSE_BYTES", 128<<20),              // 128 MiB hard cap
-		maxRequestBytes:      envInt64("PROXY_MAX_REQUEST_BYTES", 64<<20),                // 64 MiB request cap
-		respHeaderTO:         envDur("PROXY_RESP_HEADER_TIMEOUT_MS", 60000),              // wait for upstream status line
-		upstreamByteIdle:     envDur("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000),              // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
-		keepaliveMs:          envDur("PROXY_KEEPALIVE_MS", 600000),                       // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
-		wfKeepaliveMs:        envDur("PROXY_WORKFLOW_KEEPALIVE_MS", 10000),               // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
-		responsesKeepaliveMs: envDur("PROXY_RESPONSES_KEEPALIVE_MS", 30000),              // OpenAI Responses route (Codex), applies ONLY in early-commit mode: bounds a silent start (reasoning with no output) before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead (see config.keepaliveWindow). Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
-		responsesBufferMs:    envDur("PROXY_RESPONSES_BUFFER_MS", 600000),                // Responses (Codex) hold used ONLY when early-commit is off: buffer to the terminal, committing live at this window as a safety valve (the /v1/messages policy applied to Responses). Responses-OWNED — independent of PROXY_KEEPALIVE_MS — so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it (nothing is forwarded while buffering).
-		responsesEarlyCommit: os.Getenv("PROXY_RESPONSES_EARLY_COMMIT") != "0",           // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
-		responsesReplayBytes: envNonNegInt("PROXY_RESPONSES_REPLAY_DELTA_BYTES", 64<<10), // collapse tiny adjacent Codex text deltas during buffered/prefix replay so a completed turn cannot burst thousands of app-server notifications into the TUI; 0 preserves byte-for-byte replay. Live events remain untouched.
-		deadlineMargin:       envDur("PROXY_DEADLINE_MARGIN_MS", 25000),                  // finish before the client's own timeout
-		maxRequestDur:        envDur("PROXY_MAX_REQUEST_DURATION_MS", 1500000),           // absolute ceiling per attempt (25m)
-		sdkRetryCap:          int(envInt64("PROXY_SDK_RETRY_CAP", 100)),                  // backstop only; Claude Code's own retry cap still applies
-		txLocalRetries:       envNonNegInt("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0),
-		localBackoffCap:      envDur("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000),
-		spoolDir:             env("PROXY_SPOOL_DIR", os.TempDir()),
-		requestLogDir:        env("PROXY_REQUEST_LOG_DIR", ""),              // "" = disabled; set a dir to save each request/response archive
-		validateJSON:         os.Getenv("PROXY_VALIDATE_JSON") != "0",       // default on
-		normalizeToolJSON:    os.Getenv("PROXY_NORMALIZE_TOOL_JSON") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
-		refusalFallback:      loadRefusalFallback(),                         // default claude-opus-5; off/none/empty disables
-		verbose:              os.Getenv("PROXY_VERBOSE") == "1",
+		listenAddr:           e.str("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
+		maxBufferMem:         e.int64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20, 0),               // 1 MiB in RAM, then temp file
+		maxResponseBytes:     e.int64("PROXY_MAX_RESPONSE_BYTES", 128<<20, 1),               // 128 MiB hard cap
+		maxRequestBytes:      e.int64("PROXY_MAX_REQUEST_BYTES", 64<<20, 1),                 // 64 MiB request cap
+		respHeaderTO:         e.ms("PROXY_RESP_HEADER_TIMEOUT_MS", 60000, 0),                // wait for upstream status line
+		upstreamByteIdle:     e.ms("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000, 1),                // abort+retry a wedged silent upstream (covers a sparse turn within the 600s window)
+		keepaliveMs:          e.ms("PROXY_KEEPALIVE_MS", 600000, 0),                         // stay fully transactional up to this long, then commit + stream live. REQUIRES *both* client abort timers to exceed it: CLAUDE_CODE_CONNECT_TIMEOUT_MS (~660000) and API_TIMEOUT_MS (~720000). 0 = pure transactional.
+		wfKeepaliveMs:        e.ms("PROXY_WORKFLOW_KEEPALIVE_MS", 10000, 0),                 // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
+		responsesKeepaliveMs: e.ms("PROXY_RESPONSES_KEEPALIVE_MS", 30000, 0),                // OpenAI Responses route (Codex), applies ONLY in early-commit mode: bounds a silent start (reasoning with no output) before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead (see config.keepaliveWindow). Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
+		responsesBufferMs:    e.ms("PROXY_RESPONSES_BUFFER_MS", 600000, 0),                  // Responses (Codex) hold used ONLY when early-commit is off: buffer to the terminal, committing live at this window as a safety valve (the /v1/messages policy applied to Responses). Responses-OWNED — independent of PROXY_KEEPALIVE_MS — so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it (nothing is forwarded while buffering).
+		responsesEarlyCommit: e.str("PROXY_RESPONSES_EARLY_COMMIT", "1") != "0",             // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
+		responsesReplayBytes: int(e.int64("PROXY_RESPONSES_REPLAY_DELTA_BYTES", 64<<10, 0)), // collapse tiny adjacent Codex text deltas during buffered/prefix replay so a completed turn cannot burst thousands of app-server notifications into the TUI; 0 preserves byte-for-byte replay. Live events remain untouched.
+		deadlineMargin:       e.ms("PROXY_DEADLINE_MARGIN_MS", 25000, 0),                    // finish before the client's own timeout
+		maxRequestDur:        e.ms("PROXY_MAX_REQUEST_DURATION_MS", 1500000, 1),             // absolute ceiling per attempt (25m)
+		sdkRetryCap:          int(e.int64("PROXY_SDK_RETRY_CAP", 100, 0)),                   // backstop only; Claude Code's own retry cap still applies
+		txLocalRetries:       int(e.int64("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0, 0)),
+		localBackoffCap:      e.ms("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000, 0),
+		spoolDir:             e.str("PROXY_SPOOL_DIR", os.TempDir()),
+		requestLogDir:        e.str("PROXY_REQUEST_LOG_DIR", ""),             // "" = disabled; set a dir to save each request/response archive
+		validateJSON:         e.str("PROXY_VALIDATE_JSON", "1") != "0",       // default on
+		normalizeToolJSON:    e.str("PROXY_NORMALIZE_TOOL_JSON", "1") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
+		refusalFallback:      loadRefusalFallback(lookup),                    // default claude-opus-5; off/none/empty disables
+		verbose:              e.str("PROXY_VERBOSE", "") == "1",
 	}
+	if len(e.errs) > 0 {
+		return config{}, errors.New(strings.Join(e.errs, "\n  "))
+	}
+	return c, nil
+}
+
+// parseUpstream validates PROXY_UPSTREAM_URL: an http(s) URL with a host and
+// an optional path prefix. The returned upstream has no trailing slash (request
+// paths are appended verbatim); host is what the forwarded Host header carries.
+func parseUpstream(raw string) (upstream, host string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", errors.New("PROXY_UPSTREAM_URL is required, e.g. https://gateway.example.com")
+	}
+	u, perr := url.Parse(raw)
+	if perr != nil {
+		return "", "", fmt.Errorf("PROXY_UPSTREAM_URL=%q: %v", raw, perr)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", "", fmt.Errorf("PROXY_UPSTREAM_URL=%q: must be http(s)://host[:port][/prefix]", raw)
+	}
+	if strings.ContainsAny(raw, "?#") { // covers a bare "?"/"#", which url.Parse reports as empty
+		return "", "", fmt.Errorf("PROXY_UPSTREAM_URL=%q: must not carry a query or fragment", raw)
+	}
+	return strings.TrimRight(raw, "/"), u.Host, nil
 }
 
 var (
@@ -149,7 +183,11 @@ func main() {
 		return
 	}
 	log.SetFlags(log.LstdFlags) // timestamp every line at second resolution: date + HH:MM:SS
-	cfg = loadConfig()
+	c, err := loadConfig()
+	if err != nil {
+		log.Fatalf(programName+": invalid configuration:\n  %s", err)
+	}
+	cfg = c
 
 	client = &http.Client{
 		CheckRedirect: stopRedirect,
@@ -948,8 +986,8 @@ func isModelSafeguardRefusal(f failure) bool {
 // completes with stop_reason "refusal". Unset -> default claude-opus-5. Set to
 // empty / "off" / "none" / "disabled" -> the feature is off and a refusal is
 // delivered to the client unchanged (the historical behavior).
-func loadRefusalFallback() string {
-	v, ok := os.LookupEnv("PROXY_REFUSAL_FALLBACK_MODEL")
+func loadRefusalFallback(lookup func(string) (string, bool)) string {
+	v, ok := lookup("PROXY_REFUSAL_FALLBACK_MODEL")
 	if !ok {
 		return "claude-opus-5"
 	}
@@ -1064,29 +1102,40 @@ func dash(s string) string {
 	return s
 }
 
-func env(k, d string) string {
-	if v := os.Getenv(k); v != "" {
+// envReader reads configuration variables and records every malformed value
+// (not an integer, or below the knob's minimum) so parseConfig can report them
+// all at once. An unset or empty variable yields the default.
+type envReader struct {
+	lookup func(string) (string, bool)
+	errs   []string
+}
+
+func (e *envReader) str(k, d string) string {
+	if v, ok := e.lookup(k); ok && v != "" {
 		return v
 	}
 	return d
 }
-func envInt64(k string, d int64) int64 {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
-		}
+
+func (e *envReader) int64(k string, d, minAllowed int64) int64 {
+	v, ok := e.lookup(k)
+	if !ok || v == "" {
+		return d
 	}
-	return d
-}
-func envNonNegInt(k string, d int) int {
-	n := int(envInt64(k, int64(d)))
-	if n < 0 {
-		return 0
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		e.errs = append(e.errs, fmt.Sprintf("%s=%q: not an integer", k, v))
+		return d
+	}
+	if n < minAllowed {
+		e.errs = append(e.errs, fmt.Sprintf("%s=%d: must be >= %d", k, n, minAllowed))
+		return d
 	}
 	return n
 }
-func envDur(k string, dms int64) time.Duration {
-	return time.Duration(envInt64(k, dms)) * time.Millisecond
+
+func (e *envReader) ms(k string, d, minAllowed int64) time.Duration {
+	return time.Duration(e.int64(k, d, minAllowed)) * time.Millisecond
 }
 func atoiSafe(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
