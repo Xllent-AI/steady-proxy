@@ -16,8 +16,8 @@ services:
         DIRTY: "${PROXY_DIRTY:-unknown}"
     image: steady-proxy:latest
     # Run as the host user so PROXY_REQUEST_LOG_DIR dumps are owned by you, not
-    # root (readable without sudo). Falls back to 1000:1000; override by exporting
-    # UID/GID or setting them in .env if your host user differs.
+    # root (readable without sudo). Bash does not export UID and has no GID, so
+    # this falls back to 1000:1000 unless you set both in .env (or export them).
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"

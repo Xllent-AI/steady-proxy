@@ -14,6 +14,25 @@ Claude Code) and the **OpenAI Responses** API (`POST /v1/responses`, Codex with
 stream interpretation (terminal event, in-band error shape, usage) differs per
 wire — see `wireModel` in `wire.go`.
 
+## Security
+
+- The proxy is **unauthenticated**. Keep `PROXY_LISTEN_ADDR` on loopback (the
+  default; under docker compose the container listens on `0.0.0.0:8789` but the
+  published port is bound to `127.0.0.1` — keep it that way). Anyone who can
+  reach the port can relay arbitrary requests to your gateway with whatever
+  credentials they send, and read `/__version`.
+- It forwards your `Authorization` / `x-api-key` / `anthropic-*` headers to
+  `PROXY_UPSTREAM_URL` verbatim. It never follows redirects, so credentials are
+  only ever sent to that one host (or through the forward proxy you configured
+  via `HTTP_PROXY`/`HTTPS_PROXY`, if any).
+- Request bodies are held in memory; response bodies are buffered in memory and
+  spill past `PROXY_MAX_BUFFER_MEM_BYTES` to unlinked temp files under
+  `PROXY_SPOOL_DIR`. The request body is your conversation and the response is
+  the model's output — use a tmpfs spool dir if that matters to you.
+- With `PROXY_REQUEST_LOG_DIR` set, **full prompts and responses are written to
+  disk in cleartext** and the directory grows without bound. It is a debugging
+  aid, off by default — see [Saving request/response data](#saving-requestresponse-data).
+
 ## Design principle: a blind stabilizer
 
 This proxy is **not** a smart retry brain — your gateway already owns retry
@@ -194,6 +213,12 @@ PROXY_UPSTREAM_URL=https://your-gateway.example.com docker compose up -d --build
 
 Then point Claude Code at it (next section). Logs: `docker compose logs -f proxy`.
 
+The container runs as `${UID:-1000}:${GID:-1000}` so that files under `./logs`
+are owned by you rather than root. Bash does not export `UID` and has no `GID`,
+so if your user is not `1000:1000`, add `UID=<your uid>` and `GID=<your gid>` to
+`.env` (or export both before `docker compose up`; an already-exported value
+wins over `.env`).
+
 ## Build / test from source
 
 Requires Go 1.23+ (standard library only, no third-party dependencies).
@@ -202,14 +227,17 @@ Requires Go 1.23+ (standard library only, no third-party dependencies).
 git clone https://github.com/Xllent-AI/steady-proxy && cd steady-proxy
 make build                  # stamps VERSION + git commit + build date
 ./steady-proxy --version
-go test -race ./...          # unit + integration tests
-./test/live.sh               # live: real `claude -p` -> proxy -> mock + real gateway
+go test -race ./...          # unit + integration tests (same as `make test`)
+./test/live.sh               # live: real `claude -p` -> dockerized proxy -> mock faults
 ```
 
-The live harness uses a separate Compose project, test image, and random loopback
-ports. Its real-gateway smoke test also uses that isolated stack. Cleanup removes
-only the test project, including on interruption; failed-run logs are retained in
-the printed temporary directory.
+The live harness needs Docker (compose v2), `curl`, and the `claude` CLI on
+`PATH`, and takes about 10 minutes (`DO_LONG=0` skips the >300 s case). It uses a
+separate Compose project, test image, and random loopback ports, and sends no
+real requests unless you opt in with `DO_REAL=1 PROXY_UPSTREAM_URL=…` (one billed
+call through the proxy using `$ANTHROPIC_AUTH_TOKEN`). Cleanup removes only the
+test project, including on interruption; failed-run logs are retained in the
+printed temporary directory.
 
 Run the binary directly instead of compose:
 
@@ -397,10 +425,20 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a buffered response; also bounds each SSE event, including unfinished lines, before parsing |
+| `PROXY_MAX_REQUEST_BYTES` | `67108864` | hard cap on a client request body; a larger request is rejected with `413` (`400` on `/v1/responses`) rather than truncated |
+| `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` | absolute ceiling (25 min) on one inbound client request, covering every hidden local retry inside it. On the transactional routes a client `X-Stainless-Timeout` lowers it: the deadline becomes the smaller of this ceiling and the client's timeout minus `PROXY_DEADLINE_MARGIN_MS`. Other routes (`count_tokens`, model listing, non-streaming) always use the full ceiling |
 | `PROXY_DEADLINE_MARGIN_MS` | `25000` | finish before the client's `X-Stainless-Timeout` (seconds); for short timeouts, reserve at most half the client's budget |
 | `PROXY_SPOOL_DIR` | `$TMPDIR` | where large responses spill (use tmpfs for sensitive prompts) |
 | `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save each request/response JSON archive there (see below) |
 | `PROXY_VERBOSE` | off | set `1` for per-decision logs |
+
+Under `docker-compose.yml` three of these differ from the binary defaults.
+`PROXY_LISTEN_ADDR` is fixed to `0.0.0.0:8789` — the container's own interface;
+the published port is still bound to `127.0.0.1` only, so the proxy stays
+loopback-reachable. `PROXY_RESP_HEADER_TIMEOUT_MS` defaults to `660000` (a
+gateway that gates on first output can take longer than 60 s to send headers on
+a compaction turn) and `PROXY_VERBOSE` to `1`; set either one in `.env` to
+change it.
 
 ### Optional upstream headers
 
@@ -425,6 +463,13 @@ proxy writes **one JSON archive per client request** into it:
 PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./steady-proxy
 # ./logs/v1-messages-20260621t143005-a1b2c3d4.json   (a1b2c3d4 = the correlation id)
 ```
+
+> **Debugging aid — unbounded.** There is no size cap, rotation, or retention.
+> Every request (including each `count_tokens` and `/v1/models` call) writes a
+> new file holding the full prompt and response; a busy Claude Code setup
+> produces tens of thousands of files and tens of gigabytes within weeks. Enable
+> it to reproduce a problem, then turn it off — or prune on a schedule, e.g.
+> `find "$PROXY_REQUEST_LOG_DIR" -name '*.json' -mmin +120 -delete`.
 
 Each archive uses the versioned schema `steady-proxy.payload.v2`. Bodies are
 stored as JSON `data_base64` fields with `encoding`, byte `size`, and `sha256`, so
@@ -478,7 +523,6 @@ stats, and any model-swap decision.
   robustness for long turns needs resumable responses on the gateway side
   (OpenAI/Azure `background:true` + `starting_after=<sequence>`), which this
   proxy does not implement.
-- Bind to loopback only; this is an unauthenticated local proxy.
 
 ## License
 

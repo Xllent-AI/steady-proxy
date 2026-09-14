@@ -1,6 +1,6 @@
 # Deny everything by default; the image build only needs the Go sources.
-# This keeps secrets (.env), per-request dumps and the 700 MB+ harness output
-# (logs/), compiled binaries, tests, and docs out of the build context — and
+# This keeps secrets (.env), per-request dumps and harness output (logs/ can
+# reach tens of GB), compiled binaries, tests, and docs out of the build context — and
 # guards against future files accidentally leaking into the image.
 *
 
