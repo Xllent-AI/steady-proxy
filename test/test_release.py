@@ -23,6 +23,9 @@ class ReleaseTests(unittest.TestCase):
         (self.root / "LICENSE").write_text("Test license\n")
         (self.root / ".gitignore").write_text("/dist/\n")
         self.git("init", "--quiet")
+        # Temporary repositories must not leave housekeeping running during cleanup.
+        self.git("config", "maintenance.auto", "false")
+        self.git("config", "gc.auto", "0")
         self.commit()
         self.git("tag", "v0.1.1")
         self.build = patch.object(release, "build_binary", side_effect=self.fake_build).start()
