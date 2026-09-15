@@ -1,8 +1,8 @@
-// steady-proxy — a transactional, self-healing reverse proxy for Claude Code
-// (Anthropic Messages, POST /v1/messages) and Codex (OpenAI Responses, POST
-// /v1/responses).
+// steady-proxy — a transactional, self-healing reverse proxy for API clients
+// using Anthropic Messages (POST /v1/messages) or OpenAI Responses (POST
+// /v1/responses), including Claude Code and Codex.
 //
-//	Claude Code / Codex (+ subagents) ──HTTP──▶ this proxy (loopback) ──HTTPS──▶ your gateway
+//	Agents / SDKs / applications ──HTTP──▶ this proxy (loopback) ──HTTPS──▶ your gateway
 //
 // It makes the agent's API calls survive transient gateway failures WITHOUT the
 // user ever typing "continue", and without any terminal automation. The wire

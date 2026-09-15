@@ -1,532 +1,182 @@
 # steady-proxy
 
-A tiny, transactional, self-healing reverse proxy that sits between **Claude Code**
-or **Codex** and your **gateway**, so transient gateway failures never stop a turn
-— no tmux, no terminal automation, and subagents are covered automatically.
+steady-proxy exists so agents can work continuously through common API and gateway
+disruptions, with fewer interruptions that need you to restart a turn or type
+“continue.” It runs between your **agent or API client** and its gateway,
+protecting requests from dropped connections, broken streams, overload, and
+temporary errors.
 
+It provides:
+
+- **Buffering:** hold responses until they are complete, so a broken reply can be
+  retried before the agent sees it.
+- **Retries and backoff:** turn recoverable failures into automatic client retries,
+  with optional extra retries inside the proxy.
+- **Model fallback:** retry Anthropic refusals with a configured fallback model.
+- **Stream validation and repair:** catch malformed Anthropic streams, combine
+  fragmented tool input, and smooth buffered Responses text replay.
+- **Long-turn support:** use configurable buffering windows and keepalives, with
+  a shorter window for Claude Code Workflow agents.
+- **Diagnostics:** log request outcomes and optionally archive full request and
+  response data for debugging.
+
+```text
+Agents / SDKs / applications → steady-proxy on localhost → your gateway
 ```
-Claude Code / Codex (+ subagents)  ──HTTP──▶  steady-proxy (loopback)  ──HTTPS──▶  your gateway
-```
 
-It speaks both wire formats: the **Anthropic Messages** API (`POST /v1/messages`,
-Claude Code) and the **OpenAI Responses** API (`POST /v1/responses`, Codex with
-`wire_api = "responses"`). The transactional engine is shared; only the
-stream interpretation (terminal event, in-band error shape, usage) differs per
-wire — see `wireModel` in `wire.go`.
+Stream protection is built around **Anthropic Messages** (`/v1/messages`) and
+**OpenAI Responses** (`/v1/responses`). Claude Code and Codex are supported clients;
+other agents and SDK-based applications can use these routes too, with compatible
+timeout, retry, and SSE handling. Subagents using the same API settings are covered
+without terminal automation. See [client compatibility](docs/ARCHITECTURE.md#client-compatibility)
+for the requirements and behavior of other routes.
 
-## Security
+## What to expect
 
-- The proxy is **unauthenticated**. Keep `PROXY_LISTEN_ADDR` on loopback (the
-  default; under docker compose the container listens on `0.0.0.0:8789` but the
-  published port is bound to `127.0.0.1` — keep it that way). Anyone who can
-  reach the port can relay arbitrary requests to your gateway with whatever
-  credentials they send, and read `/__version`.
-- It forwards your `Authorization` / `x-api-key` / `anthropic-*` headers to
-  `PROXY_UPSTREAM_URL` verbatim. It never follows redirects, so credentials are
-  only ever sent to that one host (or through the forward proxy you configured
-  via `HTTP_PROXY`/`HTTPS_PROXY`, if any).
-- Request bodies are held in memory; response bodies are buffered in memory and
-  spill past `PROXY_MAX_BUFFER_MEM_BYTES` to unlinked temp files under
-  `PROXY_SPOOL_DIR`. The request body is your conversation and the response is
-  the model's output — use a tmpfs spool dir if that matters to you.
-- With `PROXY_REQUEST_LOG_DIR` set, **full prompts and responses are written to
-  disk in cleartext** and the directory grows without bound. It is a debugging
-  aid, off by default — see [Saving request/response data](#saving-requestresponse-data).
+By default, Messages streams are buffered for up to 10 minutes. A response that
+finishes within that window appears all at once. Responses streams go live as soon
+as output arrives; you can enable full buffering to protect them from later stream
+failures.
 
-## Design principle: a blind stabilizer
+Before the proxy sends a response, it can discard a failed attempt and retry.
+After it starts streaming to the client, recovery depends on the client's own
+stream retry behavior. Invalid requests, exhausted retry budgets, and client
+timeouts can still stop a turn. See the [architecture guide](docs/ARCHITECTURE.md) for the
+behavior and limits of each mode.
 
-This proxy is **not** a smart retry brain — your gateway already owns retry
-intelligence (routing, provider selection, backoff). The proxy's only job is to
-keep the client alive through outages, so the whole policy is one rule:
+## Quick start
 
-> **Buffer the full response. On *any* failure, tell the client to wait and retry.
-> Only give up on a request that can never succeed as written.**
-
-"Can never succeed" = a deterministic **request-shape** error: context too long,
-malformed tool blocks, schema/validation, model-not-found. *Everything else is
-retried on purpose* — network outages, `5xx`, rate limits, capacity ("no
-available providers"), auth blocks, billing, and unknown `4xx`. A temporary block
-is ridden out, not surfaced.
-
-> Trade-off: a genuinely bad API key / exhausted billing now surfaces **late**
-> (after the retry budget) instead of failing fast. That's the accepted cost of
-> maximum steadiness. Claude Code 2.1.191 defaults to 10 retries and clamps
-> `CLAUDE_CODE_MAX_RETRIES` to **15**; `PROXY_SDK_RETRY_CAP` is only a backstop.
-> To amplify retry budget beyond the client clamp, opt in with
-> `PROXY_TRANSACTIONAL_LOCAL_RETRIES`.
-
-## What it does
-
-- For `POST /v1/messages` it runs in **transactional mode**: it buffers and
-  validates the *entire* Anthropic SSE stream and only writes `200 OK` +
-  replays it once a complete, valid `message_stop` is captured. Downstream
-  forwarding also coalesces tool/server-tool `input_json_delta` fragments into
-  one complete JSON delta, avoiding client-side partial-JSON EOF failures.
-- For `POST /v1/responses` (Codex) the same engine buffers the OpenAI Responses
-  SSE stream, whose terminal is `response.completed`. A start-of-stream `error`
-  or `response.failed` (overload / capacity / rate limit — which Codex otherwise
-  treats as a **fatal turn error** and does not retry) is caught **pre-commit**
-  and converted to a retry (or ridden out by hidden local retries). By default,
-  once output appears it commits early and streams live, so streaming UX is
-  preserved; a post-commit error truncates the stream so Codex's native
-  stream-retry re-issues. Set `PROXY_RESPONSES_EARLY_COMMIT=0` to instead buffer
-  the whole response like the Messages path (under the Responses-owned
-  `PROXY_RESPONSES_BUFFER_MS` hold) — mid-stream errors then also become hidden
-  retries, at the cost of requiring the client's `stream_idle_timeout_ms` to
-  exceed that hold.
-  Live bytes and non-text frames are forwarded verbatim. Buffered/prefix replay
-  combines only adjacent compatible text deltas (bounded by
-  `PROXY_RESPONSES_REPLAY_DELTA_BYTES`) so a completed buffered turn cannot burst
-  thousands of tiny notifications into Codex. Codex's Responses parser is
-  deliberately lenient (it tolerates missing/null fields and skips any frame it
-  can't deserialize without failing the turn), so every other content frame is
-  left alone; the proxy's guarantees are at the stream level (a parseable
-  terminal, or a convert-to-retry). During a silent gap the keepalive is a **skippable Responses
-  event** (not an SSE comment, which Codex's reader discards without resetting its
-  idle timer). No tool-JSON coalescing; refusal-fallback and the Workflow stall
-  watchdog are Anthropic-only and stay off. A **non-retryable** error (a
-  deterministic request-shape) surfaces as **HTTP 400** — the one 4xx Codex treats
-  as terminal; every other non-2xx it would retry regardless of `x-should-retry`.
-- Any failure **before** that commit point — connection error, 5xx, a stalled or
-  truncated stream, a mid-stream `error` event, any retryable status — is either
-  retried inside the proxy when `PROXY_TRANSACTIONAL_LOCAL_RETRIES` is enabled,
-  or converted into a *retryable* response by stamping **`x-should-retry: true`**
-  plus a **`Retry-After` backoff** (exponential, capped ~30 s; the SDK waits then
-  re-sends using Claude Code's own retry loop).
-- Every retryable response is **normalized to one generic shape — `503` +
-  `api_error`** — never its real identity like `overloaded_error`/`529` or
-  `rate_limit_error`/`429`. Claude Code handles those specific shapes on dedicated
-  paths that **ignore `x-should-retry`** and give up after ~3 tries (e.g.
-  `Repeated 529 Overloaded errors`, which never increments the retry counter);
-  masking them as a plain `503` keeps every retry inside the SDK loop above. The
-  true cause is preserved in the access-log `code` (e.g. `sse_overloaded`).
-- **Request-shape** errors pass through with **`x-should-retry: false`** so they
-  surface instead of looping forever.
-- The **client retry budget** is driven by the SDK's own
-  `X-Stainless-Retry-Count`; `PROXY_SDK_RETRY_CAP` is a backstop (`0` disables
-  conversion entirely). For extra budget under Claude Code's 15-retry clamp, set
-  `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N`: effective transactional upstream
-  attempts are `(client retries + 1) * (N + 1)`, as long as the proxy has not
-  committed bytes to the client. Hidden proxy retries wait for upstream
-  `Retry-After` **plus** an extra exponential delay capped by
-  `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` (default 10 s). There is **no circuit
-  breaker** — a blind stabilizer never blocks the client; backoff prevents a
-  tight hammer loop.
-- **Long generations (tuned for turns up to ~600 s):** Claude aborts any request
-  that reaches its response-header ceiling with no bytes — **default 60 s**
-  (`CLAUDE_CODE_CONNECT_TIMEOUT_MS`, measured; `API_FORCE_IDLE_TIMEOUT=0` does
-  *not* affect this pre-headers wait). To keep the stream **fully transactional**
-  (so a late failure is still cleanly retryable) for long turns, this proxy
-  defaults `PROXY_KEEPALIVE_MS` to **600 000** and you raise the **two client-side
-  abort timers** above it — both matter because the proxy sends *no response
-  headers* during the hold: **`CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`** (the TTFB /
-  no-response-headers ceiling, default ~60 s) **and `API_TIMEOUT_MS=720000`** (the
-  hard per-attempt request timeout, default 600 000 — left at 600 000 it *ties* the
-  window and can abort at the boundary). Keep `API_FORCE_IDLE_TIMEOUT=0` (turning it
-  on arms a no-bytes idle watchdog that would kill the transactional hold; note
-  `CLAUDE_API_TIMEOUT` is not a real Claude Code var and is ignored). Now a turn
-  that runs for minutes and fails near the end — e.g. a truncated stream /
-  `JSON Parse error` — is still uncommitted, so it converts to an automatic retry.
-  Only if a turn *exceeds* the window does the
-  proxy **commit** the buffered prefix and switch to **live streaming with
-  keepalive pings** (a post-commit drop then falls back to Claude's native
-  dropped-stream retry). Want a different ceiling? Move all three together —
-  `PROXY_KEEPALIVE_MS` and the two client timers — keeping the client values above
-  the window.
-
-The full situation catalog — derived from real session transcripts — and how each
-is handled is in [docs/ERROR-SITUATIONS.md](docs/ERROR-SITUATIONS.md).
-
-The active buffering window is measured from the start of the **client request**.
-Upstream header waits, hidden retries, backoff, and fallback attempts share that
-one window. A pending header/error-body read is cancelled at its end and returned
-as a retryable response; an SSE stream already being captured switches to live
-output. Hidden retries never restart the clock. Claude's `X-Stainless-Timeout`
-header is read in **seconds**, with the configured deadline margin subtracted.
-
-Trade-off of transactional mode: you lose live token-by-token streaming for turns
-that complete within the grace window — the reply appears in a burst, then
-completes. In exchange you get "complete reply or automatic retry, never a stuck
-half-reply."
-
-## Workflow agents
-
-Claude Code's **Workflow** tool (`agent()` calls in an orchestration script) wraps
-each agent in a **per-agent stall watchdog**: if the agent's stream produces no
-assistant/user message for the stall budget — **default 180 s**, retried a few
-times, then the agent hard-fails with *"agent stalled … no progress"* — it aborts
-the request. That budget is **hardcoded** (there is no global env override;
-`CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` drives a *different* path, and the only
-per-agent override is the script-side `agent(prompt, {stallMs})`).
-
-Full transactional buffering starves that watchdog: the proxy withholds every
-byte until the upstream stream completes, so a single workflow turn that runs
-longer than ~180 s emits nothing → the orchestrator sees no progress → it aborts
-at 180 s (the proxy logs `client_gone`), retries, and the whole agent fails. This
-hits **only workflow agents** — the interactive session and ordinary subagents
-have no such watchdog.
-
-The proxy fixes this transparently: it detects a workflow agent by the prologue
-the Workflow runtime injects into its `system` prompt (*"You are a subagent
-spawned by a workflow orchestration script"*) and gives **only those requests** a
-**small** transactional window, `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10 000). A
-workflow turn that runs past the window commits its buffered prefix and then
-streams the rest live — real events the watchdog counts as progress — so it clears
-the *first-gap* stall (see below), while turns that finish inside the window stay
-fully transactional (cleanly retryable). The detection is scoped to the `system`
-field, so a *main* session that merely discusses workflows is never misclassified.
-These requests show as `/wf` in the access log. Everything else keeps
-`PROXY_KEEPALIVE_MS`.
-
-**Why small, precisely.** The watchdog kills on a *forwarded-content-delta gap*:
-it aborts when `stallMs` passes with no real delta reaching the client (keepalive
-comments and `ping` do not count) — i.e. at `(last forwarded delta) + stallMs`.
-While the proxy buffers it forwards nothing, so the **first gap** — query start to
-the first forwarded delta — includes time spent waiting for upstream output. The
-window runs from request start; if response headers have not arrived by then,
-the proxy returns a retryable response. After SSE headers arrive, a workflow
-commit still waits for real forwardable content. A small window removes buffering
-delay once that content arrives. A large window (e.g. 120 000) pushes the first
-gap toward `stallMs`, so small is the safe default.
-**What the proxy cannot fix:** once past the first gap the stream is governed by
-the upstream's own content-delta gaps, which the proxy cannot change — a genuine
-mid-turn content-silent pause ≥ `stallMs` (server-side reasoning emitting only
-pings, or a slow first byte under `effort:'high'`) will still stall. The only
-remedy there is a larger per-agent `stallMs`.
-
-> The robustness cost is small and targeted: pre-stream transient failures (5xx,
-> `overloaded_error`, rate limits, capacity, connection errors) are classified
-> *before* any bytes are captured, so they still convert to clean retries for
-> workflow agents too. Only a mid-stream truncation on a turn already past the
-> window degrades from a clean retry to a `DROP` (Claude's native dropped-stream
-> retry). If a workflow sets a per-agent `stallMs` **below**
-> `PROXY_WORKFLOW_KEEPALIVE_MS`, lower the window to match.
-
-## Run (docker compose — recommended)
+You need Docker with Compose v2 and a gateway that supports your client's API.
+For a native installation, see [building and running from source](docs/DEVELOPMENT.md).
 
 ```bash
-cp .env.example .env                  # set PROXY_UPSTREAM_URL to your real gateway
-docker compose up -d --build          # proxy on 127.0.0.1:8789 -> your gateway
-# or override inline instead of using .env:
-PROXY_UPSTREAM_URL=https://your-gateway.example.com docker compose up -d --build
+git clone https://github.com/Xllent-AI/steady-proxy
+cd steady-proxy
+cp .env.example .env
 ```
 
-Then point Claude Code at it (next section). Logs: `docker compose logs -f proxy`.
+Edit `.env` and set your gateway URL:
 
-The container runs as `${UID:-1000}:${GID:-1000}` so that files under `./logs`
-are owned by you rather than root. Bash does not export `UID` and has no `GID`,
-so if your user is not `1000:1000`, add `UID=<your uid>` and `GID=<your gid>` to
-`.env` (or export both before `docker compose up`; an already-exported value
-wins over `.env`).
+```dotenv
+PROXY_UPSTREAM_URL=https://your-gateway.example.com
+```
 
-## Build / test from source
+Use the gateway root, or its required path prefix. The proxy appends the request
+path: `/v1/messages` becomes `https://your-gateway.example.com/v1/messages`.
+Do not add another `/v1` unless your gateway requires that extra prefix.
 
-Requires Go 1.23+ (standard library only, no third-party dependencies).
+Start the proxy:
 
 ```bash
-git clone https://github.com/Xllent-AI/steady-proxy && cd steady-proxy
-make build                  # stamps VERSION + git commit + build date
-./steady-proxy --version
-go test -race ./...          # unit + integration tests (same as `make test`)
-./test/live.sh               # live: real `claude -p` -> dockerized proxy -> mock faults
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8789/__version
 ```
 
-The live harness needs Docker (compose v2), `curl`, and the `claude` CLI on
-`PATH`, and takes about 10 minutes (`DO_LONG=0` skips the >300 s case). It uses a
-separate Compose project, test image, and random loopback ports, and sends no
-real requests unless you opt in with `DO_REAL=1 PROXY_UPSTREAM_URL=…` (one billed
-call through the proxy using `$ANTHROPIC_AUTH_TOKEN`). Cleanup removes only the
-test project, including on interruption; failed-run logs are retained in the
-printed temporary directory.
+The version endpoint confirms that the proxy is running; it does not contact your
+gateway. Next, configure the client you use below. Keep your existing API
+credentials: the proxy forwards them to the gateway.
 
-Run the binary directly instead of compose:
+### Claude Code
 
-```bash
-PROXY_UPSTREAM_URL=https://your-gateway.example.com PROXY_LISTEN_ADDR=127.0.0.1:8789 ./steady-proxy
-```
+Merge this `env` block into `~/.claude/settings.json`, keeping your other settings
+and authentication values:
 
-`docker compose up -d --build` stamps the binary with `VERSION`, the current Git
-commit (from minimal `.git` metadata copied into the build context), and a build
-timestamp. For fully explicit release builds, use:
-
-```bash
-make docker-build
-```
-
-To query a running proxy without reading process state:
-
-```bash
-curl -s http://127.0.0.1:8789/__version
-```
-
-Background / persistent (systemd user unit, survives logout):
-
-```ini
-# ~/.config/systemd/user/steady-proxy.service
-[Unit]
-Description=steady-proxy for Claude Code
-After=network-online.target
-
-[Service]
-ExecStart=/opt/steady-proxy/steady-proxy
-Environment=PROXY_UPSTREAM_URL=https://your-gateway.example.com
-Environment=PROXY_KEEPALIVE_MS=600000
-Environment=PROXY_LISTEN_ADDR=127.0.0.1:8789
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user daemon-reload && systemctl --user enable --now steady-proxy
-```
-
-## Wire Claude Code to it
-
-In `~/.claude/settings.json`, point the base URL at the proxy and let the proxy
-hold the real upstream (the proxy forwards your `Authorization`/`anthropic-*`
-headers unchanged):
-
-```jsonc
-"env": {
-  "ANTHROPIC_BASE_URL": "http://127.0.0.1:8789",   // was: your real gateway URL
-  "ANTHROPIC_AUTH_TOKEN": "…unchanged…",
-  // Every client-side abort timer must EXCEED PROXY_KEEPALIVE_MS (600000): the
-  // proxy sends no response headers during the transactional hold, so a timer
-  // <= the window aborts the turn mid-hold.
-  "CLAUDE_CODE_CONNECT_TIMEOUT_MS": "660000", // TTFB / "no response headers" ceiling (default ~60s)
-  "API_TIMEOUT_MS": "720000",                 // hard per-attempt request timeout (default 600000)
-  "API_FORCE_IDLE_TIMEOUT": "0"               // keep OFF; ON arms a no-bytes idle watchdog that kills the hold
-  // (CLAUDE_API_TIMEOUT is NOT read by Claude Code — don't bother setting it.)
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8789",
+    "CLAUDE_CODE_CONNECT_TIMEOUT_MS": "660000",
+    "API_TIMEOUT_MS": "720000",
+    "API_FORCE_IDLE_TIMEOUT": "0"
+  }
 }
-// and run the proxy with PROXY_UPSTREAM_URL set to your real gateway (via .env)
 ```
 
-If Claude Code refuses a plain `http://` base URL, serve the proxy over TLS with a
-local cert and set `NODE_EXTRA_CA_CERTS` — but loopback `http` is normally fine.
+The proxy sends no response headers while buffering. Both client timeouts must
+exceed the default 600,000 ms buffering window, and the idle watchdog must stay
+off. If you change that window, adjust the client timers with it; see
+[timeouts](docs/CONFIGURATION.md#timeouts).
 
-## Wire Codex to it
+### Codex
 
-Point the Codex provider's `base_url` at the proxy (keep `/v1`) in
-`~/.codex/config.toml`; the proxy holds the real upstream and forwards auth
-unchanged:
+In `~/.codex/config.toml`, update your **active provider's** section. Replace
+`your_provider` below with its existing name and preserve its authentication
+settings:
 
 ```toml
-[model_providers.crs]
-base_url = "http://127.0.0.1:8789/v1"   # was: your real gateway .../v1
+[model_providers.your_provider]
+base_url = "http://127.0.0.1:8789/v1"
 wire_api = "responses"
-# Keep this strictly ABOVE the active proxy commit window: PROXY_RESPONSES_KEEPALIVE_MS
-# (30s) in the default early-commit mode, or PROXY_RESPONSES_BUFFER_MS (600s) if you
-# set PROXY_RESPONSES_EARLY_COMMIT=0. 660000 clears both with margin:
 stream_idle_timeout_ms = 660000
-# Codex's own retries still apply as a backstop when the proxy surfaces a retryable 503:
 request_max_retries = 10
 stream_max_retries = 10
 ```
 
-Enable `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N` so a start-of-stream overload is
-ridden out inside the proxy and Codex never sees it. To extend the proxy's
-hidden-retry protection past the first output event (mid-stream failures too), set
-`PROXY_RESPONSES_EARLY_COMMIT=0` — the turn then buffers under
-`PROXY_RESPONSES_BUFFER_MS` like the Messages path.
+Keep `/v1` in the client URL. The idle timeout above covers both the default
+streaming mode and the optional 10-minute buffering mode.
 
-## Verify — reading the log
+For full buffering and up to three extra upstream attempts per client request,
+add these settings to `.env`, then run `docker compose up -d`:
 
-The proxy prints **one line per request** (always on; `PROXY_VERBOSE=1` only adds
-extra internal retry chatter). Tail it with `docker compose logs -f proxy`. The
-sample below was taken with `PROXY_TRANSACTIONAL_LOCAL_RETRIES=6` and
-`PROXY_VERBOSE=1`:
-
-```text
-2026/06/21 16:34:00  steady-proxy 0.1.0+a1b2c3d4e5f6 listening on http://0.0.0.0:8789 -> https://your-gateway.example.com  (transactional, keepalive=10m0s, wf-keepalive=10s, sdkRetryCap=100, txLocalRetries=6, refusalFallback=claude-opus-5; one log line per request)
-2026/06/21 16:34:29  OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.41s
-2026/06/21 16:34:30  OK    claude-haiku-4-5/sub    in=812 out=96 tok  end_turn  buffered  1.02s
-2026/06/21 16:34:31  OK    gpt-5.6/main  high  in=1.1k out=223 tok  completed  live  2.37s
-   (timestamp prefix elided on the lines below for readability)
-RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
-RETRY claude-haiku-4-5/main   sse_overloaded 529->503  retry-after=4s  0.2s  attempt=1
-[local-retry] claude-opus-4-8/main http_503 503 wait=1s retry=1/6
-OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
-WARN  claude-fable-5/main  refusal -> retry with claude-opus-5  in=258.8k out=2.8k tok  40.7s
-FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
-DROP  claude-sonnet-4-6/main  truncated_stream -> committed, Claude retries natively  out=210 tok  61.0s
-OK    /v1/messages/count_tokens  200  730B  2ms
+```dotenv
+PROXY_RESPONSES_EARLY_COMMIT=0
+PROXY_TRANSACTIONAL_LOCAL_RETRIES=3
 ```
 
-Every line is prefixed by the logger with the date and time at second resolution
-(`2026/06/21 16:34:29`).
+Full buffering delays visible output until completion or the buffering window
+ends. Extra retries apply to both supported streaming APIs and must fit within
+the active window. See [retry budgets](docs/ARCHITECTURE.md#retry-budgets).
 
-Reading a line:
-- **First column** = outcome — `OK` served · `RETRY` converted to an automatic
-  retry (`x-should-retry: true` + `Retry-After` backoff, the SDK re-sends) ·
-  `WARN` a `stop_reason: "refusal"` was intercepted and the request re-issued with
-  `PROXY_REFUSAL_FALLBACK_MODEL` (`refusal -> retry with <model>`; a following `OK`
-  line reports the fallback's result) · `FAIL` surfaced to you (request-shape
-  error, or retry backstop hit) · `DROP` failed *after* committing a long turn, so
-  Claude's native dropped-stream retry takes over.
-- **`model/agent`** — the model called, and whether the caller is the `main` agent
-  or a spawned `sub`agent. If the upstream stream echoes a different resolved
-  model, success/drop lines show `requested->resolved/agent`.
-- **Reasoning effort** — requests add the bare effort (for example **`high`**)
-  as the next field when set via Messages `output_config.effort` or Responses
-  `reasoning.effort`.
-- Then only what varies: **`in=/out=` tokens** (`in` includes cache read/create
-  input tokens), **stop reason**, **`buffered`/`live`** capture mode, and
-  **duration**. Buffered GPT-compatible streams also normalize final input/cache
-  usage into the replayed `message_start` event when the upstream sent zero
-  placeholders there, leaving `message_delta` to carry output usage. Failures add
-  the **`code`** and **`status`**, plus
-  **`retry-after=Ns`** on a RETRY, **`attempt=N`** after a Claude Code retry, and
-  **`proxy-retries=N`** when the proxy recovered or exhausted hidden local
-  transactional retries. The **`code`** is the true cause (`sse_overloaded`,
-  `truncated_stream`, …). The **`status`** is the real upstream status; when it
-  was masked it reads **`orig->surfaced`**
-  (e.g. `529->503`) — left of the arrow is what the upstream returned, right is what
-  the client receives (every transient cause is masked to a generic `503`; see
-  [normalization](#what-it-does)). A single number means it was not masked (a `503`
-  that was already `503`, or a surfaced `FAIL` like `request_shape 400`).
-- **`[local-retry]`** lines appear only with `PROXY_VERBOSE=1`. They are the
-  proxy's hidden in-request retries and include the same `model/agent`, the true
-  cause/status, wait time, hidden retry index, and SDK `attempt=N` when present.
+### Other API clients
 
-Responses also carry headers: `X-Steady-Proxy-Mode` (`buffered`/`live`) on
-success, `X-Steady-Proxy-Reason` on a synthesized error.
+Set your client's base URL so it sends Messages requests to
+`http://127.0.0.1:8789/v1/messages` or Responses requests to
+`http://127.0.0.1:8789/v1/responses`. Some SDKs append `/v1` themselves; configure
+the base URL to produce exactly one `/v1` in the request path.
 
-Live smoke test (sends one real request through the proxy to your gateway):
+Keep authentication in the client and use `stream: true` for stream protection.
+Set client timeouts above the active buffering window and configure retries for
+HTTP `503`, respecting `Retry-After`. Extra proxy retries can absorb failures
+before a response starts, but recovery after streaming begins belongs to the
+client. Check the [compatibility requirements](docs/ARCHITECTURE.md#client-compatibility),
+especially for Responses clients with strict event parsing.
+
+### Check a request
+
+Start a new client session and send a short prompt while watching:
 
 ```bash
-curl -sS http://127.0.0.1:8789/v1/messages \
-  -H "authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
-  -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
-  -d '{"model":"<your-model>","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"say hi"}]}'
+docker compose logs -f proxy
 ```
 
-## Config (env)
+`OK` means the request was delivered. `RETRY` means the proxy asked the client to
+retry, and `FAIL` means it returned an error without requesting another attempt.
+See [reading the logs](docs/OPERATIONS.md#reading-the-logs) for examples and the
+other outcomes.
 
-| Var | Default | Meaning |
-|---|---|---|
-| `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | loopback bind (never expose publicly) |
-| `PROXY_UPSTREAM_URL` | *(required)* | the real gateway: `http(s)://host[:port][/prefix]`, set via `.env`. The proxy refuses to start without it |
-| `PROXY_SDK_RETRY_CAP` | `100` | backstop only — stop converting once the SDK reports this many retries (`0` disables conversion). **Claude/Stainless-specific:** the count comes from the `X-Stainless-Retry-Count` header the Anthropic SDK sends. **Codex does not send it**, so on `/v1/responses` the count is always 0 and any positive cap is effectively unlimited — conversion is bounded instead by Codex's own `request_max_retries`/`stream_max_retries`. With `0`, Responses failures surface as terminal HTTP 400 because Codex ignores `X-Should-Retry: false` |
-| `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | opt-in hidden retries per uncommitted transactional attempt (`/v1/messages` and `/v1/responses`). `1` means one extra upstream try before returning a retryable response to the client. For Codex this is the ideal path — an overload is ridden out and Codex never sees an error |
-| `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` | cap for the proxy's extra exponential wait between hidden local retries. If upstream sends `Retry-After`, the proxy waits `Retry-After + extra` |
-| `PROXY_KEEPALIVE_MS` | `600000` | stay fully transactional up to this long, then commit + stream live; the client's `CLAUDE_CODE_CONNECT_TIMEOUT_MS` **must exceed it** (set `660000`); `0` = pure transactional |
-| `PROXY_WORKFLOW_KEEPALIVE_MS` | `10000` | **workflow agents only** — a **small** window so the proxy commits *early* and streams live, feeding Claude Code's Workflow per-agent **stall** watchdog (default ~180 s, no global env override; kills on a forwarded-delta gap ≥ `stallMs`). Keep it small so the first gap (≈ window + TTFB) stays under `stallMs`; it can't fix a mid-turn content-silent pause ≥ `stallMs`. `0` disables (stall returns). Other callers keep `PROXY_KEEPALIVE_MS`. See [Workflow agents](#workflow-agents) |
-| `PROXY_RESPONSES_KEEPALIVE_MS` | `30000` | **`/v1/responses` (Codex), early-commit mode only** — the stream commits *early* as soon as output appears, so this just bounds a **silent start** (reasoning with no output) before committing and streaming keepalive events. (With early-commit **off** the route buffers under `PROXY_RESPONSES_BUFFER_MS` instead.) Keep it below Codex's `stream_idle_timeout_ms` so the commit — after which the proxy emits Codex-visible keepalive events that reset Codex's idle timer — happens before Codex would idle out. Start-of-stream errors arrive before any output, so they're caught pre-commit regardless of this value |
-| `PROXY_RESPONSES_BUFFER_MS` | `600000` | **`/v1/responses` (Codex), full-buffer mode only** (`PROXY_RESPONSES_EARLY_COMMIT=0`) — the max buffering hold before a safety-valve live commit: the `/v1/messages` policy applied to Responses. **Responses-owned** (independent of `PROXY_KEEPALIVE_MS`), so a proxy serving both Codex and Claude tunes the two transactional horizons separately. The Codex client's `stream_idle_timeout_ms` **must strictly exceed** it (nothing is forwarded while buffering) |
-| `PROXY_RESPONSES_EARLY_COMMIT` | `1` | **`/v1/responses` (Codex) only** — `1` (default) commits as soon as the first output event is buffered, then streams live (streaming UX preserved). Set `0` to **buffer the whole response** to `response.completed` like `/v1/messages`, under the `PROXY_RESPONSES_BUFFER_MS` hold: this extends the proxy's hidden-retry protection to **mid-stream** errors (not just start-of-stream), but the proxy forwards nothing until the turn ends, so the Codex client's `stream_idle_timeout_ms` **must exceed that hold** |
-| `PROXY_RESPONSES_REPLAY_DELTA_BYTES` | `65536` | **`/v1/responses` buffered/prefix replay only** — combine adjacent `response.output_text.delta` events for the same item/output/content route up to this many accumulated source-JSON bytes before replay. Counting the complete payload (including logprobs) keeps replay memory bounded as well as preventing full-buffer mode from dumping thousands of token-sized events into Codex's bounded app-server notification queue at completion. Text, routing fields, ordering barriers, and terminal/error events are preserved; normal live deltas are untouched. Events with non-empty logprobs and oversized, malformed, or ambiguous frames stay raw; `0` restores byte-for-byte replay |
-| `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` | abort + retry a silent/wedged upstream after this gap |
-| `PROXY_VALIDATE_JSON` | `1` | per-event JSON plus accumulated tool/server-tool input JSON validation; `0` to disable validation and JSON-fragment normalization |
-| `PROXY_NORMALIZE_TOOL_JSON` | `1` | coalesce tool/server-tool `input_json_delta` fragments into one complete JSON delta before downstream forwarding when JSON validation is enabled; `0` for byte-like upstream forwarding |
-| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | when a request completes with `stop_reason: "refusal"` or Fable returns a pre-stream safeguards block, silently re-issue the same request with this model instead of returning the refusal (logs a `WARN`). Fires at most once per request (a refusal from the fallback model is delivered as-is) and only before anything is committed downstream; every non-model field is preserved. Set to `off`/`none`/empty to disable. Stream refusal detection still works with `PROXY_VALIDATE_JSON=0`; full JSON validation is still recommended |
-| `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | wait for the upstream status line; `0` = no header timeout (the attempt is still bounded by `PROXY_MAX_REQUEST_DURATION_MS`) |
-| `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` | buffer in RAM up to this, then spill to an unlinked temp file |
-| `PROXY_MAX_RESPONSE_BYTES` | `134217728` | hard cap on a buffered response; also bounds each SSE event, including unfinished lines, before parsing |
-| `PROXY_MAX_REQUEST_BYTES` | `67108864` | hard cap on a client request body; a larger request is rejected with `413` (`400` on `/v1/responses`) rather than truncated |
-| `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` | absolute ceiling (25 min) on one inbound client request, covering every hidden local retry inside it. On the transactional routes a client `X-Stainless-Timeout` lowers it: the deadline becomes the smaller of this ceiling and the client's timeout minus `PROXY_DEADLINE_MARGIN_MS`. Other routes (`count_tokens`, model listing, non-streaming) always use the full ceiling |
-| `PROXY_DEADLINE_MARGIN_MS` | `25000` | finish before the client's `X-Stainless-Timeout` (seconds); for short timeouts, reserve at most half the client's budget |
-| `PROXY_SPOOL_DIR` | `$TMPDIR` | where large responses spill (use tmpfs for sensitive prompts) |
-| `PROXY_REQUEST_LOG_DIR` | off (`""`) | set a directory to save each request/response JSON archive there (see below) |
-| `PROXY_VERBOSE` | off | set `1` for per-decision logs |
+## Before you use it
 
-A value that is not an integer, or is below its knob's minimum (for example
-`PROXY_UPSTREAM_BYTE_IDLE_MS=0`), stops the proxy at startup with a message
-naming every offending variable — nothing silently falls back to a default.
+Keep the proxy on **loopback**. It has no authentication of its own; anyone who
+can reach its port can send requests through it. Compose publishes the port only
+on `127.0.0.1`.
 
-Under `docker-compose.yml` three of these differ from the binary defaults.
-`PROXY_LISTEN_ADDR` is fixed to `0.0.0.0:8789` — the container's own interface;
-the published port is still bound to `127.0.0.1` only, so the proxy stays
-loopback-reachable. `PROXY_RESP_HEADER_TIMEOUT_MS` defaults to `660000` (a
-gateway that gates on first output can take longer than 60 s to send headers on
-a compaction turn) and `PROXY_VERBOSE` to `1`; set either one in `.env` to
-change it.
+Full payload archives are **off by default**. Enabling them saves prompts and
+responses unencrypted, without automatic retention. See
+[data handling](docs/OPERATIONS.md#data-handling) before enabling them.
 
-### Optional upstream headers
+Retries repeat upstream work. Server-side or remote tools with side effects need
+their own idempotency protection. Buffering does not undo work already performed
+by the provider; see [retry limits and side effects](docs/ARCHITECTURE.md#retry-limits-and-side-effects).
 
-A gateway can override the proxy's error classification by setting a response
-header on a non-2xx reply: `x-gateway-retryable: true` forces a retryable
-conversion, `x-gateway-retryable: false` surfaces the error as-is (on
-`/v1/responses` it surfaces as `400`, Codex's terminal status). The Anthropic
-API's own `x-should-retry` header is honored the same way, at lower precedence.
-Neither is required — without them the proxy classifies by status and error body
-as described above. The `x-gateway-*` names (including `x-gateway-error-stage`
-and `x-gateway-error-code`) are stripped from client requests so a client cannot
-assert them.
+## Documentation
 
-## Saving request/response data
-
-The one-line access log tells you *what happened*; sometimes you need to see
-*exactly what was sent and returned* — to debug a converted retry, a malformed
-stream, or a surfaced request-shape 4xx. Set `PROXY_REQUEST_LOG_DIR` to a directory and the
-proxy writes **one JSON archive per client request** into it:
-
-```
-PROXY_REQUEST_LOG_DIR=./logs PROXY_UPSTREAM_URL=… ./steady-proxy
-# ./logs/v1-messages-20260621t143005-a1b2c3d4.json   (a1b2c3d4 = the correlation id)
-```
-
-> **Debugging aid — unbounded.** There is no size cap, rotation, or retention.
-> Every request (including each `count_tokens` and `/v1/models` call) writes a
-> new file holding the full prompt and response; a busy Claude Code setup
-> produces tens of thousands of files and tens of gigabytes within weeks. Enable
-> it to reproduce a problem, then turn it off — or prune on a schedule, e.g.
-> `find "$PROXY_REQUEST_LOG_DIR" -name '*.json' -mmin +120 -delete`.
-
-Each archive uses the versioned schema `steady-proxy.payload.v2`. Bodies are
-stored as JSON `data_base64` fields with `encoding`, byte `size`, and `sha256`, so
-request and response payload bytes can be restored exactly, including binary or
-image payloads. The archive records the original client request envelope, the
-upstream URL with API secrets redacted, proxy build/version metadata, all upstream
-attempts, each attempt's response or transport failure, retry wait/result, SSE
-stats, and any model-swap decision.
-
-- **Correlation id.** Every access-log line carries `id=<hex>`, and that same id is
-  the archive filename suffix and top-level `id` — so a bad line pins straight to
-  the payload: `ls logs/*<id>*.json`. The id only appears in the access log when
-  `PROXY_REQUEST_LOG_DIR` is set (otherwise there's no archive to point at).
-- **`prun` (ping-run).** The stats line reports the longest run of consecutive
-  upstream `ping` events — a content-silent-gap tripwire. Healthy dense streams stay
-  at `0`; a climbing `prun` on a `DROP` is the signature of a genuine mid-turn
-  upstream pause (what a Workflow stall watchdog kills on).
-- **API secrets are redacted.** API-secret carriers such as `Authorization`,
-  `x-api-key`, `api-key`, and query params such as `api_key`, `key`,
-  `api_token`, `auth_token`, `access_token`/`accessToken`, and
-  `client_secret`/`clientSecret` are written redacted and listed in `redactions`.
-  Non-forwarded `Proxy-Authorization` is also redacted. Other headers and query
-  params are preserved for debugging/restoration.
-- **Bodies are not deliberately truncated.** Captured request and response bytes
-  are archived for restoration. Error-body reads obey the byte-idle and request
-  deadlines; interrupted captures carry `capture_error`. This can use significant
-  disk for large requests or long streams.
-- **Bodies are preserved verbatim.** The request body (your conversation) and
-  response bodies land on disk unencrypted and are not inspected/redacted; point
-  the dir at a tmpfs or a path you control, and keep it out of version control
-  (`.gitignore` already excludes `/logs/`).
-- For failures before a stream starts, the archive records the upstream HTTP
-  status, response headers, and full upstream error body. Hidden local retries and
-  model-fallback reissues appear as separate entries in `attempts`.
-
-## Caveats
-
-- Upstream redirects are classified as responses; the proxy does not follow them
-  or forward credentials to a redirect destination.
-- Non-streaming successful responses pass through without transactional buffering.
-  If copying the body fails, the proxy logs `DROP` and aborts the downstream HTTP
-  response so truncation cannot look like a clean success.
-- **Server-side / remote MCP tools:** re-issuing a request is safe for
-  *client-local* tool execution (Claude runs tools only after a complete reply),
-  but it is **not** provider-level idempotency. If you enable server-side or
-  remote side-effecting tools without their own idempotency keys, set
-  `PROXY_SDK_RETRY_CAP=0` to disable conversion, or don't proxy those.
-- **Live streaming is lost** for turns that finish within the grace window (by
-  design). Turns longer than `PROXY_KEEPALIVE_MS` commit early and stream live but
-  then can't cleanly convert a late drop. Keeping live streaming *and* full
-  robustness for long turns needs resumable responses on the gateway side
-  (OpenAI/Azure `background:true` + `starting_after=<sequence>`), which this
-  proxy does not implement.
+| Guide | Use it to… |
+| --- | --- |
+| [Architecture](docs/ARCHITECTURE.md) | Understand client compatibility, buffering, retries, fallback, and Workflow agents. |
+| [Configuration](docs/CONFIGURATION.md) | Tune timeouts, retry budgets, storage limits, and gateway hints. |
+| [Operations](docs/OPERATIONS.md) | Read logs, capture payloads, and run the proxy persistently. |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Match an error or symptom to its cause and next step. |
+| [Development](docs/DEVELOPMENT.md) | Build, test, and find the relevant source code. |
 
 ## License
 

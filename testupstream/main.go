@@ -1,6 +1,6 @@
 // testupstream — a fault-injecting mock of the Anthropic Messages API, used by
 // the live docker tests. It returns valid Anthropic SSE for normal requests and
-// deterministically reproduces the failure modes in docs/ERROR-SITUATIONS.md.
+// deterministically reproduces the failure modes in docs/TROUBLESHOOTING.md.
 //
 // The desired fault is read from the LAST user message text via a directive:
 //

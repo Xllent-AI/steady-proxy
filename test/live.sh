@@ -6,7 +6,7 @@
 # env, so we isolate with `env -i HOME=<temp>` to force ANTHROPIC_BASE_URL at the
 # proxy. Credentials for the real smoke come from the host's $ANTHROPIC_AUTH_TOKEN.
 #
-# Requires: docker (compose v2), curl, and the `claude` CLI on PATH.
+# Requires: docker (compose v2), curl, claude, and GNU timeout on PATH.
 # Runs ~10 minutes with the default long-generation case.
 #
 # Usage:  ./test/live.sh            # mock faults + long-gen (no real requests)

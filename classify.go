@@ -72,7 +72,7 @@ func origStatusOf(f failure) int {
 // succeed as written, so retrying it would loop forever. These are the ONLY
 // errors we surface immediately — everything else is retried (see the design
 // principle in main.go). Derived from real Claude Code transcripts; see
-// docs/ERROR-SITUATIONS.md.
+// docs/TROUBLESHOOTING.md.
 //
 // Deliberately excluded (so they ARE retried): auth, billing, policy, rate
 // limits, capacity, and unknown errors — a temporary block or outage should be

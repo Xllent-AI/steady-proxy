@@ -1,10 +1,7 @@
-# Production: start the self-healing proxy in front of your real gateway.
-#
-#   cp .env.example .env   # set PROXY_UPSTREAM_URL to your real gateway (untracked)
-#   docker compose up -d --build
-#   # then set ANTHROPIC_BASE_URL=http://127.0.0.1:8789 in ~/.claude/settings.json,
-#   # and CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000 (must exceed PROXY_KEEPALIVE_MS).
-#
+# Run the proxy in front of your gateway: set PROXY_UPSTREAM_URL in .env,
+# then run `docker compose up -d --build`.
+# See README.md for API client setup, including Claude Code and Codex examples.
+# Settings and defaults: docs/CONFIGURATION.md.
 services:
   proxy:
     build:
@@ -22,16 +19,16 @@ services:
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"
       PROXY_UPSTREAM_URL: "${PROXY_UPSTREAM_URL:?set PROXY_UPSTREAM_URL in .env to your real gateway}"
-      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-100}" # backstop only; Claude Code still has its own retry cap
+      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-100}" # Backstop for the Stainless retry counter; not the client retry budget.
       PROXY_TRANSACTIONAL_LOCAL_RETRIES: "${PROXY_TRANSACTIONAL_LOCAL_RETRIES:-0}"
       PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS: "${PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS:-10000}"
       PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
-      PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}" # workflow agents only: SMALL window — commit early + stream live so forwarded deltas feed their ~180s per-agent stall watchdog. Keep small: while buffering nothing is forwarded, so the first gap (~= window + TTFB) must stay under stallMs. A content-silent pause >= stallMs is unfixable here (raise the workflow's stallMs instead).
-      PROXY_RESPONSES_KEEPALIVE_MS: "${PROXY_RESPONSES_KEEPALIVE_MS:-30000}" # /v1/responses (Codex), early-commit mode only: bounds a silent start before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead. Keep below Codex's stream_idle_timeout_ms. Start-of-stream errors are caught pre-commit regardless.
-      PROXY_RESPONSES_BUFFER_MS: "${PROXY_RESPONSES_BUFFER_MS:-600000}" # /v1/responses (Codex), full-buffer mode only (early-commit off): the max buffering hold before a safety-valve live commit — the /v1/messages policy applied to Responses. Responses-owned (independent of PROXY_KEEPALIVE_MS) so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it.
-      PROXY_RESPONSES_EARLY_COMMIT: "${PROXY_RESPONSES_EARLY_COMMIT:-1}" # /v1/responses (Codex) only: 1 (default) commits early — streams as soon as output appears. Set 0 to buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends the hidden-retry protection to mid-stream errors), which requires the Codex client's stream_idle_timeout_ms to exceed that hold (nothing is forwarded while buffering).
-      PROXY_RESPONSES_REPLAY_DELTA_BYTES: "${PROXY_RESPONSES_REPLAY_DELTA_BYTES:-65536}" # /v1/responses buffered/prefix replay: coalesce adjacent text deltas for the same output route up to this much accumulated source JSON (including logprobs), bounding memory and preventing a completed turn from bursting thousands of tiny notifications into Codex. 0 disables and restores byte-for-byte replay; live deltas are untouched.
-      PROXY_RESP_HEADER_TIMEOUT_MS: "${PROXY_RESP_HEADER_TIMEOUT_MS:-660000}" # wait for the gateway to return response headers; compaction turns can legitimately exceed one minute before a gateway that gates on first output sends any headers (overrides the binary default of 60000)
+      PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}" # Shorter window for Workflow content progress; see docs/ARCHITECTURE.md.
+      PROXY_RESPONSES_KEEPALIVE_MS: "${PROXY_RESPONSES_KEEPALIVE_MS:-30000}" # Silent-start window when early commit is enabled.
+      PROXY_RESPONSES_BUFFER_MS: "${PROXY_RESPONSES_BUFFER_MS:-600000}" # Full-buffer window when early commit is disabled.
+      PROXY_RESPONSES_EARLY_COMMIT: "${PROXY_RESPONSES_EARLY_COMMIT:-1}" # 0 buffers Responses; client idle timeout must exceed the buffer window.
+      PROXY_RESPONSES_REPLAY_DELTA_BYTES: "${PROXY_RESPONSES_REPLAY_DELTA_BYTES:-65536}" # Combine compatible text deltas during replay; 0 keeps raw replay.
+      PROXY_RESP_HEADER_TIMEOUT_MS: "${PROXY_RESP_HEADER_TIMEOUT_MS:-660000}" # Overrides the binary default of 60000 ms for slow gateway headers.
       PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
       PROXY_VALIDATE_JSON: "${PROXY_VALIDATE_JSON:-1}"
       PROXY_NORMALIZE_TOOL_JSON: "${PROXY_NORMALIZE_TOOL_JSON:-1}"
