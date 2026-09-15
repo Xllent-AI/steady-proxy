@@ -31,6 +31,9 @@ This tags both `steady-proxy:<VERSION>` and `steady-proxy:latest`. Ordinary
 Git metadata in its build context, and build timestamp. The running proxy exposes
 that information at `/__version`.
 
+For version bumps, local release previews, and tag-triggered publishing, see
+[releasing](RELEASING.md).
+
 ## Tests and checks
 
 ```bash

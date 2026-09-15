@@ -1,5 +1,6 @@
 # compiled binary
 /steady-proxy
+/dist/
 *.test
 # local Go build cache / temp (GOCACHE=./.gocache, GOTMPDIR=./.gotmp) — generated artifacts, never commit
 /.gocache/

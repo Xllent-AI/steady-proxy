@@ -177,6 +177,7 @@ by the provider; see [retry limits and side effects](docs/ARCHITECTURE.md#retry-
 | [Operations](docs/OPERATIONS.md) | Read logs, capture payloads, and run the proxy persistently. |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Match an error or symptom to its cause and next step. |
 | [Development](docs/DEVELOPMENT.md) | Build, test, and find the relevant source code. |
+| [Releasing](docs/RELEASING.md) | Preview release archives locally and publish through the tag workflow. |
 
 ## License
 

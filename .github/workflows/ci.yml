@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -22,6 +23,7 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test -race ./...
+      - run: make release-test
 
   docker:
     runs-on: ubuntu-latest

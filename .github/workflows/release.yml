@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build and verify release archives
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/package_release.py "$RELEASE_TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/${{ github.ref_name }}/*
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true # Allow a packaging-job retry to replace this run's temporary artifact.
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Verify uploaded archives
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS
+      - name: Create and publish release
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          existing_tags=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fxq -- "$RELEASE_TAG" <<< "$existing_tags"; then
+            echo "Refusing to modify existing release $RELEASE_TAG (including drafts)." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --draft \
+            --title "$RELEASE_TAG" --generate-notes \
+            ./*.tar.gz SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false
