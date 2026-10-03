@@ -76,6 +76,18 @@ specific `code` is `request_timeout`, `rate_limit_exceeded`, or
 example, `request_timeout` with “stream disconnected before completion” remains
 retryable instead of becoming an invalid-request failure.
 
+For Anthropic SSE `event: error`, the proxy also recognizes one verified transport
+disconnect mislabeled `invalid_request_error`. The complete message must be exactly:
+
+```text
+stream error: stream disconnected before completion: stream closed before response.completed
+```
+
+This failure is classified as `sse_stream_disconnect`. Before commit, failed
+output is discarded and the existing local and client retry budgets apply, within
+the current deadline and buffering window. After commit, the stream ends without
+transparent replay. This exception does not change retry limits or timeouts.
+
 If retries continue, check the gateway's credentials, account state, availability,
 and rate limits. A permanently bad key or exhausted balance will not improve
 without intervention, even though the proxy allows time for recovery. Generic
@@ -108,9 +120,11 @@ are returned with `X-Should-Retry: false`; terminal Responses errors use HTTP
 
 Anthropic HTTP errors use recognized message signatures. A bare HTTP
 `invalid_request_error` without one can still retry; an Anthropic in-stream
-`invalid_request_error` is terminal. Responses classification uses error codes,
-types, and recognized messages, with known transient codes taking precedence over
-generic invalid-request types. Gateway retry headers override HTTP heuristics.
+`invalid_request_error` is terminal except for the exact transport-disconnect
+signature above. Invalid schemas, malformed tool messages, and context-limit
+failures remain terminal. Responses classification uses error codes, types, and
+recognized messages, with known transient codes taking precedence over generic
+invalid-request types. Gateway retry headers override HTTP heuristics.
 
 ### Codex context compaction
 

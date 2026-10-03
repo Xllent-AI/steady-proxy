@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"log"
@@ -392,6 +393,125 @@ func TestE2ETransactionalLocalRetryTruncateThenSuccess(t *testing.T) {
 	}
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("want exactly 2 upstream attempts, got %d", got)
+	}
+}
+
+func TestE2ESSEDisconnectRetryBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		retries                   int
+		recover                   bool
+		backoff, window, deadline time.Duration
+		attempts, status          int
+	}{
+		{name: "recovered", retries: 1, recover: true, attempts: 2, status: 200},
+		{name: "local_disabled", recover: true, attempts: 1, status: 503},
+		{name: "local_exhausted", retries: 1, attempts: 2, status: 503},
+		{name: "deadline_insufficient", retries: 1, recover: true, backoff: time.Second, deadline: time.Second, attempts: 1, status: 503},
+		{name: "window_insufficient", retries: 1, recover: true, backoff: time.Second, window: 500 * time.Millisecond, attempts: 1, status: 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			prefix := strings.Replace(goodStream[:strings.Index(goodStream, "event: content_block_stop")], "Hi", "discarded-attempt", 1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if hits.Add(1) > 1 && tc.recover {
+					io.WriteString(w, goodStream)
+					return
+				}
+				io.WriteString(w, prefix+mislabeledDisconnectStream)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.txLocalRetries = tc.retries
+			cfg.localBackoffCap = tc.backoff
+			if tc.window > 0 {
+				cfg.keepaliveMs = tc.window
+			}
+			if tc.deadline > 0 {
+				cfg.maxRequestDur = tc.deadline
+			}
+
+			rec := doStream(`{"stream":true,"model":"m"}`)
+			body := rec.Body.String()
+			if rec.Code != tc.status || int(hits.Load()) != tc.attempts {
+				t.Fatalf("want status=%d attempts=%d, got status=%d attempts=%d body=%s", tc.status, tc.attempts, rec.Code, hits.Load(), body)
+			}
+			if strings.Contains(body, "discarded-attempt") {
+				t.Fatalf("failed attempt leaked output: %s", body)
+			}
+			if tc.status == 200 {
+				if rec.Header().Get("X-Steady-Proxy-Mode") != "buffered" || !strings.Contains(body, "message_stop") || !strings.Contains(body, "Hi") || strings.Contains(body, "event: error") {
+					t.Fatalf("recovery did not deliver a complete buffered response: headers=%v body=%s", rec.Header(), body)
+				}
+			} else if rec.Header().Get("X-Should-Retry") != "true" || rec.Header().Get("X-Steady-Proxy-Reason") != "sse_stream_disconnect" || !strings.Contains(body, `"type":"api_error"`) {
+				t.Fatalf("uncommitted disconnect must retain the client retry signal: headers=%v body=%s", rec.Header(), body)
+			}
+		})
+	}
+}
+
+func TestE2ESSEDisconnectAfterCommitDoesNotReplay(t *testing.T) {
+	var hits atomic.Int32
+	releaseError := make(chan struct{}, 1)
+	prefix := strings.Replace(goodStream[:strings.Index(goodStream, "event: content_block_stop")], "Hi", "committed-attempt", 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits.Add(1) > 1 {
+			io.WriteString(w, goodStream)
+			return
+		}
+		io.WriteString(w, prefix)
+		w.(http.Flusher).Flush()
+		select {
+		case <-releaseError:
+			io.WriteString(w, mislabeledDisconnectStream)
+		case <-r.Context().Done():
+		}
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.keepaliveMs = 20 * time.Millisecond
+	cfg.txLocalRetries = 2
+	cfg.localBackoffCap = 0
+	proxy := httptest.NewServer(http.HandlerFunc(handle))
+	defer proxy.Close()
+	downstream := &http.Client{Timeout: 3 * time.Second}
+	resp, err := downstream.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(`{"stream":true,"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("X-Steady-Proxy-Mode") != "live" {
+		t.Fatalf("want committed live response, got status=%d headers=%v", resp.StatusCode, resp.Header)
+	}
+	reader := bufio.NewReader(resp.Body)
+	var received strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading committed content: %v", err)
+		}
+		received.WriteString(line)
+		if strings.Contains(line, "committed-attempt") {
+			break
+		}
+	}
+	// Release the error only after the client has observed actual response content.
+	releaseError <- struct{}{}
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received.Write(rest)
+	body := received.String()
+	if hits.Load() != 1 {
+		t.Fatalf("committed failure replayed upstream: attempts=%d body=%s", hits.Load(), body)
+	}
+	if strings.Contains(body, "message_stop") || strings.Contains(body, "event: error") || strings.Contains(body, streamDisconnectMessage) || strings.Contains(body, `"text":"Hi"`) {
+		t.Fatalf("committed failure must end the partial stream without an error or replacement response: %s", body)
 	}
 }
 

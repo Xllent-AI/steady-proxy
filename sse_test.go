@@ -31,6 +31,10 @@ data: {"type":"message_stop"}
 
 `
 
+const streamDisconnectMessage = "stream error: stream disconnected before completion: stream closed before response.completed"
+
+const mislabeledDisconnectStream = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" + streamDisconnectMessage + "\"}}\n\n"
+
 func init() { cfg = testConfig() }
 
 func capture(t *testing.T, s string) (*httptest.ResponseRecorder, *failure) {
@@ -482,11 +486,46 @@ func TestCaptureSSEErrorOverloaded(t *testing.T) {
 	}
 }
 
-func TestCaptureSSEErrorPermanent(t *testing.T) {
-	s := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n"
-	_, f := capture(t, s)
-	if f == nil || f.transient {
-		t.Fatalf("want permanent failure, got %+v", f)
+func TestCaptureSSEErrorClassification(t *testing.T) {
+	useDefaultConfig(t)
+	for _, tc := range []struct {
+		name, typ, message string
+		transient          bool
+	}{
+		{"mislabeled_disconnect", "invalid_request_error", streamDisconnectMessage, true},
+		{"typed_disconnect", "timeout_error", streamDisconnectMessage, true},
+		{"unknown_request_error", "invalid_request_error", "bad", false},
+		{"invalid_schema", "invalid_request_error", "invalid tool schema", false},
+		{"malformed_tool_message", "invalid_request_error", "messages.0: unexpected tool_use_id in tool_result", false},
+		{"context_limit", "invalid_request_error", "prompt is too long for context", false},
+		{"stream_validation", "invalid_request_error", "invalid tool schema for stream", false},
+		{"stream_error_validation", "invalid_request_error", "stream error: invalid tool schema", false},
+		{"partial_disconnect", "invalid_request_error", "stream disconnected before completion", false},
+		{"different_stream_error", "invalid_request_error", "stream error: stream disconnected before completion: invalid tool schema", false},
+		{"disconnect_with_validation", "invalid_request_error", streamDisconnectMessage + ": invalid tool schema", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(map[string]any{
+				"type": "error", "error": map[string]string{"type": tc.typ, "message": tc.message},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, f := capture(t, "event: error\ndata: "+string(data)+"\n\n")
+			if f == nil || f.transient != tc.transient || f.message != tc.message {
+				t.Fatalf("want transient=%v with original message, got %+v", tc.transient, f)
+			}
+			status, typ := http.StatusBadRequest, "invalid_request_error"
+			if tc.transient {
+				status, typ = http.StatusBadGateway, "api_error"
+			}
+			if f.status != status || f.atype != typ {
+				t.Fatalf("want status=%d type=%s, got %+v", status, typ, f)
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("failed attempt leaked output: %s", rec.Body.String())
+			}
+		})
 	}
 }
 
