@@ -224,7 +224,11 @@ func classifySSEError(data string) *failure {
 		return &failure{transient: true, status: 429, atype: "rate_limit_error", code: "sse_rate_limit", message: e.Error.Message}
 	case "api_error", "timeout_error", "":
 		return &failure{transient: true, status: 502, atype: "api_error", code: "sse_api_error", message: e.Error.Message}
-	case "invalid_request_error": // request-shape: can never succeed, surface it
+	case "invalid_request_error":
+		// Only this verified transport failure overrides the request-error label.
+		if e.Error.Message == "stream error: stream disconnected before completion: stream closed before response.completed" {
+			return &failure{transient: true, status: 502, atype: "api_error", code: "sse_stream_disconnect", message: e.Error.Message}
+		}
 		return &failure{transient: false, status: 400, atype: e.Error.Type, code: "sse_request_shape", message: e.Error.Message}
 	default: // authentication_error, permission_error, not_found_error, unknown -> retry
 		return &failure{transient: true, status: 502, atype: "api_error", code: "sse_retryable", message: e.Error.Message}
