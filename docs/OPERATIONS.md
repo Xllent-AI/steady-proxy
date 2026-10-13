@@ -5,7 +5,8 @@ This guide covers routine operation, request logs, and payload capture.
 
 ## Docker Compose
 
-Run these commands from the repository directory:
+Run these commands from the repository directory after copying
+`docker-compose.yml.example` to your local `docker-compose.yml` during setup:
 
 ```bash
 docker compose up -d --build
@@ -21,7 +22,7 @@ their numeric results as `UID` and `GID` in `.env`. Bash does not export its `UI
 variable by default and has no built-in `GID` variable. Exported values take
 precedence over `.env`.
 
-The host's `./logs` directory is mounted at `/logs` in the container. The container
+The example mounts the host's `./logs` directory at `/logs` in the container. The container
 working directory is `/`, so `PROXY_REQUEST_LOG_DIR=./logs` uses that mount.
 
 ## Check the running version

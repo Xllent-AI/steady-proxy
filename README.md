@@ -53,6 +53,7 @@ For a native installation, see [building and running from source](docs/DEVELOPME
 git clone https://github.com/Xllent-AI/steady-proxy
 cd steady-proxy
 cp .env.example .env
+cp docker-compose.yml.example docker-compose.yml
 ```
 
 Edit `.env` and set your gateway URL:

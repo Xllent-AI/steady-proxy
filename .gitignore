@@ -15,3 +15,6 @@ test/*.log
 !/logs/.gitkeep
 # local env with the real gateway URL — never commit
 .env
+
+# local Compose deployment — copy docker-compose.yml.example for a fresh setup
+/docker-compose.yml

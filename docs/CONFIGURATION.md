@@ -7,7 +7,7 @@ remaining settings when you need to change the defaults.
 ## Applying settings
 
 Docker Compose reads `.env` and passes the variables declared in
-[`docker-compose.yml`](../docker-compose.yml) to the container. After editing
+[`docker-compose.yml.example`](../docker-compose.yml.example) to the container. After editing
 `.env`, run `docker compose up -d` to apply the changes. Exported shell values take
 precedence over `.env`.
 

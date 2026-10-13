@@ -1,4 +1,4 @@
-# Run the proxy in front of your gateway: set PROXY_UPSTREAM_URL in .env,
+# Copy to docker-compose.yml, set PROXY_UPSTREAM_URL in .env,
 # then run `docker compose up -d --build`.
 # See README.md for API client setup, including Claude Code and Codex examples.
 # Settings and defaults: docs/CONFIGURATION.md.
