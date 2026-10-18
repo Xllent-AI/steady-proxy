@@ -64,10 +64,33 @@ The workflow then:
 4. Refuses to proceed if any release already uses the tag, including a draft.
 5. Creates a draft with generated GitHub release notes and all five assets, then
    publishes it after uploading succeeds.
+6. Calls the container publishing workflow to build the tagged source and push
+   `ghcr.io/xllent-ai/steady-proxy:v0.1.1` (using the actual release tag).
 
-The workflow uses GitHub's automatic token; no personal token is needed. It does
-not upload container images. Review the published release notes for any migration
-or configuration guidance that commit and pull-request summaries do not explain.
+The workflows use GitHub's automatic token; no personal token is needed. The
+container job has `packages: write` permission. Review the published release notes
+for any migration or configuration guidance that commit and pull-request summaries
+do not explain.
+
+## Container images
+
+The [container workflow](../.github/workflows/docker-publish.yml) publishes Linux
+amd64 images to `ghcr.io/xllent-ai/steady-proxy`:
+
+- Every push to `main` updates `latest` from that push's commit.
+- Publishing a GitHub release builds its tag and publishes an image with that
+  tag, such as `v0.1.1`. Release images never move `latest`.
+- Both paths also publish `sha-<full-commit-sha>` and stamp the executable with
+  `VERSION`, the checked-out commit, build time, and clean working-tree status.
+
+The release workflow calls the container workflow directly because releases
+created with `GITHUB_TOKEN` do not trigger another workflow via a `release` event.
+Manually published releases use the `release: published` trigger instead.
+
+After the first image is published, check the package's visibility in GitHub's
+package settings; change it to public to allow unauthenticated pulls. The image's
+source label links it to this repository. If a package with the same name already
+exists, grant this repository Actions access to it before publishing.
 
 ## If a release fails
 
@@ -75,6 +98,9 @@ Use the failed Actions run to identify the failing step. A test or packaging
 failure creates no GitHub release. An upload or publication failure can leave a
 draft; inspect it and delete that draft before rerunning the failed jobs. The
 workflow will not overwrite its assets automatically.
+
+If only the container job fails after the release is published, rerun that failed
+job; do not recreate the release. It rebuilds the same release tag.
 
 If a published release needs a fix, use a new version and tag. Keep existing
 published tags and assets unchanged so downloads continue to identify the same

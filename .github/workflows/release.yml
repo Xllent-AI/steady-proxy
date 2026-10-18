@@ -69,3 +69,13 @@ jobs:
             --title "$RELEASE_TAG" --generate-notes \
             ./*.tar.gz SHA256SUMS
           gh release edit "$RELEASE_TAG" --draft=false
+
+  # GITHUB_TOKEN-created releases do not trigger release-event workflows.
+  image:
+    needs: publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      tag: ${{ github.ref_name }}
