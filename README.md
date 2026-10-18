@@ -79,6 +79,19 @@ The version endpoint confirms that the proxy is running; it does not contact you
 gateway. Next, configure the client you use below. Keep your existing API
 credentials: the proxy forwards them to the gateway.
 
+Prebuilt Linux amd64 images are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/xllent-ai/steady-proxy:latest
+```
+
+`latest` follows `main`; release tags such as `v0.1.1` select a release instead.
+To use a prebuilt image with the example Compose configuration, change its
+`image:` to `ghcr.io/xllent-ai/steady-proxy:latest`, remove the `build:` block, then
+run `docker compose pull && docker compose up -d`. See
+[container publishing](docs/RELEASING.md#container-images) for tagging and registry
+access details.
+
 ### Claude Code
 
 Merge this `env` block into `~/.claude/settings.json`, keeping your other settings
