@@ -333,12 +333,16 @@ func surfaceFor(path string, f failure) (status int, atype string) {
 	return status, atype
 }
 
-// Codex ignores X-Should-Retry, so exhausting/disabling the proxy retry budget
-// must also produce its terminal HTTP status. Keep the original failure intact
-// for diagnostics, and preserve Claude's generic error shape with its false header.
+// Clients that ignore X-Should-Retry need a terminal status when retry conversion
+// is disabled or exhausted. Keep the original failure intact for diagnostics.
 func retrySurfaceFor(path string, f failure, canRetry bool) (int, string) {
-	if isResponsesPath(path) && !canRetry {
+	if (isResponsesPath(path) || isGeminiPath(path)) && !canRetry {
+		wasTransient := f.transient
 		f.transient = false
+		status := statusFor(f)
+		if isGeminiPath(path) && (wasTransient || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500) {
+			f.status = http.StatusBadRequest
+		}
 	}
 	return surfaceFor(path, f)
 }

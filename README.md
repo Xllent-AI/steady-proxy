@@ -24,19 +24,21 @@ It provides:
 Agents / SDKs / applications → steady-proxy on localhost → your gateway
 ```
 
-Stream protection is built around **Anthropic Messages** (`/v1/messages`) and
-**OpenAI Responses** (`/v1/responses`). Claude Code and Codex are supported clients;
-other agents and SDK-based applications can use these routes too, with compatible
-timeout, retry, and SSE handling. Subagents using the same API settings are covered
-without terminal automation. See [client compatibility](docs/ARCHITECTURE.md#client-compatibility)
-for the requirements and behavior of other routes.
+Stream protection supports **Anthropic Messages** (`/v1/messages`),
+**OpenAI Responses** (`/v1/responses`), and native **Gemini GenerateContent**
+(`/{version}/models/{model}:streamGenerateContent?alt=sse`). Claude Code and Codex
+are supported clients; other agents and SDK-based applications can use these
+routes with compatible timeout, retry, and SSE handling. Subagents using the same
+API settings are covered without terminal automation. See
+[client compatibility](docs/ARCHITECTURE.md#client-compatibility) for requirements
+and the behavior of other routes.
 
 ## What to expect
 
-By default, Messages streams are buffered for up to 10 minutes. A response that
-finishes within that window appears all at once. Responses streams go live as soon
-as output arrives; you can enable full buffering to protect them from later stream
-failures.
+By default, Messages and Gemini SSE streams are buffered for up to 10 minutes.
+A response that finishes within that window appears all at once. Responses
+streams go live as soon as output arrives; you can enable full buffering to
+protect them from later stream failures.
 
 Before the proxy sends a response, it can discard a failed attempt and retry.
 After it starts streaming to the client, recovery depends on the client's own
@@ -125,8 +127,37 @@ PROXY_TRANSACTIONAL_LOCAL_RETRIES=3
 ```
 
 Full buffering delays visible output until completion or the buffering window
-ends. Extra retries apply to both supported streaming APIs and must fit within
+ends. Extra retries apply to all three supported streaming APIs and must fit within
 the active window. See [retry budgets](docs/ARCHITECTURE.md#retry-budgets).
+
+### Gemini
+
+Use a gateway that accepts native Gemini requests, or set
+`PROXY_UPSTREAM_URL=https://generativelanguage.googleapis.com` for Google's
+Developer API. Point your SDK's HTTP base URL at `http://127.0.0.1:8789`, retaining
+its API version and model settings. The proxy forwards `x-goog-api-key`, bearer
+authentication, and query parameters unchanged; it does not translate protocols.
+
+For a direct SSE request, set `GEMINI_MODEL` to an available model and keep your
+existing `GEMINI_API_KEY`:
+
+```bash
+curl -N --max-time 720 \
+  "http://127.0.0.1:8789/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse" \
+  -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"contents":[{"parts":[{"text":"Say hello."}]}]}'
+```
+
+Gemini selects streaming through the method and `alt=sse`, not a `stream` body
+field. `generateContent` and `countTokens` remain single-shot JSON requests with
+Gemini-shaped HTTP errors. Standard Vertex AI project/location/publisher model
+paths are also recognized; keep the Vertex upstream host and bearer credentials.
+
+`PROXY_GEMINI_BUFFER_MS` controls the independent 600,000 ms buffering window.
+Set client timeouts above it and configure bounded retries for HTTP `503`, honoring
+`Retry-After`. After a timed switch to live output, keepalives are SSE comments;
+failed streams abort the HTTP transport and require client recovery.
 
 ### Other API clients
 

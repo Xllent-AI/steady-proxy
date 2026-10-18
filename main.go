@@ -1,6 +1,5 @@
 // steady-proxy — a transactional, self-healing reverse proxy for API clients
-// using Anthropic Messages (POST /v1/messages) or OpenAI Responses (POST
-// /v1/responses), including Claude Code and Codex.
+// using Anthropic Messages, OpenAI Responses, or native Gemini GenerateContent.
 //
 //	Agents / SDKs / applications ──HTTP──▶ this proxy (loopback) ──HTTPS──▶ your gateway
 //
@@ -35,6 +34,9 @@
 //     SSE stream (terminal `response.completed`); a start-of-stream `error` /
 //     `response.failed` is caught pre-commit and converted to a retry, and once
 //     output appears it commits early and streams live. See wireModel (wire.go).
+//   - Native Gemini streamGenerateContent?alt=sse buffers through clean EOF
+//     after all requested candidates finish, retaining trailing usage metadata.
+//     PROXY_GEMINI_BUFFER_MS bounds the hold before switching to live output.
 //   - Any failure before that commit point (connection error, 5xx, stalled or
 //     truncated stream, mid-stream `error` event, or a retryable status) is
 //     turned into a *retryable* response: it stamps `x-should-retry: true` plus a
@@ -91,6 +93,7 @@ type config struct {
 	wfKeepaliveMs        time.Duration
 	responsesKeepaliveMs time.Duration
 	responsesBufferMs    time.Duration
+	geminiBufferMs       time.Duration
 	responsesEarlyCommit bool // Responses (Codex): commit on first output (default); false = buffer to terminal under responsesBufferMs, like /v1/messages
 	responsesReplayBytes int  // Responses buffered/prefix replay: coalesce adjacent output_text.delta events up to this many source JSON bytes; 0 = raw replay
 	deadlineMargin       time.Duration
@@ -132,6 +135,7 @@ func parseConfig(lookup func(string) (string, bool)) (config, error) {
 		wfKeepaliveMs:        e.ms("PROXY_WORKFLOW_KEEPALIVE_MS", 10000, 0),                 // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
 		responsesKeepaliveMs: e.ms("PROXY_RESPONSES_KEEPALIVE_MS", 30000, 0),                // OpenAI Responses route (Codex), applies ONLY in early-commit mode: bounds a silent start (reasoning with no output) before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead (see config.keepaliveWindow). Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
 		responsesBufferMs:    e.ms("PROXY_RESPONSES_BUFFER_MS", 600000, 0),                  // Responses (Codex) hold used ONLY when early-commit is off: buffer to the terminal, committing live at this window as a safety valve (the /v1/messages policy applied to Responses). Responses-OWNED — independent of PROXY_KEEPALIVE_MS — so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it (nothing is forwarded while buffering).
+		geminiBufferMs:       e.ms("PROXY_GEMINI_BUFFER_MS", 600000, 0),                     // Gemini buffers through clean EOF; 0 disables the timed switch to live output.
 		responsesEarlyCommit: e.str("PROXY_RESPONSES_EARLY_COMMIT", "1") != "0",             // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
 		responsesReplayBytes: int(e.int64("PROXY_RESPONSES_REPLAY_DELTA_BYTES", 64<<10, 0)), // collapse tiny adjacent Codex text deltas during buffered/prefix replay so a completed turn cannot burst thousands of app-server notifications into the TUI; 0 preserves byte-for-byte replay. Live events remain untouched.
 		deadlineMargin:       e.ms("PROXY_DEADLINE_MARGIN_MS", 25000, 0),                    // finish before the client's own timeout
@@ -214,8 +218,8 @@ func main() {
 		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: /v1/messages + /v1/responses, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
-		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
+	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: Messages + Responses + Gemini SSE, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, gemini-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
+		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.geminiBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -251,15 +255,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reqStart := time.Now()
-	// The client-facing error shape follows the request's wire (Anthropic Messages
-	// vs OpenAI Responses); resolve it up front so even an early reject renders in
-	// the shape the client expects.
+	// Resolve the wire before reading the body so early rejects also use its
+	// native error envelope. Only supported SSE generation requests are buffered;
+	// other routes remain single-shot with HTTP retry normalization.
 	writeErr := errorWriterFor(r.URL.Path)
-	// Only streaming POST /v1/messages and POST /v1/responses get the full
-	// transactional treatment. Everything else (e.g. /v1/messages/count_tokens,
-	// model listing) is forwarded with a single attempt; transport errors AND
-	// upstream HTTP errors there are still converted to retryable and masked to a
-	// generic 503 (see proxyOnce).
 	body, tooBig, err := readBody(r)
 	if tooBig {
 		// Deterministic: the same oversized request can never succeed. surfaceFor keeps
@@ -281,8 +280,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		defer rec.finish()
 	}
 
-	transactional := r.Method == http.MethodPost && requestWantsStream(body) &&
-		(isMessagesPath(r.URL.Path) || isResponsesPath(r.URL.Path))
+	_, geminiMethod := geminiTarget(r.URL.Path)
+	geminiStream := geminiMethod == "streamGenerateContent" && r.URL.Query().Get("alt") == "sse"
+	transactional := r.Method == http.MethodPost && (geminiStream ||
+		(requestWantsStream(body) && (isMessagesPath(r.URL.Path) || isResponsesPath(r.URL.Path))))
 	if !transactional {
 		proxyOnce(w, r, body, rec)
 		return
@@ -295,6 +296,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// become hidden retries too — at the cost of a longer initial silence the
 	// client's stream-idle timeout must cover).
 	isResp := isResponsesPath(r.URL.Path)
+	isMessages := isMessagesPath(r.URL.Path)
 	earlyCommit := isResp && cfg.responsesEarlyCommit
 
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
@@ -320,8 +322,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// commit-early window AND gate the commit on real forwarded progress (see
 	// captureSSEWindow); every other caller keeps the full hold. The window choice
 	// (per wire + mode) lives in config.keepaliveWindow.
-	gated := !isResp && isWorkflowAgent(body) // Workflow stall gating is Anthropic-only
+	gated := isMessages && isWorkflowAgent(body)
 	kaWindow := cfg.keepaliveWindow(isResp, earlyCommit, gated)
+	if geminiStream {
+		kaWindow = cfg.geminiBufferMs
+	}
 	commitBy := bufferDeadline(reqStart, kaWindow)
 	canWait := func(wait time.Duration) bool {
 		return canWaitForLocalRetry(ctx, wait) && (commitBy.IsZero() || time.Until(commitBy) > wait)
@@ -385,7 +390,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// again (no recursion). The swap itself is deferred to the refusal branch so
 		// the happy path never marshals a fallback body it won't use.
 		reqModel := modelOf(body)
-		interceptRefusal := !isResp && cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
+		interceptRefusal := isMessages && cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
 
 		rec.beginAttempt(body, reqWho, proxyRetries)
 		resp, started, stopDeadline, rtErr := roundTripBefore(ctx, r, body, commitBy)
@@ -457,7 +462,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// The stream engine now owns the same absolute commit deadline; it can
 		// switch to live output without the pre-stream timer killing the body.
 		stopDeadline()
-		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wireFor(r.URL.Path, interceptRefusal), commitBy)
+		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wireFor(r.URL.Path, body, interceptRefusal), commitBy)
 		resp.Body.Close()
 		rec.noteAttemptStats(&st)
 		if fail == nil {
@@ -490,11 +495,16 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
-			log.Printf("DROP  %s%s  %s -> committed, Claude retries natively  out=%s tok  %s%s%s%s%s",
+			log.Printf("DROP  %s%s  %s -> committed, client recovery required  out=%s tok  %s%s%s%s%s",
 				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
 			rec.noteAttemptResult("drop")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
+			if geminiStream {
+				// Gemini readers use transport EOF, not a terminal SSE event. A clean
+				// HTTP end here could turn a truncated response into apparent success.
+				panic(http.ErrAbortHandler)
+			}
 			return
 		}
 		last = *fail
@@ -771,7 +781,11 @@ func isEventStream(ct string) bool { return strings.Contains(strings.ToLower(ct)
 // The method/path/gateway are static for the transactional route, so omitted.
 
 func who(r *http.Request, body []byte) string {
-	return modelOf(body) + "/" + agentKindFull(r, body)
+	model, _ := geminiTarget(r.URL.Path)
+	if model == "" {
+		model = modelOf(body)
+	}
+	return model + "/" + agentKindFull(r, body)
 }
 
 // agentKindFull refines agentKind with a body-derived signal: a Workflow-tool
@@ -779,7 +793,7 @@ func who(r *http.Request, body []byte) string {
 // generic "sub"agent, and only it carries the Workflow per-agent stall). Falls
 // back to the header-only agentKind for everything else.
 func agentKindFull(r *http.Request, body []byte) string {
-	if isWorkflowAgent(body) {
+	if isMessagesPath(r.URL.Path) && isWorkflowAgent(body) {
 		return "wf"
 	}
 	return agentKind(r)

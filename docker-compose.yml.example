@@ -26,6 +26,7 @@ services:
       PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}" # Shorter window for Workflow content progress; see docs/ARCHITECTURE.md.
       PROXY_RESPONSES_KEEPALIVE_MS: "${PROXY_RESPONSES_KEEPALIVE_MS:-30000}" # Silent-start window when early commit is enabled.
       PROXY_RESPONSES_BUFFER_MS: "${PROXY_RESPONSES_BUFFER_MS:-600000}" # Full-buffer window when early commit is disabled.
+      PROXY_GEMINI_BUFFER_MS: "${PROXY_GEMINI_BUFFER_MS:-600000}" # Native Gemini SSE buffering window; 0 disables the timed live switch.
       PROXY_RESPONSES_EARLY_COMMIT: "${PROXY_RESPONSES_EARLY_COMMIT:-1}" # 0 buffers Responses; client idle timeout must exceed the buffer window.
       PROXY_RESPONSES_REPLAY_DELTA_BYTES: "${PROXY_RESPONSES_REPLAY_DELTA_BYTES:-65536}" # Combine compatible text deltas during replay; 0 keeps raw replay.
       PROXY_RESP_HEADER_TIMEOUT_MS: "${PROXY_RESP_HEADER_TIMEOUT_MS:-660000}" # Overrides the binary default of 60000 ms for slow gateway headers.

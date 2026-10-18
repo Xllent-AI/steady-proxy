@@ -15,8 +15,8 @@ PROXY_UPSTREAM_URL=https://your-gateway.example.com ./steady-proxy
 
 The binary listens on `127.0.0.1:8789` by default. It reads environment variables
 directly and does not load `.env`. The README includes setup for
-[Claude Code](../README.md#claude-code), [Codex](../README.md#codex), and
-[other API clients](../README.md#other-api-clients).
+[Claude Code](../README.md#claude-code), [Codex](../README.md#codex),
+[Gemini](../README.md#gemini), and [other API clients](../README.md#other-api-clients).
 
 `make build` stamps the binary with `VERSION`, the Git commit, build date, and
 working-tree status. To build a versioned Docker image with explicit build
@@ -87,6 +87,8 @@ Read the [architecture guide](ARCHITECTURE.md) for the request lifecycle and
 | [`main.go`](../main.go) | Configuration, routing, deadlines, local retries, fallback, and access logs. |
 | [`wire.go`](../wire.go) | Shared protocol interface and Anthropic stream behavior. |
 | [`responses.go`](../responses.go) | OpenAI Responses completion, errors, keepalives, and replay. |
+| [`gemini.go`](../gemini.go) | Native Gemini candidate completion, usage, and unchanged SSE replay. |
+| [`gemini_errors.go`](../gemini_errors.go) | Google numeric/canonical error classification and rendering. |
 | [`sse.go`](../sse.go) | SSE capture, buffering, validation, tool JSON, and the transition to live output. |
 | [`classify.go`](../classify.go) | Failure classification and client retry responses. |
 | [`transport.go`](../transport.go) | Upstream deadline and byte-idle handling. |

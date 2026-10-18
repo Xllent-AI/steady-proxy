@@ -38,6 +38,8 @@ func newOpenAIWire() *openaiWire {
 	return &openaiWire{replayDeltaBytes: cfg.responsesReplayBytes}
 }
 
+func (o *openaiWire) completeOnEOF() bool { return false }
+
 func (o *openaiWire) scrape(ev event, st *captureStats) {
 	if st == nil {
 		return
@@ -1030,6 +1032,9 @@ func classifyHTTPErrorForPath(path string, resp *http.Response, b []byte) failur
 	if isResponsesPath(path) {
 		return classifyResponsesHTTPErrorBytes(resp, b)
 	}
+	if isGeminiPath(path) {
+		return classifyGeminiHTTPErrorBytes(resp, b)
+	}
 	return classifyHTTPErrorBytes(resp, b)
 }
 
@@ -1042,6 +1047,9 @@ type errorWriter func(w http.ResponseWriter, canRetry bool, status int, atype, m
 func errorWriterFor(path string) errorWriter {
 	if isResponsesPath(path) {
 		return writeOpenAIError
+	}
+	if isGeminiPath(path) {
+		return writeGeminiError
 	}
 	return writeAnthropicError
 }

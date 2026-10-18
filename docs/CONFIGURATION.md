@@ -59,12 +59,13 @@ includes upstream waits, retry delays, and fallback attempts. See
 | `PROXY_WORKFLOW_KEEPALIVE_MS` | `10000` (10 s) | Workflow agent window; live output also requires real content. `0` keeps these requests buffered without a timed switch. |
 | `PROXY_RESPONSES_KEEPALIVE_MS` | `30000` (30 s) | Responses silent-start window when early commit is on. `0` disables this timer; output can still trigger early commit. |
 | `PROXY_RESPONSES_BUFFER_MS` | `600000` (10 min) | Responses window when early commit is off. `0` disables the timed switch to live output. |
+| `PROXY_GEMINI_BUFFER_MS` | `600000` (10 min) | Native Gemini SSE buffering window. `0` disables the timed switch to live output; clean completion, idle limits, and request deadlines still apply. |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` (1 min) | Wait for upstream response headers. `0` disables this timeout, but other deadlines still apply. |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` (10 min) | Maximum gap without upstream bytes during SSE capture or error-body reads. Must be at least `1`. |
 | `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` (25 min) | Total request deadline, including local retries. Must be at least `1`. |
 | `PROXY_DEADLINE_MARGIN_MS` | `25000` (25 s) | Time reserved before a client's `X-Stainless-Timeout` deadline. `0` removes the margin. |
 
-On streaming Messages and Responses requests, `X-Stainless-Timeout` is read in
+On supported streaming requests, `X-Stainless-Timeout`, when present, is read in
 **seconds**. The effective duration is the smaller of the configured request
 ceiling and the client timeout minus the margin. For short client timeouts, the
 margin is limited to half their budget. Other routes use the configured ceiling.
@@ -93,6 +94,12 @@ early-commit mode, or above `PROXY_RESPONSES_BUFFER_MS` in full-buffer mode. The
 README's `660000` covers either default. A zero window does not disable the
 client's timeouts or the proxy's request deadline.
 
+For Gemini, keep SDK response-header, idle, and total timeouts above
+`PROXY_GEMINI_BUFFER_MS`. A timeout of 660,000 ms or more covers the default
+buffering window. Keepalives after the live switch are standard SSE comments;
+clients that ignore comments for idle accounting must allow their actual content
+gaps too. Non-SSE `streamGenerateContent` transports are forwarded without buffering.
+
 Claude Code Workflow agents have an additional content stall timer. Keep their proxy window
 small and below the script's `stallMs`; see [Workflow agents](ARCHITECTURE.md#workflow-agents).
 
@@ -107,9 +114,10 @@ small and below the script's `stallMs`; see [Workflow agents](ARCHITECTURE.md#wo
 
 Local retries need enough time left in the current request and buffering window.
 The SDK cap uses the Stainless counter; it does not raise client retry limits.
-Clients without that header, including Codex, must enforce their own retry limits
-when the proxy cap is positive. With a zero cap, Responses failures are returned
-as terminal HTTP `400` because Codex does not honor `X-Should-Retry: false` alone.
+Clients without that header, including Codex and Gemini SDKs, must enforce their
+own retry limits when the proxy cap is positive. With a zero cap, Responses and
+transient Gemini failures are returned as terminal HTTP `400` because those
+clients may not honor `X-Should-Retry: false` alone.
 
 Model fallback has a separate budget and remains enabled when the SDK cap is
 zero. See [retry budgets](ARCHITECTURE.md#retry-budgets) and
@@ -129,8 +137,8 @@ bounds grouped payloads and reduces bursts of tiny notifications when replaying 
 buffered response. Live deltas are unchanged. Incompatible, oversized, malformed,
 or ambiguous frames and frames with non-empty logprobs remain raw.
 
-Responses completion/error detection and Anthropic structured refusal detection
-remain active even when `PROXY_VALIDATE_JSON=0`.
+Responses completion/error detection, Gemini JSON/completion/error checks, and
+Anthropic structured refusal detection remain active with `PROXY_VALIDATE_JSON=0`.
 
 ## Storage and diagnostics
 
@@ -161,7 +169,9 @@ classification:
 
 `x-gateway-retryable` takes precedence over `x-should-retry`, which takes precedence
 over status and body heuristics. A terminal Responses error is rendered as HTTP
-`400`; other routes retain the classified non-retryable status.
+`400`. Gemini also normalizes non-retryable `408`, `429`, and `5xx` errors to `400`
+because its SDKs may ignore `X-Should-Retry: false`. Other non-retryable statuses
+are retained.
 
 These headers control retry classification. Recognized Anthropic safeguards
 errors can still trigger a separate [model fallback](ARCHITECTURE.md#model-fallback),

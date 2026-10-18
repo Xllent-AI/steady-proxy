@@ -133,7 +133,8 @@ The proxy has no authentication of its own. Keep its listening port on loopback;
 Compose's published port already is. Anyone with access to the port can relay
 requests with credentials they supply and read `/__version`.
 
-Client authorization and Anthropic headers are forwarded to `PROXY_UPSTREAM_URL`.
+Client authorization and provider-specific headers, including `x-goog-api-key`,
+are forwarded to `PROXY_UPSTREAM_URL`, along with query authentication such as `key`.
 The proxy does not follow redirects. Its HTTP transport honors
 `HTTP_PROXY`/`HTTPS_PROXY` and `NO_PROXY` in the proxy process environment, so a
 configured forward proxy is also part of the connection path.
@@ -145,8 +146,8 @@ off persistent disk.
 
 Payload archives are different: they are persistent and **unencrypted**. Known
 credential headers and query parameters are redacted, including `Authorization`,
-`x-api-key`, `Proxy-Authorization`, `api_key`, `api_token`, `access_token`, and
-`client_secret`. Redacted names are listed in `redactions`. Other headers and
+`x-api-key`, `x-goog-api-key`, `Proxy-Authorization`, `key`, `api_key`, `api_token`,
+`access_token`, and `client_secret`. Redacted names are listed in `redactions`. Other headers and
 parameters remain, and **bodies are not inspected or redacted**. Base64 is an
 encoding, not encryption.
 

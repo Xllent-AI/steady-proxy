@@ -401,6 +401,7 @@ func TestRequestLogOnlyRedactsAPISecrets(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer sk-secret-auth")
 	req.Header.Set("X-API-Key", "sk-secret-header")
 	req.Header.Set("Proxy-Authorization", "Basic proxy-secret")
+	req.Header.Set("X-Goog-Api-Key", "goog-secret-header")
 	req.Header.Set("Cookie", "sid=request-cookie")
 	rec := httptest.NewRecorder()
 	handle(rec, req)
@@ -413,7 +414,7 @@ func TestRequestLogOnlyRedactsAPISecrets(t *testing.T) {
 		t.Fatalf("want 1 archive file, got %d", len(files))
 	}
 	ar, raw := readArchive(t, files[0])
-	for _, leaked := range []string{"sk-secret-auth", "sk-secret-header", "proxy-secret", "sk-secret-0000", "sk-secret-key", "sk-api-token", "sk-auth-token", "sk-access", "sk-client"} {
+	for _, leaked := range []string{"sk-secret-auth", "sk-secret-header", "goog-secret-header", "proxy-secret", "sk-secret-0000", "sk-secret-key", "sk-api-token", "sk-auth-token", "sk-access", "sk-client"} {
 		if bytes.Contains(raw, []byte(leaked)) {
 			t.Fatalf("API secret %q leaked into archive:\n%s", leaked, raw)
 		}
@@ -434,6 +435,7 @@ func TestRequestLogOnlyRedactsAPISecrets(t *testing.T) {
 	}
 	if !containsString(ar.Redactions.HeaderNames, "Authorization") ||
 		!containsString(ar.Redactions.HeaderNames, "X-Api-Key") ||
+		!containsString(ar.Redactions.HeaderNames, "X-Goog-Api-Key") ||
 		!containsString(ar.Redactions.HeaderNames, "Proxy-Authorization") {
 		t.Fatalf("missing API header redactions: %+v", ar.Redactions)
 	}
