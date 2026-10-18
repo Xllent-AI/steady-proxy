@@ -296,7 +296,7 @@ func (rec *reqRecorder) beginAttempt(body []byte, reqWho string, proxyRetries in
 		StartedAt:         rec.whenString(started),
 		started:           started,
 		Who:               reqWho,
-		Model:             modelOf(body),
+		Model:             requestModelOf(rec.path, body),
 		ProxyRetry:        proxyRetries,
 		RequestBodyRef:    ref,
 		RequestBodySize:   len(body),

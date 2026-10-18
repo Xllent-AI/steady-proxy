@@ -111,8 +111,7 @@ func anyContains(s string, subs []string) bool {
 	return false
 }
 
-// classifyTransport handles a failure that occurred before/around the response
-// headers (dial/TLS/reset/timeout).
+// classifyTransport handles failed upstream I/O and request cancellation.
 func classifyTransport(err error, ctx context.Context) failure {
 	switch {
 	case ctx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded):
@@ -156,6 +155,19 @@ func classifyHTTPErrorBytes(resp *http.Response, b []byte) failure {
 	return classifyHTTPErrorBytesShaped(resp, b, anthropicRequestShaped)
 }
 
+// httpRetryHint returns the first recognized authoritative retry verdict.
+func httpRetryHint(h http.Header) (source string, retry bool) {
+	for _, name := range [...]string{"x-gateway-retryable", "x-should-retry"} {
+		switch strings.ToLower(h.Get(name)) {
+		case "true":
+			return name, true
+		case "false":
+			return name, false
+		}
+	}
+	return "", false
+}
+
 // classifyHTTPErrorBytesShaped is classifyHTTPErrorBytes with a pluggable
 // request-shape decision so each wire keeps its own "can never succeed" rule
 // while sharing the status/header handling.
@@ -178,17 +190,17 @@ func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, reqShaped reque
 	// beats every heuristic below. x-should-retry is the Anthropic API's own near-
 	// equivalent. Both are absent from a plain provider, which falls through
 	// to status/body classification.
-	switch strings.ToLower(resp.Header.Get("x-gateway-retryable")) {
-	case "true":
-		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "gateway_retryable_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
-	case "false":
+	switch source, retry := httpRetryHint(resp.Header); source {
+	case "x-gateway-retryable":
+		if retry {
+			return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "gateway_retryable_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
+		}
 		return failure{transient: false, status: st, atype: atype, code: "gateway_permanent", message: ae.Error.Message, retryAfter: ra}
-	}
-	switch strings.ToLower(resp.Header.Get("x-should-retry")) {
-	case "false":
+	case "x-should-retry":
+		if retry {
+			return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "upstream_retry_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
+		}
 		return failure{transient: false, status: st, atype: atype, code: "upstream_no_retry", message: ae.Error.Message}
-	case "true":
-		return failure{transient: true, status: mapTransientStatus(st), atype: atype, code: "upstream_retry_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
 	}
 
 	switch {

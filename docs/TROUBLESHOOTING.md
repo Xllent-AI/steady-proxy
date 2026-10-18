@@ -145,6 +145,18 @@ status is `INVALID_ARGUMENT`, preserving the proxy's authentication policy.
 Gateway retry headers still take precedence on HTTP errors. See Google's
 [GenerateContent error reference](https://ai.google.dev/gemini-api/docs/generate-content/api-errors).
 
+Gemini's native [`google.rpc.RetryInfo`](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto)
+cooldown is honored for HTTP and in-band SSE errors when no valid positive HTTP
+`Retry-After` is present. Fractional seconds round up. A delay that cannot fit the
+remaining local retry window is returned to the client without an early retry.
+
+Interrupted HTTP error-body reads are transport failures, not proof of an invalid
+request. Incomplete or malformed Gemini error JSON likewise cannot establish a
+validation error. Explicit retry headers remain authoritative unless the request
+context itself has ended.
+Proxy buffering deadlines remain timeout failures during HTTP/2 body reads; they
+are not treated as client cancellations.
+
 ### Codex context compaction
 
 A Responses `response.failed` event whose error code is exactly

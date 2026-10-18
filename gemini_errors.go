@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -14,8 +15,9 @@ type geminiAPIError struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 	Details []struct {
-		Type   string `json:"@type"`
-		Reason string `json:"reason"`
+		Type       string          `json:"@type"`
+		Reason     string          `json:"reason"`
+		RetryDelay json.RawMessage `json:"retryDelay"`
 	} `json:"details,omitempty"`
 }
 
@@ -24,11 +26,17 @@ func classifyGeminiHTTPErrorBytes(resp *http.Response, b []byte) failure {
 		Error geminiAPIError `json:"error"`
 	}
 	data := bytes.TrimSpace(b)
+	var decodeErr error
 	if len(data) > 0 && data[0] == '[' {
 		// The non-SSE streaming transport wraps its HTTP error in an array.
-		_ = json.Unmarshal(data, &envelopes)
+		decodeErr = json.Unmarshal(data, &envelopes)
 	} else {
-		_ = json.Unmarshal(data, &envelopes[0])
+		decodeErr = json.Unmarshal(data, &envelopes[0])
+	}
+	if decodeErr != nil {
+		// A malformed or classification-size-limited body cannot establish a
+		// deterministic validation error. Header retry verdicts still win.
+		return classifyHTTPErrorBytesShaped(resp, b, func(_, _, _, _ string) bool { return false })
 	}
 	return classifyGeminiErrorBytes(resp, b, envelopes[0].Error)
 }
@@ -67,7 +75,53 @@ func classifyGeminiErrorBytes(resp *http.Response, b []byte, e geminiAPIError) f
 	} else if !f.transient {
 		f.atype = geminiStatusForHTTP(f.status)
 	}
+	if f.transient && f.retryAfter == 0 {
+		f.retryAfter = retryAfterSeconds(resp.Header.Get("Retry-After"))
+		if f.retryAfter == 0 {
+			for _, detail := range e.Details {
+				if detail.Type != "type.googleapis.com/google.rpc.RetryInfo" {
+					continue
+				}
+				var delay string
+				if json.Unmarshal(detail.RetryDelay, &delay) == nil {
+					f.retryAfter = max(f.retryAfter, geminiRetryDelaySeconds(delay))
+				}
+			}
+		}
+	}
 	return f
+}
+
+// ProtoJSON Duration uses seconds with up to nine fractional digits. Round up
+// to the HTTP Retry-After granularity so the client never retries early.
+func geminiRetryDelaySeconds(value string) int {
+	text, ok := strings.CutSuffix(value, "s")
+	if !ok || text == "" {
+		return 0
+	}
+	whole, fraction, fractional := strings.Cut(text, ".")
+	if whole == "" || (fractional && (fraction == "" || len(fraction) > 9)) {
+		return 0
+	}
+	for _, part := range [...]string{whole, fraction} {
+		for i := range len(part) {
+			if part[i] < '0' || part[i] > '9' {
+				return 0
+			}
+		}
+	}
+	seconds, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil || seconds > 315576000000 {
+		return 0
+	}
+	if strings.Trim(fraction, "0") != "" {
+		seconds++
+	}
+	maxInt := int(^uint(0) >> 1)
+	if seconds > int64(maxInt) {
+		return maxInt
+	}
+	return int(seconds)
 }
 
 // classifyGeminiSSEError is called only after the wire detects an error frame;

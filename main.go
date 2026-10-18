@@ -414,8 +414,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			respBody := readHTTPErrorBody(resp, rec)
-			last = classifyHTTPErrorForPath(r.URL.Path, resp, respBody)
+			respBody, readErr := readHTTPErrorBody(resp, rec)
+			last = classifyHTTPErrorForPath(ctx, r.URL.Path, resp, respBody, readErr)
 			last.origStatus = resp.StatusCode
 			rec.noteAttemptFailure(last, "http_error")
 			resp.Body.Close()
@@ -570,19 +570,18 @@ func (p *prefixCapture) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func readHTTPErrorBody(resp *http.Response, rec *reqRecorder) []byte {
+func readHTTPErrorBody(resp *http.Response, rec *reqRecorder) ([]byte, error) {
 	body := withByteIdle(resp.Body, cfg.upstreamByteIdle)
 	defer body.stop()
 	if rec == nil {
-		b, _ := io.ReadAll(io.LimitReader(body, httpErrorClassifyBytes))
-		return b
+		return io.ReadAll(io.LimitReader(body, httpErrorClassifyBytes))
 	}
 	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
 	prefix := &prefixCapture{max: httpErrorClassifyBytes}
 	dst := io.MultiWriter(prefix, rec.respWriter())
 	_, err := io.Copy(dst, body)
 	rec.noteResponseReadError(err)
-	return prefix.buf.Bytes()
+	return prefix.buf.Bytes(), err
 }
 
 func copyResponseBodyToArchive(resp *http.Response, rec *reqRecorder) {
@@ -621,8 +620,8 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		f = classifyTransport(err, ctx)
 		rec.noteAttemptFailure(f, "transport_error")
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
-		respBody := readHTTPErrorBody(resp, rec)
-		f = classifyHTTPErrorForPath(r.URL.Path, resp, respBody)
+		respBody, readErr := readHTTPErrorBody(resp, rec)
+		f = classifyHTTPErrorForPath(ctx, r.URL.Path, resp, respBody, readErr)
 		f.origStatus = resp.StatusCode
 		rec.noteAttemptFailure(f, "http_error")
 		resp.Body.Close()
@@ -781,11 +780,14 @@ func isEventStream(ct string) bool { return strings.Contains(strings.ToLower(ct)
 // The method/path/gateway are static for the transactional route, so omitted.
 
 func who(r *http.Request, body []byte) string {
-	model, _ := geminiTarget(r.URL.Path)
-	if model == "" {
-		model = modelOf(body)
+	return requestModelOf(r.URL.Path, body) + "/" + agentKindFull(r, body)
+}
+
+func requestModelOf(path string, body []byte) string {
+	if model, _ := geminiTarget(path); model != "" {
+		return model
 	}
-	return model + "/" + agentKindFull(r, body)
+	return modelOf(body)
 }
 
 // agentKindFull refines agentKind with a body-derived signal: a Workflow-tool
@@ -889,7 +891,12 @@ func localRetryDelay(upstreamRetryAfter int, retryIndex int) time.Duration {
 	if upstreamRetryAfter < 0 {
 		upstreamRetryAfter = 0
 	}
-	return time.Duration(upstreamRetryAfter)*time.Second + localRetryExtraBackoff(retryIndex)
+	extra := localRetryExtraBackoff(retryIndex)
+	maxDelay := time.Duration(math.MaxInt64)
+	if int64(upstreamRetryAfter) > int64((maxDelay-extra)/time.Second) {
+		return maxDelay
+	}
+	return time.Duration(upstreamRetryAfter)*time.Second + extra
 }
 
 func localRetryExtraBackoff(retryIndex int) time.Duration {
@@ -917,8 +924,11 @@ func canWaitForLocalRetry(ctx context.Context, wait time.Duration) bool {
 	if wait <= 0 {
 		return true
 	}
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= wait+time.Second {
-		return false
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= time.Second || wait >= remaining-time.Second {
+			return false
+		}
 	}
 	return true
 }
@@ -949,6 +959,9 @@ func modelOf(body []byte) string {
 }
 
 func reasoningEffortOf(path string, body []byte) string {
+	if isGeminiPath(path) {
+		return geminiSettingsOf(body).thinkingLevel
+	}
 	var b struct {
 		Reasoning struct {
 			Effort string `json:"effort"`

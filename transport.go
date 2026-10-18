@@ -46,13 +46,24 @@ func roundTripBefore(ctx context.Context, r *http.Request, body []byte, deadline
 		cleanup()
 		return nil, started, stop, err
 	}
-	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cleanup}
+	resp.Body = &cancelBody{ReadCloser: resp.Body, ctx: attemptCtx, cancel: cleanup}
 	return resp, started, stop, nil
 }
 
 type cancelBody struct {
 	io.ReadCloser
+	ctx    context.Context
 	cancel func()
+}
+
+func (b *cancelBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		if cause := context.Cause(b.ctx); cause != nil {
+			err = errors.Join(err, cause)
+		}
+	}
+	return n, err
 }
 
 func (b *cancelBody) Close() error {

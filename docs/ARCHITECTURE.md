@@ -75,9 +75,12 @@ Only `streamGenerateContent?alt=sse` receives transactional protection;
 `generateContent`, `countTokens`, and non-SSE streaming transports remain
 single-shot. Gemini has no separate terminal SSE event, so the proxy waits for
 clean EOF, retaining usage-only frames after candidate completion. Missing
-candidates, unfinished SSE frames, and read faults fail the attempt. Native
-`MAX_TOKENS`, safety stops, and prompt blocks are delivered unchanged, not retried
-as transport failures. See Google's [GenerateContent contract](https://ai.google.dev/api/generate-content).
+candidates, unfinished SSE frames, and read faults fail the attempt. SSE control
+frames and empty data messages do not advance candidate completion. Native
+`MAX_TOKENS`, safety stops, and prompt blocks without candidates are delivered
+unchanged, not retried as transport failures. A prompt block accompanied by
+candidates is contradictory and cannot satisfy completion. See Google's
+[GenerateContent contract](https://ai.google.dev/api/generate-content).
 Candidate counts follow [ProtoJSON](https://protobuf.dev/programming-guides/json/):
 camelCase and snake_case field names, quoted integers, exponent notation, and zero
 fractional parts are accepted without rewriting the request.

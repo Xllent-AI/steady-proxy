@@ -32,30 +32,73 @@ type geminiCandidateState struct {
 }
 
 func newGeminiWire(body []byte) *geminiWire {
-	g := &geminiWire{candidateCount: 1}
-	config := geminiRequestConfig{count: &g.candidateCount}
+	return &geminiWire{candidateCount: geminiSettingsOf(body).candidateCount}
+}
+
+type geminiRequestSettings struct {
+	candidateCount int
+	thinkingLevel  string
+}
+
+func geminiSettingsOf(body []byte) geminiRequestSettings {
+	settings := geminiRequestSettings{candidateCount: 1}
+	config := geminiRequestConfig{settings: &settings}
 	request := struct {
 		Config      geminiRequestConfig `json:"generationConfig"`
 		ProtoConfig geminiRequestConfig `json:"generation_config"`
 	}{config, config}
-	if json.Unmarshal(body, &request) != nil || g.candidateCount < 1 {
-		g.candidateCount = 1
+	if json.Unmarshal(body, &request) != nil {
+		return geminiRequestSettings{candidateCount: 1}
 	}
-	return g
+	if settings.candidateCount < 1 {
+		settings.candidateCount = 1
+	}
+	return settings
 }
 
-// Both ProtoJSON spellings update one count in JSON field order. A later config
-// replaces the earlier config, including resetting an omitted count to default.
-type geminiRequestConfig struct{ count *int }
+// Both ProtoJSON spellings update one configuration in JSON field order. A later
+// config replaces the earlier config, including resetting omitted settings.
+type geminiRequestConfig struct{ settings *geminiRequestSettings }
 
 func (c geminiRequestConfig) UnmarshalJSON(data []byte) error {
-	*c.count = 1
-	count := geminiRequestCount{value: c.count}
+	*c.settings = geminiRequestSettings{candidateCount: 1}
+	count := geminiRequestCount{value: &c.settings.candidateCount}
+	thinking := geminiThinkingConfig{level: &c.settings.thinkingLevel}
 	fields := struct {
-		Count      geminiRequestCount `json:"candidateCount"`
-		ProtoCount geminiRequestCount `json:"candidate_count"`
-	}{count, count}
+		Count         geminiRequestCount   `json:"candidateCount"`
+		ProtoCount    geminiRequestCount   `json:"candidate_count"`
+		Thinking      geminiThinkingConfig `json:"thinkingConfig"`
+		ProtoThinking geminiThinkingConfig `json:"thinking_config"`
+	}{count, count, thinking, thinking}
 	return json.Unmarshal(data, &fields)
+}
+
+type geminiThinkingConfig struct{ level *string }
+
+func (c geminiThinkingConfig) UnmarshalJSON(data []byte) error {
+	*c.level = ""
+	level := geminiThinkingLevel{value: c.level}
+	fields := struct {
+		Level      geminiThinkingLevel `json:"thinkingLevel"`
+		ProtoLevel geminiThinkingLevel `json:"thinking_level"`
+	}{level, level}
+	return json.Unmarshal(data, &fields)
+}
+
+type geminiThinkingLevel struct{ value *string }
+
+func (l geminiThinkingLevel) UnmarshalJSON(data []byte) error {
+	// Diagnostic metadata must not invalidate otherwise usable candidate counts.
+	// Do not infer a level from a token budget or a model's implicit defaults.
+	var level string
+	_ = json.Unmarshal(data, &level)
+	switch level = strings.ToLower(strings.TrimSpace(level)); level {
+	case "minimal", "low", "medium", "high":
+		*l.value = level
+	default:
+		*l.value = ""
+	}
+	return nil
 }
 
 type geminiRequestCount struct{ value *int }
@@ -99,7 +142,10 @@ func (g *geminiWire) live(ev event, raw []byte, st *captureStats) ([][]byte, boo
 }
 
 func (g *geminiWire) completeOnEOF() bool {
-	return !g.failed && (g.blocked || g.finished == g.candidateCount)
+	if g.blocked {
+		return !g.failed && len(g.candidates) == 0
+	}
+	return !g.failed && g.finished == g.candidateCount
 }
 
 func (g *geminiWire) replayBuffered(sp *spool, w io.Writer, st *captureStats) error {
@@ -167,6 +213,10 @@ func (*geminiPart) UnmarshalJSON(data []byte) error {
 
 func (g *geminiWire) accept(ev event, st *captureStats) *failure {
 	data := strings.TrimSpace(ev.data)
+	// SSE control frames and empty data messages carry no model response.
+	if ev.data == "" && ev.name != "error" {
+		return nil
+	}
 	if data == "" || data[0] != '{' {
 		return malformedSSE("Gemini stream event is not a JSON object")
 	}

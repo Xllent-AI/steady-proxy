@@ -99,6 +99,29 @@ func TestGeminiCaptureBufferedWaitsForEOFAndTrailingUsage(t *testing.T) {
 	}
 }
 
+func TestGeminiControlFramesDoNotFailOrCompleteResponse(t *testing.T) {
+	controls := ": keepalive\n\nid: 123\nretry: 1000\n\nevent: ping\n\ndata:\n\n"
+	for _, early := range []bool{false, true} {
+		t.Run(strconv.FormatBool(early), func(t *testing.T) {
+			for _, complete := range []bool{false, true} {
+				stream := controls
+				if complete {
+					stream += goodGeminiStream + controls
+				}
+				var st captureStats
+				rec, wrote, f := captureGemini(t, nil, iotest1byte(stream), &st, early)
+				if complete {
+					if !wrote || f != nil || st.stop != "STOP" || st.outTok != 11 || !strings.Contains(rec.Body.String(), `"text":"Hello"`) {
+						t.Fatalf("control frames broke a complete response: wrote=%v failure=%+v stats=%+v body=%q", wrote, f, st, rec.Body.String())
+					}
+				} else if wrote || f == nil || !f.transient || rec.Body.Len() != 0 {
+					t.Fatalf("control frames completed an empty response: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestGeminiWireCompletionTracksEveryRequestedCandidate(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -115,6 +138,7 @@ func TestGeminiWireCompletionTracksEveryRequestedCandidate(t *testing.T) {
 		{"omitted default index", `{}`, []string{`{"candidates":[{"finishReason":"STOP"}]}`}, true},
 		{"explicit count one", `{"generationConfig":{"candidateCount":1}}`, []string{`{"candidates":[{"index":0,"finishReason":"STOP"}]}`}, true},
 		{"two requested one finished", `{"generationConfig":{"candidateCount":2}}`, []string{`{"candidates":[{"index":0,"finishReason":"STOP"}]}`}, false},
+		{"thinking enum encoding cannot mask missing candidate", `{"generationConfig":{"candidateCount":2,"thinkingConfig":{"thinkingLevel":2}}}`, []string{`{"candidates":[{"index":0,"finishReason":"STOP"}]}`}, false},
 		{"only second finished", `{"generationConfig":{"candidateCount":2}}`, []string{`{"candidates":[{"index":1,"finishReason":"STOP"}]}`}, false},
 		{"repeat finish cannot replace missing candidate", `{"generationConfig":{"candidateCount":2}}`, []string{`{"candidates":[{"index":0,"finishReason":"STOP"}]}`, `{"candidates":[{"index":0,"finishReason":"STOP"}]}`}, false},
 		{"second remains unfinished", `{"generationConfig":{"candidateCount":2}}`, []string{`{"candidates":[{"index":0,"finishReason":"STOP"},{"index":1,"finishReason":"FINISH_REASON_UNSPECIFIED"}]}`}, false},
@@ -204,6 +228,19 @@ func TestGeminiPromptBlocksCompleteWithoutCandidates(t *testing.T) {
 	}
 }
 
+func TestGeminiPromptBlocksCannotHideCandidates(t *testing.T) {
+	block := string(geminiTestEvent(`{"promptFeedback":{"blockReason":"SAFETY"}}`).raw)
+	for _, finish := range []string{"", "STOP"} {
+		candidate := string(geminiTestEvent(`{"candidates":[{"content":{"parts":[{"text":"candidate"}]},"finishReason":` + strconv.Quote(finish) + `}]}`).raw)
+		for _, stream := range []string{block + candidate, candidate + block} {
+			rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), nil, false)
+			if wrote || f == nil || !f.transient || rec.Body.Len() != 0 {
+				t.Fatalf("contradictory prompt block accepted: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
+			}
+		}
+	}
+}
+
 func TestGeminiUsageSnapshotsDoNotDoubleCount(t *testing.T) {
 	wire := newGeminiWire(nil)
 	var st captureStats
@@ -243,7 +280,6 @@ func TestGeminiMalformedEventsFailEvenWhenValidationDisabled(t *testing.T) {
 	saved := cfg.validateJSON
 	t.Cleanup(func() { cfg.validateJSON = saved })
 	cases := map[string]string{
-		"empty":                   "",
 		"broken JSON":             `{"candidates":[`,
 		"null":                    `null`,
 		"array":                   `[]`,
@@ -320,6 +356,7 @@ func TestGeminiInBandErrorsFailBeforeAndAfterFinish(t *testing.T) {
 		{"named error", `{"error":{"code":503,"status":"UNAVAILABLE","message":"overloaded"}}`, "error", true},
 		{"null error envelope", `{"error":null}`, "", true},
 		{"missing named error envelope", `{}`, "error", true},
+		{"empty named error", ``, "error", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, afterFinish := range []bool{false, true} {
@@ -411,5 +448,15 @@ func TestGeminiCaptureLiveRejectsErrorAfterFinish(t *testing.T) {
 				t.Fatalf("post-commit failure must DROP without forwarding the bad tail: wrote=%v failure=%+v stats=%+v body=%q", wrote, f, st, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestGeminiLongRetryInfoCannotFitRequestDeadline(t *testing.T) {
+	useDefaultConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	f := classifyGeminiSSEError(`{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"315576000000s"}]}}`)
+	if f == nil || canWaitForLocalRetry(ctx, localRetryDelay(f.retryAfter, 0)) {
+		t.Fatalf("native cooldown exceeded the request deadline but was accepted: %+v", f)
 	}
 }

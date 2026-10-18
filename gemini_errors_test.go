@@ -120,7 +120,7 @@ func TestGeminiHTTPRetryHeaderPrecedence(t *testing.T) {
 		{"upstream-force-permanent", 503, "", "false", false, 503, "upstream_no_retry", 0},
 		{"unknown-gateway-defers-to-upstream", 400, "unknown", "true", true, 502, "upstream_retry_400", 7},
 	}
-	body := []byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"invalid contents"}}`)
+	body := []byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"invalid contents","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"23s"}]}}`)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := &http.Response{StatusCode: tc.status, Header: make(http.Header)}
@@ -159,6 +159,47 @@ func TestGeminiHTTPRetryAfter(t *testing.T) {
 			f := classifyGeminiHTTPErrorBytes(resp, []byte(tc.body))
 			if !f.transient || f.retryAfter != tc.want {
 				t.Fatalf("want transient backoff=%d, got %+v", tc.want, f)
+			}
+		})
+	}
+}
+
+func TestGeminiRetryInfoBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		delay  string
+		header string
+		want   int64
+	}{
+		{"whole seconds", `"23s"`, "", 23},
+		{"fractional seconds round up", `"23.000000001s"`, "", 24},
+		{"subsecond cooldown", `"0.000000001s"`, "", 1},
+		{"whole fractional form", `"23.000s"`, "", 23},
+		{"protobuf maximum seconds", `"315576000000s"`, "", 315576000000},
+		{"HTTP header takes precedence", `"23s"`, "7", 7},
+		{"invalid header uses native delay", `"23s"`, "invalid", 23},
+		{"zero cooldown", `"0s"`, "", 0},
+		{"negative cooldown", `"-1s"`, "", 0},
+		{"out of range duration", `"315576000001s"`, "", 0},
+		{"excess fractional precision", `"0.0000000001s"`, "", 0},
+		{"wrong units", `"1m"`, "", 0},
+		{"compound duration", `"1s2s"`, "", 0},
+		{"invalid field type", `23`, "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":` + tc.delay + `}]}}`
+			resp := &http.Response{StatusCode: 429, Header: make(http.Header)}
+			resp.Header.Set("Retry-After", tc.header)
+			f := classifyGeminiHTTPErrorBytes(resp, []byte(body))
+			want := min(tc.want, int64(int(^uint(0)>>1)))
+			if !f.transient || int64(f.retryAfter) != want {
+				t.Fatalf("HTTP cooldown=%d, want %d: %+v", f.retryAfter, want, f)
+			}
+			if tc.header == "" {
+				f := classifyGeminiSSEError(body)
+				if f == nil || !f.transient || int64(f.retryAfter) != want {
+					t.Fatalf("SSE cooldown must preserve native RetryInfo: %+v, want %d", f, want)
+				}
 			}
 		})
 	}
@@ -240,6 +281,15 @@ func TestGeminiMalformedErrors(t *testing.T) {
 				t.Fatalf("detected malformed SSE error must remain a failure: %+v", f)
 			}
 		})
+	}
+}
+
+func TestGeminiIncompleteHTTPErrorCannotEstablishValidationFailure(t *testing.T) {
+	for _, body := range []string{`{"error":{"code":400,`, `{"error":{"status":"INVALID_ARGUMENT","message":`, "not JSON"} {
+		f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: 400}, []byte(body))
+		if !f.transient || f.status != 502 {
+			t.Fatalf("incomplete error metadata became terminal: %+v", f)
+		}
 	}
 }
 

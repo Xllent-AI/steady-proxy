@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -1027,8 +1028,21 @@ func responsesRequestShaped(atype, code, msg, _ string) bool {
 	return !classifyResponsesError(atype, code, msg).transient
 }
 
-// classifyHTTPErrorForPath dispatches HTTP-error classification by wire.
-func classifyHTTPErrorForPath(path string, resp *http.Response, b []byte) failure {
+// classifyHTTPErrorForPath applies read failures before body heuristics, retaining
+// explicit retry hints unless the request context itself has ended.
+func classifyHTTPErrorForPath(ctx context.Context, path string, resp *http.Response, b []byte, readErr error) failure {
+	if readErr != nil {
+		if source, _ := httpRetryHint(resp.Header); source == "" || ctx.Err() != nil {
+			f := classifyTransport(readErr, ctx)
+			if f.transient {
+				f.retryAfter = retryAfterSeconds(resp.Header.Get("Retry-After"))
+			}
+			return f
+		}
+		// An authoritative header owns the verdict; the incomplete body cannot
+		// supply trustworthy error metadata.
+		b = nil
+	}
 	if isResponsesPath(path) {
 		return classifyResponsesHTTPErrorBytes(resp, b)
 	}
