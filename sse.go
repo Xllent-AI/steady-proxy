@@ -392,11 +392,17 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 					return wrote, fail
 				}
 			}
-			// Check the read error BEFORE any deferred commit: a read can return
-			// data together with io.EOF, and if that final read is a truncation
-			// (no message_stop) we must convert it to a clean uncommitted retry
-			// rather than commit the partial buffer and log a post-commit DROP.
+			// Gemini has no terminal SSE event: accept clean EOF only after the
+			// wire reports completion and no partial frame remains. Read faults and
+			// cancellation must still fail even after a candidate's finishReason.
 			if r.err != nil {
+				if r.err == io.EOF && ctx.Err() == nil && !parser.cur.has && len(parser.pending) == 0 && model.completeOnEOF() {
+					if !committed {
+						return true, replayCaptured(sp, model, w, st, writeHead, flush)
+					}
+					flush()
+					return true, nil
+				}
 				return onReadErr(r.err, ctx, committed, flush)
 			}
 			// Clean read, gated caller: the window already elapsed and real
@@ -528,22 +534,23 @@ func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.
 			return false, classifyBufferError(err), true
 		}
 		if done {
-			// Complete, valid stream: replay the whole buffer downstream. This runs
-			// before any bytes reached the client, so it is still a clean commit.
-			writeHead("buffered")
-			if err := model.replayBuffered(sp, w, st); err != nil {
-				sp.discard()
-				return true, &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}, true
-			}
-			flush()
-			sp.discard()
-			return true, nil, true
+			return true, replayCaptured(sp, model, w, st, writeHead, flush), true
 		}
 	}
 	if parser.err != nil {
 		return *committed, classifyBufferError(parser.err), true
 	}
 	return false, nil, false
+}
+
+func replayCaptured(sp *spool, model wireModel, w io.Writer, st *captureStats, writeHead func(string), flush func()) *failure {
+	writeHead("buffered")
+	if err := model.replayBuffered(sp, w, st); err != nil {
+		return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
+	}
+	flush()
+	sp.discard()
+	return nil
 }
 
 func validateSSEEventShape(ev event) *failure {
@@ -977,7 +984,7 @@ func onReadErr(err error, ctx context.Context, committed bool, flush func()) (bo
 	case ctx.Err() == context.Canceled:
 		f = &failure{transient: false, status: 499, atype: "api_error", code: "client_gone", message: "client cancelled"}
 	case err == io.EOF || err == io.ErrUnexpectedEOF:
-		f = &failure{transient: true, status: 502, atype: "api_error", code: "truncated_stream", message: "EOF before message_stop"}
+		f = &failure{transient: true, status: 502, atype: "api_error", code: "truncated_stream", message: "stream ended before a complete response"}
 	default:
 		f = &failure{transient: true, status: 502, atype: "api_error", code: "stream_read_error", message: err.Error()}
 	}

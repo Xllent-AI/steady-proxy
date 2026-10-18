@@ -12,12 +12,9 @@ import (
 // The transactional engine (spool + keepalive→commit→live + local-retry +
 // idle/deadline, see captureSSECore / handle) is protocol-agnostic: its one rule
 // is "buffer the full response; convert any pre-commit failure into a retry; only
-// give up on a request that can never succeed." What differs between the Anthropic
-// Messages wire (`POST /v1/messages`) and the OpenAI Responses wire
-// (`POST /v1/responses`, used by Codex) is only how the byte stream is
-// *interpreted*: when it is complete, which event is an error, and how tokens are
-// scraped. wireModel owns exactly that; one instance is created per upstream
-// attempt.
+// give up on a request that can never succeed." Each wire interprets completion,
+// in-band errors, and usage for Anthropic Messages, OpenAI Responses, or Gemini
+// GenerateContent. One instance is created per upstream attempt.
 type wireModel interface {
 	// scrape pulls best-effort access-log facts (model/usage/stop) out of one
 	// event into st. Called for every event; must never fail a stream.
@@ -35,6 +32,10 @@ type wireModel interface {
 	//                   (engine writes this event, then replays via replayBuffered).
 	buffered(ev event, st *captureStats) (done bool, fail *failure)
 
+	// completeOnEOF accepts a clean end of transport for protocols without a
+	// terminal SSE event. The engine also requires a fully framed final event.
+	completeOnEOF() bool
+
 	// live ingests one event on the post-commit LIVE path: it returns the exact
 	// downstream bytes to forward (empty -> engine emits keepalive()), whether the
 	// stream terminated, and fail != nil for an in-band error (the engine ends the
@@ -44,14 +45,13 @@ type wireModel interface {
 
 	// keepalive is the byte frame the engine writes downstream during a silent gap
 	// to keep the client's connection/idle timer alive. It MUST be one the client
-	// treats as a no-op. The two wires differ: the Anthropic SDK is fine with a
-	// spec SSE comment, but Codex's SSE reader only resets its idle timer on a
-	// yielded event and discards comments — so the Responses wire sends a skippable
-	// unknown-type event instead (see openaiWire.keepalive).
+	// treats as a no-op. Messages and Gemini use a standard SSE comment. Codex's
+	// reader discards comments without resetting its idle timer, so Responses
+	// sends a skippable unknown-type event (see openaiWire.keepalive).
 	keepalive() []byte
 
 	// replayBuffered writes the whole buffered stream downstream once, at the
-	// terminal-in-buffer commit.
+	// terminal-event or clean-EOF commit.
 	replayBuffered(sp *spool, w io.Writer, st *captureStats) error
 
 	// replayPrefix writes the buffered prefix at a keepalive/early commit, before
@@ -63,13 +63,13 @@ type wireModel interface {
 	forwardable() bool
 }
 
-// wireFor selects the wire model for a request path. Only the two transactional
-// routes reach here; everything else uses proxyOnce and never needs a model. The
-// Anthropic-only refusal intercept is baked into the returned wire, so the shared
-// engine never carries it (interceptRefusal is meaningless for Responses).
-func wireFor(path string, interceptRefusal bool) wireModel {
+// wireFor selects a stream interpreter. Refusal interception is Anthropic-only.
+func wireFor(path string, body []byte, interceptRefusal bool) wireModel {
 	if isResponsesPath(path) {
 		return newOpenAIWire()
+	}
+	if isGeminiPath(path) {
+		return newGeminiWire(body)
 	}
 	return newAnthropicWire(interceptRefusal)
 }
@@ -87,6 +87,55 @@ func isMessagesPath(path string) bool {
 
 func isResponsesPath(path string) bool {
 	return pathIs(path, "/v1/responses")
+}
+
+// geminiTarget recognizes native Developer API and Vertex AI model methods.
+// Exact resource boundaries keep look-alike and unrelated routes single-shot.
+func geminiTarget(path string) (model, method string) {
+	version, resource, ok := strings.Cut(strings.TrimPrefix(path, "/"), "/")
+	if !ok {
+		return "", ""
+	}
+	switch version {
+	case "v1", "v1beta", "v1alpha", "v1beta1":
+	default:
+		return "", ""
+	}
+	var name string
+	if rest, vertex := strings.CutPrefix(resource, "projects/"); vertex {
+		project, rest, ok := strings.Cut(rest, "/locations/")
+		if !ok || project == "" || strings.Contains(project, "/") {
+			return "", ""
+		}
+		location, rest, ok := strings.Cut(rest, "/publishers/google/models/")
+		if !ok || location == "" || strings.Contains(location, "/") {
+			return "", ""
+		}
+		name = rest
+	} else {
+		name, ok = strings.CutPrefix(resource, "models/")
+		if !ok {
+			return "", ""
+		}
+	}
+	if strings.Contains(name, "/") {
+		return "", ""
+	}
+	model, method, ok = strings.Cut(name, ":")
+	if !ok || model == "" {
+		return "", ""
+	}
+	switch method {
+	case "generateContent", "streamGenerateContent", "countTokens":
+		return model, method
+	default:
+		return "", ""
+	}
+}
+
+func isGeminiPath(path string) bool {
+	_, method := geminiTarget(path)
+	return method != ""
 }
 
 // ─────────────────────────────────────────────────────── anthropic wire model ──
@@ -115,6 +164,8 @@ func newAnthropicWire(interceptRefusal bool) *anthropicWire {
 }
 
 func (a *anthropicWire) scrape(ev event, st *captureStats) { scrapeUsage(ev, st) }
+
+func (a *anthropicWire) completeOnEOF() bool { return false }
 
 func (a *anthropicWire) buffered(ev event, st *captureStats) (bool, *failure) {
 	if cfg.validateJSON {

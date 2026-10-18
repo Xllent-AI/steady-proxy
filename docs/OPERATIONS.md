@@ -74,7 +74,7 @@ The fields after the outcome explain the request:
 | Field | Meaning |
 | --- | --- |
 | `model/main`, `model/sub`, `model/wf` | Requested model and detected caller kind. `requested->resolved` shows a different model reported by the upstream. |
-| `high` or another effort value | Reasoning effort requested through Messages `output_config.effort` or Responses `reasoning.effort`. |
+| `high` or another effort value | Requested Messages `output_config.effort`, Responses `reasoning.effort`, or Gemini `generationConfig.thinkingConfig.thinkingLevel` (lowercased). |
 | `in=… out=… tok` | Input and output token counts. Input includes cache reads and creation. |
 | `end_turn`, `completed`, etc. | The reported stop reason. |
 | `truncated_stream`, `sse_overloaded`, etc. | The classified failure code; use it to identify the actual cause. |
@@ -88,6 +88,12 @@ The fields after the outcome explain the request:
 Caller labels use Claude Code headers and the Workflow system-prompt marker.
 Requests without those signals appear as `main`, including requests from other
 applications; the label does not identify or restrict the client software.
+
+Gemini thinking-level logging also accepts ProtoJSON snake_case field names.
+Only an explicit named level is reported; the proxy does not infer one from
+`thinkingBudget` or a model's default. The original request is forwarded unchanged.
+Gemini model labels and archived attempt models come from the model URL, not a
+body-level `model` field.
 
 Verbose `[local-retry]` lines include the cause, wait, and retry index.
 `skip=not-enough-time` explains why another attempt could not fit the time budget.
@@ -133,7 +139,8 @@ The proxy has no authentication of its own. Keep its listening port on loopback;
 Compose's published port already is. Anyone with access to the port can relay
 requests with credentials they supply and read `/__version`.
 
-Client authorization and Anthropic headers are forwarded to `PROXY_UPSTREAM_URL`.
+Client authorization and provider-specific headers, including `x-goog-api-key`,
+are forwarded to `PROXY_UPSTREAM_URL`, along with query authentication such as `key`.
 The proxy does not follow redirects. Its HTTP transport honors
 `HTTP_PROXY`/`HTTPS_PROXY` and `NO_PROXY` in the proxy process environment, so a
 configured forward proxy is also part of the connection path.
@@ -145,8 +152,8 @@ off persistent disk.
 
 Payload archives are different: they are persistent and **unencrypted**. Known
 credential headers and query parameters are redacted, including `Authorization`,
-`x-api-key`, `Proxy-Authorization`, `api_key`, `api_token`, `access_token`, and
-`client_secret`. Redacted names are listed in `redactions`. Other headers and
+`x-api-key`, `x-goog-api-key`, `Proxy-Authorization`, `key`, `api_key`, `api_token`,
+`access_token`, and `client_secret`. Redacted names are listed in `redactions`. Other headers and
 parameters remain, and **bodies are not inspected or redacted**. Base64 is an
 encoding, not encryption.
 

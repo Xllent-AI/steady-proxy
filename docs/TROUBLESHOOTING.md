@@ -48,6 +48,14 @@ as success. Ordinary content frames are handled according to Codex's lenient
 parser rather than Anthropic's validation rules. A `response.incomplete` event
 also triggers a retry; it is not a successful completion.
 
+Gemini `streamGenerateContent?alt=sse` requires a clean transport EOF after every
+requested candidate finishes, or a prompt block. A `finishReason` alone does not
+end capture: a later usage frame or error still matters. Missing candidates,
+missing finish reasons, partial SSE frames, malformed JSON, and read faults cause
+a retry before commit. After commit, the proxy aborts HTTP instead of sending a
+clean EOF that could look successful. Native `MAX_TOKENS` and safety stops are
+delivered unchanged; they are not stream failures.
+
 If the log shows `DROP`, the client had already received headers. Default Responses
 mode reaches that point as soon as output appears. Enable full buffering with
 `PROXY_RESPONSES_EARLY_COMMIT=0` to protect more of the response, and set the
@@ -68,6 +76,7 @@ shapes from triggering Claude Code's smaller special-case retry budgets.
 | `429`, `rate_limit_error`, or “Rate limited” | Retry with the upstream delay when available. |
 | An Anthropic SSE `error` reporting overload or rate limit | Retry before commit; end the stream after commit. |
 | A Responses `error` or `response.failed` reporting overload, timeout, or rate limit | Retry before commit; end the stream after commit. |
+| A Gemini SSE `error` envelope reporting `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, or a server failure | Retry before commit with Gemini-shaped HTTP `503`; abort HTTP after commit. |
 | Invalid API key, disabled organization, billing block, or unknown `4xx` | Usually retry, since gateway access or capacity may recover. |
 
 A Responses error can carry `type: "invalid_request_error"` while its more
@@ -117,6 +126,7 @@ are returned with `X-Should-Retry: false`; terminal Responses errors use HTTP
 | “Prompt is too long” or context-length error | Compact or shorten the input. |
 | Explicit `model_not_found` code | Choose a model the gateway supports. |
 | Responses `unknown_parameter`, `invalid_type`, or another recognized validation code | Correct the named field or value. |
+| Gemini `INVALID_ARGUMENT`, `NOT_FOUND`, or a bare numeric `400`/`404` | Correct the request, model, or referenced resource. The documented `API_KEY_INVALID` ErrorInfo is an authentication exception and remains retryable. |
 
 Anthropic HTTP errors use recognized message signatures. A bare HTTP
 `invalid_request_error` without one can still retry; an Anthropic in-stream
@@ -125,6 +135,27 @@ signature above. Invalid schemas, malformed tool messages, and context-limit
 failures remain terminal. Responses classification uses error codes, types, and
 recognized messages, with known transient codes taking precedence over generic
 invalid-request types. Gateway retry headers override HTTP heuristics.
+
+Gemini decodes numeric `error.code`, canonical `error.status`, and `error.message`
+on both HTTP and SSE errors, including the array-wrapped HTTP errors returned by
+non-SSE `streamGenerateContent`. `FAILED_PRECONDITION` is not automatically permanent:
+it can indicate billing or regional access. The documented Google
+`google.rpc.ErrorInfo` reason `API_KEY_INVALID` remains retryable even when its
+status is `INVALID_ARGUMENT`, preserving the proxy's authentication policy.
+Gateway retry headers still take precedence on HTTP errors. See Google's
+[GenerateContent error reference](https://ai.google.dev/gemini-api/docs/generate-content/api-errors).
+
+Gemini's native [`google.rpc.RetryInfo`](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto)
+cooldown is honored for HTTP and in-band SSE errors when no valid positive HTTP
+`Retry-After` is present. Fractional seconds round up. A delay that cannot fit the
+remaining local retry window is returned to the client without an early retry.
+
+Interrupted HTTP error-body reads are transport failures, not proof of an invalid
+request. Incomplete or malformed Gemini error JSON likewise cannot establish a
+validation error. Explicit retry headers remain authoritative unless the request
+context itself has ended.
+Proxy buffering deadlines remain timeout failures during HTTP/2 body reads; they
+are not treated as client cancellations.
 
 ### Codex context compaction
 

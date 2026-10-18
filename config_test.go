@@ -61,6 +61,7 @@ func TestParseConfigRejectsBadValues(t *testing.T) {
 	_, err := parseConfig(envOf(map[string]string{
 		"PROXY_UPSTREAM_URL":            "https://gw.example.com",
 		"PROXY_KEEPALIVE_MS":            "60s",
+		"PROXY_GEMINI_BUFFER_MS":        "-1",
 		"PROXY_UPSTREAM_BYTE_IDLE_MS":   "0",
 		"PROXY_SDK_RETRY_CAP":           "-1",
 		"PROXY_MAX_REQUEST_BYTES":       "0",
@@ -72,6 +73,7 @@ func TestParseConfigRejectsBadValues(t *testing.T) {
 	}
 	for _, want := range []string{
 		`PROXY_KEEPALIVE_MS="60s": not an integer`,
+		`PROXY_GEMINI_BUFFER_MS=-1: must be >= 0`,
 		`PROXY_UPSTREAM_BYTE_IDLE_MS=0: must be >= 1`,
 		`PROXY_SDK_RETRY_CAP=-1: must be >= 0`,
 		`PROXY_MAX_REQUEST_BYTES=0: must be >= 1`,

@@ -1012,12 +1012,6 @@ func TestPathHelpers(t *testing.T) {
 	if !isMessagesPath("/v1/messages/batches") || isMessagesPath("/v1/messagesfoo") {
 		t.Fatal("isMessagesPath boundary matching wrong")
 	}
-	if _, ok := wireFor("/v1/responses", false).(*openaiWire); !ok {
-		t.Fatal("wireFor(/v1/responses) should be openaiWire")
-	}
-	if _, ok := wireFor("/v1/messages", false).(*anthropicWire); !ok {
-		t.Fatal("wireFor(/v1/messages) should be anthropicWire")
-	}
 }
 
 // ───────────────────────────────────────────────────────────── e2e (handle) ──

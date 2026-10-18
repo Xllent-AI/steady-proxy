@@ -381,3 +381,36 @@ func TestErrorArchiveObeysByteIdle(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTP2ErrorBodyDeadlineRemainsRetryable(t *testing.T) {
+	for _, path := range []string{geminiStreamPath, "/v1/responses", "/v1/messages"} {
+		t.Run(path, func(t *testing.T) {
+			up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != 2 {
+					t.Errorf("expected HTTP/2 upstream, got %s", r.Proto)
+				}
+				w.WriteHeader(503)
+				io.WriteString(w, `{"error":{"message":"unavailable",`)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			}))
+			up.EnableHTTP2 = true
+			up.StartTLS()
+			defer up.Close()
+			setupForTest(up.URL)
+			client = up.Client()
+			client.CheckRedirect = stopRedirect
+			cfg.geminiBufferMs = 100 * time.Millisecond
+			cfg.responsesEarlyCommit = false
+			cfg.responsesBufferMs = 100 * time.Millisecond
+			cfg.keepaliveMs = 100 * time.Millisecond
+			cfg.upstreamByteIdle = 2 * time.Second
+			cfg.maxRequestDur = time.Second
+			rec := httptest.NewRecorder()
+			handle(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"stream":true}`)))
+			if rec.Code != 503 || rec.Header().Get("X-Should-Retry") != "true" || rec.Header().Get("X-Steady-Proxy-Reason") != "deadline" {
+				t.Fatalf("attempt timeout became terminal client cancellation: status=%d headers=%v", rec.Code, rec.Header())
+			}
+		})
+	}
+}

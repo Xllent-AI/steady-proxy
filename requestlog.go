@@ -296,7 +296,7 @@ func (rec *reqRecorder) beginAttempt(body []byte, reqWho string, proxyRetries in
 		StartedAt:         rec.whenString(started),
 		started:           started,
 		Who:               reqWho,
-		Model:             modelOf(body),
+		Model:             requestModelOf(rec.path, body),
 		ProxyRetry:        proxyRetries,
 		RequestBodyRef:    ref,
 		RequestBodySize:   len(body),
@@ -910,6 +910,7 @@ var apiSecretHeaders = map[string]bool{
 	"x-stainless-api-key": true,
 	"anthropic-api-key":   true,
 	"openai-api-key":      true,
+	"x-goog-api-key":      true,
 	"proxy-authorization": true,
 }
 
@@ -964,6 +965,8 @@ var apiSecretQueryNames = map[string]bool{
 	"anthropic-api-key": true,
 	"openai_api_key":    true,
 	"openai-api-key":    true,
+	"x-goog-api-key":    true,
+	"x_goog_api_key":    true,
 	"access_token":      true,
 	"accesstoken":       true,
 	"access-token":      true,
