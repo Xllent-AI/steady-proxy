@@ -1,233 +1,126 @@
 # Troubleshooting
 
-Start with the request's outcome and failure code in the
-[access log](OPERATIONS.md#reading-the-logs). The code preserves the cause even
-when the client receives a generic `503`.
+Start by checking the outcome tag and failure code in the [access log](OPERATIONS.md#reading-the-logs). Even when the client receives a generic `503`, the log line records the underlying cause.
 
-Before the proxy sends response headers, a recoverable failure can be retried
-locally or returned as a client retry. After headers have been sent, the proxy can
-only end a failed stream and log `DROP`. The tables below assume the failure
-happens **before commit** unless stated otherwise. Recovery still depends on the
-remaining time and retry budgets.
+Failures **before commit** (before `200 OK` headers are sent to the client) can be retried locally or returned as a `503` client retry. Failures **after commit** cannot be replaced with an HTTP error; the proxy closes the stream and logs `DROP`.
 
 ## Find the symptom
 
-| Symptom | Start here |
+| Symptom | Section |
 | --- | --- |
-| EOF, socket closure, incomplete reply, or JSON parse error | [Broken streams](#broken-streams) |
-| Repeated overload, rate-limit, authentication, or billing errors | [Service errors](#service-errors) |
-| Invalid tools, context, schema, or model | [Invalid requests](#invalid-requests) |
-| No visible output, timeout, or `client_gone` | [Long or silent requests](#long-or-silent-requests) |
-| Workflow agent reports “stalled … no progress” | [Workflow stalls](#workflow-stalls) |
-| A different model answers after a refusal | [Model fallback](#model-fallback) |
-| Size-limit failure, missing archive, or disk error | [Storage and payload capture](#storage-and-payload-capture) |
+| EOF, socket reset, truncated reply, or JSON parse error | [Broken streams](#broken-streams) |
+| Overload (`529`), rate limit (`429`), `5xx`, auth, or billing errors | [Service errors](#service-errors) |
+| Invalid tool blocks, schema error, context overflow, or unknown model | [Invalid requests](#invalid-requests) |
+| Request hangs, times out, or logs `client_gone` / `deadline` | [Long or silent requests](#long-or-silent-requests) |
+| Claude Code Workflow agent aborts with “stalled … no progress” | [Workflow stalls](#workflow-stalls) |
+| A different model answers after a refusal (`WARN`) | [Model fallback](#model-fallback) |
+| `request_too_large`, `response_too_large`, `spool_error`, or missing archive | [Storage and payload capture](#storage-and-payload-capture) |
 
 ## Broken streams
 
-These failures often appear after an upstream has already returned HTTP `200`.
-Holding the response lets the proxy detect the failure before the client accepts
-that success status.
+Upstreams often fail mid-stream *after* sending HTTP `200`. Buffering catches these failures before the client sees them:
 
-| Message or condition | What the proxy detects | Result before commit |
+| Upstream failure | Proxy classification | Pre-commit action |
 | --- | --- | --- |
-| `JSON Parse error: Unexpected EOF` | Connection closes before the terminal event, or tool input ends as incomplete JSON. | Retry as `truncated_stream` or `malformed_sse`. |
-| `Request was aborted.` or `The socket connection was closed unexpectedly.` | Interrupted upstream connection. | Retry a transport or stream-read failure. |
-| `Connection closed mid-response` or `Connection closed while thinking` | Missing completion after partial output or reasoning. | Retry the incomplete stream. |
-| HTTP/2 `INTERNAL_ERROR; received from peer` | Upstream resets a stream. | Retry as a stream-read or transport error. |
-| `JSON Parse error: Unexpected identifier` | Invalid JSON in a complete Anthropic event. | Retry as `malformed_sse`. |
-| Tool/server-tool fragments never form valid JSON | Invalid accumulated Anthropic tool input. | Retry as `malformed_sse`. |
-| HTML or another non-SSE response to a streaming request | Unexpected content type. | Retry as `unexpected_content_type`. |
+| Stream closes before terminal event (`JSON Parse error: Unexpected EOF`, `Connection closed mid-response` / `while thinking`) | `truncated_stream` | Discard buffer and retry. |
+| Socket reset, `Request was aborted.`, or HTTP/2 `INTERNAL_ERROR; received from peer` | Transport / stream-read error | Discard buffer and retry. |
+| Invalid JSON in an Anthropic event (`JSON Parse error: Unexpected identifier`) or incomplete/invalid accumulated `tool_use` / `server_tool_use` JSON | `malformed_sse` | Discard buffer and retry. |
+| HTML error page or non-SSE `Content-Type` on a streaming call | `unexpected_content_type` | Discard buffer and retry. |
 
-For Anthropic, leave `PROXY_VALIDATE_JSON=1` to catch malformed event and tool
-payloads. `PROXY_NORMALIZE_TOOL_JSON=1` also combines fragmented tool input before
-forwarding it. Turning validation off disables that normalization too.
+### Protocol-specific validation
 
-For Responses streams, a valid `response.completed` is required for successful completion.
-A malformed terminal, including duplicate keys or invalid Unicode, does not count
-as success. Ordinary content frames are handled according to Codex's lenient
-parser rather than Anthropic's validation rules. A `response.incomplete` event
-also triggers a retry; it is not a successful completion.
+- **Anthropic Messages:** Keep `PROXY_VALIDATE_JSON=1` and `PROXY_NORMALIZE_TOOL_JSON=1` enabled so malformed events are retried and fragmented `input_json_delta` chunks are combined before replay.
+- **OpenAI Responses:** Requires a valid `response.completed` event (duplicate keys or invalid Unicode in the terminal event are rejected; `response.incomplete` is treated as a retryable failure). Ordinary content events follow Codex's lenient parser.
+- **Gemini `streamGenerateContent?alt=sse`:** Requires clean transport EOF after all requested candidates report a `finishReason` (or a standalone prompt block). Trailing usage frames are preserved. Missing candidates, missing finish reasons, partial frames, or malformed JSON trigger a retry before commit, and abort the HTTP transport after commit so the client does not mistake a drop for clean EOF. Native `MAX_TOKENS` and safety stops are valid completions and pass through unchanged.
 
-Gemini `streamGenerateContent?alt=sse` requires a clean transport EOF after every
-requested candidate finishes, or a prompt block. A `finishReason` alone does not
-end capture: a later usage frame or error still matters. Missing candidates,
-missing finish reasons, partial SSE frames, malformed JSON, and read faults cause
-a retry before commit. After commit, the proxy aborts HTTP instead of sending a
-clean EOF that could look successful. Native `MAX_TOKENS` and safety stops are
-delivered unchanged; they are not stream failures.
-
-If the log shows `DROP`, the client had already received headers. Default Responses
-mode reaches that point as soon as output appears. Enable full buffering with
-`PROXY_RESPONSES_EARLY_COMMIT=0` to protect more of the response, and set the
-[client idle timeout](CONFIGURATION.md#match-the-client-to-the-window) above the
-buffering window. For Messages, check whether the turn outlasted its window or
-used the shorter Workflow window.
+If you see frequent `DROP` logs on `/v1/responses`, enable full buffering with `PROXY_RESPONSES_EARLY_COMMIT=0` and ensure the client's `stream_idle_timeout_ms` exceeds `PROXY_RESPONSES_BUFFER_MS`.
 
 ## Service errors
 
-The proxy treats temporary service failures as retryable and renders them as a
-generic `503` with retry headers. This keeps recognizable overload or rate-limit
-shapes from triggering Claude Code's smaller special-case retry budgets.
+Recoverable upstream errors are normalized into a generic HTTP `503` with `X-Should-Retry: true` and `Retry-After` so clients like Claude Code stay on their standard retry loop instead of aborting early on `529` or `429`.
 
-| Upstream error | Expected handling |
+| Upstream error | Handling |
 | --- | --- |
-| `529`, `overloaded_error`, “API is at capacity,” or “No available providers” | Retry; the log retains the overload or HTTP failure code. |
-| `500`, `502`, `503`, or another server failure | Retry, subject to gateway override headers. |
-| `429`, `rate_limit_error`, or “Rate limited” | Retry with the upstream delay when available. |
-| An Anthropic SSE `error` reporting overload or rate limit | Retry before commit; end the stream after commit. |
-| A Responses `error` or `response.failed` reporting overload, timeout, or rate limit | Retry before commit; end the stream after commit. |
-| A Gemini SSE `error` envelope reporting `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, or a server failure | Retry before commit with Gemini-shaped HTTP `503`; abort HTTP after commit. |
-| Invalid API key, disabled organization, billing block, or unknown `4xx` | Usually retry, since gateway access or capacity may recover. |
+| `529`, `overloaded_error`, “API is at capacity”, “No available providers” | Retry (`503`); original overload code logged. |
+| `500`, `502`, `503`, `504` | Retry (`503`), unless overridden by [gateway headers](CONFIGURATION.md#optional-upstream-headers). |
+| `429`, `rate_limit_error`, “Rate limited” | Retry (`503`), preserving upstream `Retry-After` or `RetryInfo`. |
+| In-stream SSE `error` / `response.failed` (overload, timeout, rate limit, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`) | Retry (`503`) before commit; terminate stream (`DROP`) after commit. |
+| Auth failure, billing block, or unknown `4xx` | Retried by default so temporary gateway/account blips do not abort a turn. |
 
-A Responses error can carry `type: "invalid_request_error"` while its more
-specific `code` is `request_timeout`, `rate_limit_exceeded`, or
-`server_is_overloaded`. The recognized transient code takes precedence. For
-example, `request_timeout` with “stream disconnected before completion” remains
-retryable instead of becoming an invalid-request failure.
+### Special error-classification rules
 
-For Anthropic SSE `event: error`, the proxy also recognizes one verified transport
-disconnect mislabeled `invalid_request_error`. The complete message must be exactly:
+- **Responses transient codes:** If a `/v1/responses` error has `type: "invalid_request_error"` but carries a transient `code` (`request_timeout`, `rate_limit_exceeded`, or `server_is_overloaded`), the transient code wins and the request is retried.
+- **Anthropic SSE disconnect signature:** An Anthropic in-stream `event: error` with `type: "invalid_request_error"` is normally terminal, except for the exact gateway disconnect message:
+  ```text
+  stream error: stream disconnected before completion: stream closed before response.completed
+  ```
+  which is classified as `sse_stream_disconnect` and retried before commit.
+- **Policy errors:** Generic policy errors retry by default, but Responses `bio_policy` and `cyber_policy` codes are terminal.
 
-```text
-stream error: stream disconnected before completion: stream closed before response.completed
-```
-
-This failure is classified as `sse_stream_disconnect`. Before commit, failed
-output is discarded and the existing local and client retry budgets apply, within
-the current deadline and buffering window. After commit, the stream ends without
-transparent replay. This exception does not change retry limits or timeouts.
-
-If retries continue, check the gateway's credentials, account state, availability,
-and rate limits. A permanently bad key or exhausted balance will not improve
-without intervention, even though the proxy allows time for recovery. Generic
-policy errors usually follow this retry policy; recognized Responses `bio_policy`
-and `cyber_policy` codes are terminal.
-
-Use [retry budgets](ARCHITECTURE.md#retry-budgets) to understand the remaining
-attempts. Increasing the budget cannot fix a persistent configuration error.
-A gateway that knows an error is permanent can use
-[`x-gateway-retryable: false`](CONFIGURATION.md#optional-upstream-headers).
+Because auth and billing failures are retried by default, a permanently invalid API key or empty balance will retry until the retry budget expires. Gateways that can distinguish permanent failures should return `x-gateway-retryable: false`.
 
 ## Invalid requests
 
-An identical retry cannot repair an invalid request. Recognized request errors
-are returned with `X-Should-Retry: false`; terminal Responses errors use HTTP
-`400` so Codex stops retrying them.
+Deterministic request-shape errors cannot succeed on an identical retry. The proxy returns them immediately with `X-Should-Retry: false` (and normalizes terminal Responses errors and non-retryable Gemini `408`/`429`/`5xx` errors to HTTP `400`).
 
-| Error or message | What to fix |
+| Error condition | Fix |
 | --- | --- |
-| Missing tool result, duplicate `tool_use` ID, or unexpected `tool_use_id` | Repair or rewind the conversation's tool history. |
-| Tool-use concurrency error with “Run /rewind” | Restore a consistent conversation state. |
-| “Extra inputs are not permitted,” `context_management`, or `input_examples` | Align the request schema with what the gateway accepts. |
-| Unexpected `anthropic-beta` header value | Use a beta/header combination supported by the gateway. |
-| `max_tokens must be greater than thinking.budget_tokens` | Increase the output limit or reduce the thinking budget. |
-| Thinking blocks “cannot be modified” | Preserve the original thinking blocks in conversation history. |
-| Image dimensions exceed the allowed size | Resize or replace the image. |
-| “Prompt is too long” or context-length error | Compact or shorten the input. |
-| Explicit `model_not_found` code | Choose a model the gateway supports. |
-| Responses `unknown_parameter`, `invalid_type`, or another recognized validation code | Correct the named field or value. |
-| Gemini `INVALID_ARGUMENT`, `NOT_FOUND`, or a bare numeric `400`/`404` | Correct the request, model, or referenced resource. The documented `API_KEY_INVALID` ErrorInfo is an authentication exception and remains retryable. |
+| Missing `tool_result`, duplicate `tool_use` ID, or unexpected `tool_use_id` | Rewind or repair the conversation's tool history. |
+| Tool-use concurrency error (`Run /rewind`) | Rewind the session to a consistent state. |
+| `Extra inputs are not permitted`, `context_management`, or `input_examples` | Remove unsupported fields for the target gateway/model. |
+| Invalid `anthropic-beta` header | Use beta flags supported by your gateway. |
+| `max_tokens must be greater than thinking.budget_tokens` | Raise `max_tokens` or lower `thinking.budget_tokens`. |
+| Thinking blocks `cannot be modified` | Preserve historical thinking blocks unmodified. |
+| Oversized image dimensions | Resize or remove the image. |
+| `Prompt is too long` / context-length exceeded | Compact or shorten the conversation. |
+| `model_not_found` | Configure a model supported by your gateway. |
+| Responses `unknown_parameter`, `invalid_type`, or schema validation codes | Fix the rejected request field. |
+| Gemini `INVALID_ARGUMENT`, `NOT_FOUND`, or bare HTTP `400`/`404` | Fix the request or model name (`API_KEY_INVALID` remains retryable). |
 
-Anthropic HTTP errors use recognized message signatures. A bare HTTP
-`invalid_request_error` without one can still retry; an Anthropic in-stream
-`invalid_request_error` is terminal except for the exact transport-disconnect
-signature above. Invalid schemas, malformed tool messages, and context-limit
-failures remain terminal. Responses classification uses error codes, types, and
-recognized messages, with known transient codes taking precedence over generic
-invalid-request types. Gateway retry headers override HTTP heuristics.
+### Protocol-specific validation details
 
-Gemini decodes numeric `error.code`, canonical `error.status`, and `error.message`
-on both HTTP and SSE errors, including the array-wrapped HTTP errors returned by
-non-SSE `streamGenerateContent`. `FAILED_PRECONDITION` is not automatically permanent:
-it can indicate billing or regional access. The documented Google
-`google.rpc.ErrorInfo` reason `API_KEY_INVALID` remains retryable even when its
-status is `INVALID_ARGUMENT`, preserving the proxy's authentication policy.
-Gateway retry headers still take precedence on HTTP errors. See Google's
-[GenerateContent error reference](https://ai.google.dev/gemini-api/docs/generate-content/api-errors).
-
-Gemini's native [`google.rpc.RetryInfo`](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto)
-cooldown is honored for HTTP and in-band SSE errors when no valid positive HTTP
-`Retry-After` is present. Fractional seconds round up. A delay that cannot fit the
-remaining local retry window is returned to the client without an early retry.
-
-Interrupted HTTP error-body reads are transport failures, not proof of an invalid
-request. Incomplete or malformed Gemini error JSON likewise cannot establish a
-validation error. Explicit retry headers remain authoritative unless the request
-context itself has ended.
-Proxy buffering deadlines remain timeout failures during HTTP/2 body reads; they
-are not treated as client cancellations.
+- **Anthropic:** HTTP `invalid_request_error` responses only fail permanently when they match a known request-shape signature; unrecognized HTTP `400`s remain retryable. In-stream SSE `invalid_request_error` events are terminal (except for the exact `sse_stream_disconnect` string above).
+- **Gemini:** Parses `error.code`, `error.status`, and `error.message` across HTTP and SSE errors (including JSON-array HTTP error bodies from non-SSE `streamGenerateContent`). `FAILED_PRECONDITION` (often billing or region routing) and `google.rpc.ErrorInfo` with `reason: "API_KEY_INVALID"` remain retryable. Native [`google.rpc.RetryInfo`](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto) delays are honored when no positive `Retry-After` header is present (fractional seconds round up).
+- **Interrupted error reads & HTTP/2 deadlines:** Truncated error bodies, malformed error JSON, and proxy buffering deadlines during HTTP/2 reads are treated as retryable transport/timeout failures—never as validation errors or `client_gone`.
 
 ### Codex context compaction
 
-A Responses `response.failed` event whose error code is exactly
-`context_length_exceeded` is forwarded to Codex so its native compaction path can
-handle it. This is an intentional exception to converting errors into HTTP
-responses. A top-level `error` event with the same code, or another recognized
-context-error shape, is returned as terminal HTTP `400` instead.
+When a `/v1/responses` stream emits `response.failed` with `error.code: "context_length_exceeded"`, the proxy forwards that SSE event to the client instead of converting it into an HTTP error, allowing Codex's native auto-compaction to trigger. A top-level `error` event with the same code (or an HTTP context-length error) is returned as terminal HTTP `400`.
 
 ## Long or silent requests
 
-Silence while buffering is expected. The proxy has not sent response headers
-because it is still waiting for a complete response. If the client cancels during
-that wait, the proxy cannot keep the abandoned call running for it.
+While buffering, the proxy sends no HTTP headers to the client. If the client's own timeout is shorter than the buffering window, the client will disconnect (`client_gone`).
 
-| Log or timing | Likely cause | Next step |
+| Symptom | Cause | Fix |
 | --- | --- | --- |
-| Claude aborts around 60 seconds with `client_gone` | Its response-header timeout is shorter than the buffering window. | Apply both Claude timeout settings from the [README](../README.md#claude-code). |
-| Claude aborts near 600 seconds | Its per-attempt timeout may equal the default window. | Keep `API_TIMEOUT_MS` strictly above the window. |
-| Codex idles out in full-buffer mode | `stream_idle_timeout_ms` is too short. | Set it above `PROXY_RESPONSES_BUFFER_MS`. |
-| `upstream_idle` | No upstream bytes arrived within the byte-idle limit. | Check the gateway for a stalled generation or connection. |
-| `deadline` before streaming begins | A header timeout, buffering-window deadline, or total request deadline elapsed. | Compare the duration with the [timeout settings](CONFIGURATION.md#timeouts). |
-| `DROP` after a long live stream | The response failed after the proxy had committed. | Check the cause code and the client's stream recovery. |
-
-The buffering window includes header waits and all hidden retries. More local
-retries do not extend it. Keepalive messages help an open client connection, but
-cannot override its absolute timeout or make an upstream produce useful content.
+| Claude Code aborts around ~60s with `client_gone` | Default response-header timeout (~60s) fired while buffering. | Set `CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`, `API_TIMEOUT_MS=720000`, and `API_FORCE_IDLE_TIMEOUT=0` in `~/.claude/settings.json`. |
+| Client aborts right at ~600s with `client_gone` | Client timeout equals `PROXY_KEEPALIVE_MS` with no margin. | Keep client timeouts strictly above the buffering window (e.g., `660000` ms+). |
+| Codex disconnects in full-buffer mode | `stream_idle_timeout_ms` is shorter than `PROXY_RESPONSES_BUFFER_MS`. | Set `stream_idle_timeout_ms = 660000` in `~/.codex/config.toml`. |
+| `upstream_idle` in proxy log | No bytes received from gateway within `PROXY_UPSTREAM_BYTE_IDLE_MS`. | Check gateway health or increase `PROXY_UPSTREAM_BYTE_IDLE_MS`. |
+| `deadline` before streaming starts | Header timeout (`PROXY_RESP_HEADER_TIMEOUT_MS`), buffering window, or total request deadline expired. | Compare the logged duration against your [timeout settings](CONFIGURATION.md#timeouts). |
+| `DROP` after a long live stream | Upstream failed after the proxy committed to live output. | Check the logged failure code; recovery depends on client stream retries. |
 
 ## Workflow stalls
 
-Workflow `agent()` calls have a separate watchdog based on real forwarded content.
-The proxy's default 10-second Workflow window reduces buffering delay before the
-first useful output. A workflow should appear as `/wf` in the log.
+Claude Code Workflow `agent()` requests (logged as `/wf`) use `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10s) so buffered content reaches the client before the Workflow runtime's 180s content-stall watchdog fires.
 
-If it still stalls, keep `PROXY_WORKFLOW_KEEPALIVE_MS` below its `stallMs`, then
-check for a long gap in actual upstream content. Pings do not reset the Workflow
-watchdog; a high `prun` value can help identify such a gap. A larger script-side
-`stallMs` is needed when the upstream itself remains content-silent too long.
-See [Workflow behavior](ARCHITECTURE.md#workflow-agents) for detection and limits.
+If a Workflow agent still stalls:
+1. Verify `PROXY_WORKFLOW_KEEPALIVE_MS` is well below the script's `stallMs`.
+2. Check the log for a high `prun=N` value, which indicates the upstream sent SSE pings without real content tokens. Because SSE pings do not reset the Workflow watchdog, increase `stallMs` in your workflow script (e.g., `agent(prompt, {stallMs: 300000})`).
 
 ## Model fallback
 
-A `WARN` line with `refusal -> retry with <model>` or
-`safeguard -> retry with <model>` records an Anthropic model substitution. The
-following outcome is for the fallback attempt. Ensure that the configured model
-is available through your gateway.
+A `WARN` log with `refusal -> retry with <model>` or `safeguard -> retry with <model>` means the proxy intercepted a pre-commit Anthropic refusal and re-issued the request with `PROXY_REFUSAL_FALLBACK_MODEL`. The next log line shows the fallback attempt's result.
 
-The substitution only works before commit and happens at most once per client
-request. It does not apply to Responses requests. To keep the original refusal response, set
-`PROXY_REFUSAL_FALLBACK_MODEL=off`; see [model fallback](ARCHITECTURE.md#model-fallback).
+Ensure your gateway supports the configured fallback model, or set `PROXY_REFUSAL_FALLBACK_MODEL=off` to pass refusals through unchanged. See [Model fallback](ARCHITECTURE.md#model-fallback).
 
 ## Storage and payload capture
 
-`request_too_large` means the incoming body exceeded `PROXY_MAX_REQUEST_BYTES`.
-It is rejected without truncation. `response_too_large` means a buffered response
-or an individual SSE event exceeded `PROXY_MAX_RESPONSE_BYTES`; it is returned as
-a non-retryable failure before commit. Reduce the payload or deliberately adjust
-the relevant limit.
-
-`spool_error` means a storage operation failed, not that the size cap was reached.
-Check permissions and free space for `PROXY_SPOOL_DIR`. Storage I/O failures remain
-retryable, and temporary response buffers are released when attempts end.
-
-For a missing or incomplete payload archive, enable `PROXY_VERBOSE=1` and look for
-`[request-log]` errors. A `capture_error` in an archive indicates a read problem.
-Archives have no automatic retention; see
-[payload capture and data handling](OPERATIONS.md#saving-request-and-response-data).
+- **`request_too_large`:** Client request body exceeded `PROXY_MAX_REQUEST_BYTES` (64 MiB default); rejected immediately without truncation.
+- **`response_too_large`:** Buffered response or single SSE event exceeded `PROXY_MAX_RESPONSE_BYTES` (128 MiB default); returned as a non-retryable error before commit.
+- **`spool_error`:** Disk I/O failure in `PROXY_SPOOL_DIR` (check free space and permissions); treated as retryable.
+- **Missing or partial payload archives:** Run with `PROXY_VERBOSE=1` and check for `[request-log]` errors, or inspect `capture_error` inside the JSON archive.
 
 ## Non-streaming calls
 
-Successful non-streaming requests, token counting, and model listing are forwarded
-without full response buffering. Their HTTP or connection errors can still become
-client retries, but there are no hidden transactional retries. If a successful
-body copy fails, the proxy logs `DROP` and aborts the HTTP response so a truncated
-body does not look like clean success.
+Non-streaming requests (`stream: false`), `count_tokens` / `countTokens`, and model listings bypass SSE buffering and local retries, using a single upstream attempt per call. Recoverable HTTP and connection failures still convert into `503` client retries. If a response body transfer fails mid-copy after `200 OK` headers are written, the proxy logs `DROP` and aborts the connection so the client does not accept a truncated JSON body.

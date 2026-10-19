@@ -1,266 +1,109 @@
 # Architecture
 
-steady-proxy handles the connection between an API client and its gateway. The gateway
-still owns provider routing and availability. The proxy holds responses long
-enough to catch failures, then either delivers the response or makes another
-attempt possible within the configured budgets.
+`steady-proxy` sits between an API client and an upstream gateway. Your gateway still handles model routing and provider selection; the proxy buffers streaming responses so transient upstream failures can be caught and retried before the client commits to a turn.
 
 ## Client compatibility
 
-The proxy selects stream behavior from the HTTP method, API path, and request.
-Messages and Responses use the body's `stream` field; Gemini uses the
-`streamGenerateContent` method with `alt=sse`. These streaming `POST` requests
-share one buffering and retry engine, with a separate interpreter per protocol.
-No specific user agent is required.
+The proxy selects a protocol interpreter based on the HTTP method, path, and request parameters:
 
-Other agents, SDKs, and applications can use these routes when they support the
-proxy's timeout, retry, and stream behavior. Integration tests exercise all three
-protocols using ordinary HTTP requests. The live CLI harness uses Claude Code;
-it does not establish compatibility with every client.
+- **Anthropic Messages:** `POST /v1/messages` with `"stream": true`
+- **OpenAI Responses:** `POST /v1/responses` with `"stream": true`
+- **Gemini GenerateContent:** `POST /{version}/models/{model}:streamGenerateContent?alt=sse` under `/v1`, `/v1beta`, `/v1alpha`, or `/v1beta1` (including Vertex AI `/projects/{project}/locations/{location}/publishers/google/models/{model}` paths)
 
-| Client behavior | Requirement or effect |
+All three streaming routes share one buffering and retry engine (`wireModel` in `wire.go`) and do not require a specific `User-Agent`. Other routes (`/v1/chat/completions`, `generateContent`, `countTokens`, non-SSE `streamGenerateContent`, `/v1/models`, and `stream: false` requests) are forwarded as single-shot requests with HTTP error normalization. Synthesized HTTP errors use the route's native error envelope: Google's `error.code` / `error.status` on known Gemini model methods, OpenAI's error object on `/v1/responses`, and Anthropic's `type: "error"` envelope on `/v1/messages` and all other routes.
+
+| Requirement | Client expectation |
 | --- | --- |
-| Base URL and transport | Send HTTP requests to the proxy using the expected API paths and SSE for streaming. The proxy does not translate between APIs or implement WebSocket streaming. |
-| Timeouts | Allow the initial buffered wait and the chosen live keepalive interval; see [timeouts](CONFIGURATION.md#timeouts). |
-| HTTP retries | Retry HTTP `503` with `Retry-After`. Honor `X-Should-Retry: false` where supported. Local proxy retries can recover some failures even if the client does not retry. |
-| Stream recovery | Handle an incomplete response after headers have been sent. The proxy cannot restart a committed response for the client. |
-| Responses events | Tolerate the additional `response.proxy_keepalive` event. Completion checks and content handling follow Codex's parser expectations. |
-| Gemini events | Use native `GenerateContentResponse` SSE frames and tolerate SSE comment keepalives. The proxy preserves tool arguments, thought signatures, and unknown fields. |
-| Retry counter | Without `X-Stainless-Retry-Count`, the proxy treats the client retry count as zero; a positive `PROXY_SDK_RETRY_CAP` cannot bound those client retries. |
-
-Some compatibility choices apply to every request on a protocol's routes.
-Responses errors classified as non-retryable become HTTP `400`, and a
-`response.failed` event with `context_length_exceeded` is forwarded for the client
-to handle. Codex uses that event for compaction; other clients need their own
-handling. The shorter Workflow window specifically depends on Claude Code's
-system-prompt marker.
-
-Other routes, including `/v1/chat/completions`, are forwarded with one upstream
-attempt per client call. They do not receive stream validation, transactional
-buffering, or model fallback. HTTP errors can still be normalized for retry.
-Known Gemini model methods use Google's error envelope; Responses uses OpenAI's,
-and remaining routes use the Anthropic-style envelope.
+| **Transport & paths** | Standard HTTP + SSE. The proxy does not translate between protocols or support WebSocket streaming. |
+| **Timeouts** | Header, idle, and per-attempt timeouts must exceed the active buffering window (and live keepalive interval); see [Timeouts](CONFIGURATION.md#timeouts). |
+| **HTTP retries** | Retry HTTP `503` honoring `Retry-After`, and stop on `X-Should-Retry: false` (or terminal `400`). In-proxy retries (`PROXY_TRANSACTIONAL_LOCAL_RETRIES`) can also absorb pre-commit failures transparently. |
+| **Post-commit recovery** | Handle interrupted streams after `200 OK` headers are sent. Once committed, the proxy cannot restart the stream on the client's behalf. |
+| **Responses events** | Ignore unknown SSE event types (`response.proxy_keepalive`), which the proxy emits because SSE comments do not reset Codex's idle timer. |
+| **Gemini events** | Accept standard SSE comment keepalives (`: keepalive`). Tool calls, thought signatures, and unknown JSON fields are preserved unchanged. |
+| **Retry counter** | `PROXY_SDK_RETRY_CAP` reads `X-Stainless-Retry-Count`. Clients that do not send that header (such as Codex and Gemini SDKs) must enforce their own retry limit. |
 
 ## Buffering and the point of no return
 
-A supported streaming request starts in **buffered mode**. The proxy reads the upstream
-server-sent events (SSE) without sending response headers or content to the client.
-If the response completes, it sends `200 OK` and replays the buffered events.
-If the attempt fails, it can discard the buffer and retry without exposing a
-partial reply.
+Supported streaming requests start in **buffered mode**: the proxy reads upstream SSE frames into memory (spilling to disk beyond 1 MiB) without writing HTTP headers to the client.
 
-The moment it sends response headers is the **commit point**. From then on, it
-cannot replace the response with an HTTP error. If a stream fails after that
-point, the proxy ends it and logs `DROP`; recovery depends on the client's stream
-retry support and remaining budget.
+- If the stream completes within the buffering window, the proxy sends `200 OK` and replays the validated buffer.
+- If the stream fails before headers are sent, the proxy discards the buffer and either retries upstream locally or returns a retryable `503` to the client.
 
-The protocols choose that point differently:
+Writing `200 OK` response headers is the **commit point**. Once headers are sent, the proxy can no longer convert a failure into an HTTP error; any subsequent upstream failure terminates the stream and logs `DROP`.
 
-| Request | Default behavior | Successful completion |
+| Request type | Default commit policy | Completion criterion |
 | --- | --- | --- |
-| Anthropic Messages | Buffer for up to 600 seconds, then switch to live output. | A valid stream ending in `message_stop`. |
-| Claude Code Workflow agent | Use a 10-second window, then switch once real content is available. | The same Messages completion. |
-| OpenAI Responses | Switch to live output as soon as an output event arrives; a 30-second window bounds a silent start. | A valid `response.completed`. |
-| Responses with `PROXY_RESPONSES_EARLY_COMMIT=0` | Buffer for up to 600 seconds, then switch to live output. | A valid `response.completed`. |
-| Gemini `streamGenerateContent?alt=sse` | Buffer for up to 600 seconds, then switch to live output. | Clean transport EOF after every requested candidate has a `finishReason`, or a native prompt block. |
+| **Anthropic Messages** | Buffer up to 600s (`PROXY_KEEPALIVE_MS`), then switch to live streaming. | Valid SSE stream ending in `message_stop`. |
+| **Claude Code Workflow agent** | Buffer up to 10s (`PROXY_WORKFLOW_KEEPALIVE_MS`), then switch to live streaming once forwardable content arrives. | Valid SSE stream ending in `message_stop`. |
+| **OpenAI Responses (default)** | Commit and stream live as soon as the first output event arrives; 30s (`PROXY_RESPONSES_KEEPALIVE_MS`) bounds a silent reasoning start. | Valid `response.completed` event. |
+| **OpenAI Responses (`PROXY_RESPONSES_EARLY_COMMIT=0`)** | Buffer up to 600s (`PROXY_RESPONSES_BUFFER_MS`), then switch to live streaming. | Valid `response.completed` event. |
+| **Gemini `streamGenerateContent?alt=sse`** | Buffer up to 600s (`PROXY_GEMINI_BUFFER_MS`), then switch to live streaming. | Clean transport EOF after every requested candidate has a `finishReason` (or a prompt block without candidates). |
 
-Buffering trades immediate output for a chance to recover before the client sees
-anything. Choose full buffering when that protection matters more than seeing
-tokens arrive live.
+### Gemini completion details
 
-Gemini supports native model methods under `/v1`, `/v1beta`, `/v1alpha`, and
-`/v1beta1`, including standard Vertex AI
-`/projects/{project}/locations/{location}/publishers/google/models/{model}` paths.
-Only `streamGenerateContent?alt=sse` receives transactional protection;
-`generateContent`, `countTokens`, and non-SSE streaming transports remain
-single-shot. Gemini has no separate terminal SSE event, so the proxy waits for
-clean EOF, retaining usage-only frames after candidate completion. Missing
-candidates, unfinished SSE frames, and read faults fail the attempt. SSE control
-frames and empty data messages do not advance candidate completion. Native
-`MAX_TOKENS`, safety stops, and prompt blocks without candidates are delivered
-unchanged, not retried as transport failures. A prompt block accompanied by
-candidates is contradictory and cannot satisfy completion. See Google's
-[GenerateContent contract](https://ai.google.dev/api/generate-content).
-Candidate counts follow [ProtoJSON](https://protobuf.dev/programming-guides/json/):
-camelCase and snake_case field names, quoted integers, exponent notation, and zero
-fractional parts are accepted without rewriting the request.
+Because Gemini SSE has no dedicated terminal event, the proxy waits for clean EOF after all requested `candidateCount` candidates report a `finishReason`, preserving trailing usage-metadata frames (SSE control frames and empty data messages do not advance candidate completion). `generationConfig` / `generation_config` settings accept ProtoJSON camelCase or `snake_case` in JSON field order (later objects replace earlier ones), and candidate counts accept quoted integers, exponents, and `.0` fractions without mutating the request body.
 
-After a Gemini response commits, a failure aborts the downstream HTTP transport:
-a normal EOF could otherwise appear successful to an SDK. No committed attempt
-is replayed. Whether the client recovers depends on its stream-retry behavior.
+Missing candidates, truncated frames, contradictory prompt blocks (a block accompanied by candidates), and read errors fail the attempt. Native `MAX_TOKENS`, safety stops, and standalone prompt blocks are valid completions and are delivered as-is. If a Gemini stream fails after committing to live output, the proxy aborts the downstream HTTP connection so the SDK does not treat a premature close as clean EOF.
 
 ### One window per client request
 
-The buffering window starts when the client request reaches the proxy. Waiting
-for upstream headers, retry delays, extra attempts, and model fallback all use
-that same window. None of them restart its clock.
+The buffering timer starts when the client request arrives. Upstream header waits, local retry backoffs, and model fallback attempts all share that single window.
 
-When the window ends, a pending header or error-body read is cancelled and becomes
-eligible for a client retry. An active SSE capture switches to live output;
-Workflow requests also wait for real forwardable content. In live mode, keepalives
-help keep the client connection open. Messages and Gemini clients receive SSE
-comments; Responses clients receive a `response.proxy_keepalive` event. This
-event is skippable in Codex, whose SSE reader discards comments without resetting
-its idle timer; other Responses clients must also tolerate it.
-
-Keepalives cannot extend an absolute request deadline or make a silent upstream
-produce content. The separate upstream idle timeout still applies. See
-[timeouts](CONFIGURATION.md#timeouts) for the settings that must move together.
+When the window expires:
+- A pending header or error-body read is cancelled and returned for client retry.
+- An active SSE stream flushes its buffered prefix and switches to live streaming (Workflow requests wait until forwardable content is present).
+- In live mode, silent gaps emit `: keepalive` comments on Messages/Gemini and `response.proxy_keepalive` events on Responses. Keepalives prevent client idle disconnects, but `PROXY_UPSTREAM_BYTE_IDLE_MS` and the total request deadline still apply.
 
 ## Retries
 
-Before commit, a recoverable failure has two possible paths:
+When an attempt fails before commit:
 
-1. If extra local retries are enabled and there is enough time, the proxy waits
-   and sends the request again. The client continues waiting on its original call.
-2. Otherwise, the proxy returns HTTP `503` with `X-Should-Retry: true` and
-   `Retry-After`. Messages and Responses use `api_error`; Gemini uses its native
-   numeric `error.code: 503` and `error.status: "UNAVAILABLE"` envelope.
+1. **Local retry:** If `PROXY_TRANSACTIONAL_LOCAL_RETRIES` has remaining budget and enough time remains in the buffering window and request deadline, the proxy waits and re-issues the upstream request transparently.
+2. **Client retry:** Otherwise, the proxy returns HTTP `503` with `X-Should-Retry: true` and `Retry-After` (`api_error` envelope for Anthropic/Responses; `error.code: 503` / `UNAVAILABLE` for Gemini).
 
-Using one generic error shape matters for Claude Code. Recognizable overload and
-rate-limit errors can enter special client handlers with smaller retry budgets.
-The proxy keeps those failures in the ordinary retry path and records the original
-cause in its logs.
+Masking all retryable failures—including `429` rate limits and `529` overloads—into a generic `503` prevents Claude Code from routing them into special-case handlers that ignore `X-Should-Retry` and abort after ~3 tries. The real failure code is preserved in the proxy logs.
 
-Connection failures, truncation, overload, rate limits, and most temporary service
-errors are retryable. Authentication, billing, and unknown errors also usually
-retry, since a gateway may recover from them. A truly invalid key or empty balance
-therefore takes longer to surface.
-
-Recognized invalid requests are returned without a retry request. Explicit
-[gateway retry headers](CONFIGURATION.md#optional-upstream-headers) can override
-HTTP error classification. The Responses path also has exceptions designed for
-Codex's native context compaction and terminal policy errors; see the
-[error guide](TROUBLESHOOTING.md#invalid-requests).
+By default, connection errors, truncated streams, 5xx errors, rate limits, overloads, auth/billing failures, and unknown 4xx responses are retried so transient gateway issues do not kill long turns. Deterministic request-shape errors (context length, schema/tool validation, unknown model) fail immediately without retry; see [Troubleshooting](TROUBLESHOOTING.md#invalid-requests).
 
 ### Retry budgets
 
-`PROXY_TRANSACTIONAL_LOCAL_RETRIES=N` allows up to `N` extra attempts for a
-recoverable streaming failure before commit. With `N > 0`, a request that keeps
-using the same model can make at most:
+With `PROXY_TRANSACTIONAL_LOCAL_RETRIES=N` (`N > 0`), a turn using the same model can make up to:
 
 ```text
 (client retries + 1) × (N + 1) upstream attempts
 ```
 
-The actual number may be lower because attempts and backoff must fit within the
-buffering window, request deadline, and proxy retry cap. Local retries wait for
-upstream `Retry-After` **plus** an exponential delay starting at one second. The
-extra delay is capped at 10 seconds by default; that cap does not shorten an
-upstream-requested wait.
+bounded by the buffering window, total request deadline, and `PROXY_SDK_RETRY_CAP`. Local retries sleep for the upstream `Retry-After` **plus** an exponential backoff (1s, 2s, 4s, …, capped by `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS`, default 10s).
 
-The default `N=0` disables the general local retry budget. It still permits one
-short retry for selected fast connection or HTTP failures: the failure must arrive
-within three seconds, and the proxy waits 250 ms before trying again. The formula
-above does not describe that default path.
+When `N = 0` (the default), general local retries are off, except for a single fast retry (250 ms wait) when a connection error or selected HTTP status (`408`, `409`, `502`, `503` without `Retry-After`) arrives within 3 seconds of the attempt start.
 
-`PROXY_SDK_RETRY_CAP` is a separate backstop based on the Anthropic SDK's
-`X-Stainless-Retry-Count` header. It does not increase the client's own budget.
-Claude Code 2.1.191 was observed to default to 10 retries and clamp
-`CLAUDE_CODE_MAX_RETRIES` to 15; client versions can change these limits. Codex does
-not send the Stainless counter, so any positive proxy cap leaves its retry limit
-to `request_max_retries` and `stream_max_retries`. Other clients without that
-header likewise need to enforce their own retry limit.
-
-Gemini clients likewise own their retry budgets when they do not send the
-Stainless counter. If conversion is disabled or exhausted, a transient Gemini
-failure becomes terminal HTTP `400`, since its SDK may ignore `X-Should-Retry`.
-Explicitly non-retryable Gemini `408`, `429`, and `5xx` errors also become `400`
-so a gateway's `false` retry verdict cannot trigger an SDK's status-based retry.
-
-The same counter determines the `Retry-After` sent to the client when the upstream
-provides no delay. It grows exponentially from one second to 30 seconds, plus
-0–1 seconds of jitter. Without the counter, the synthesized delay remains
-1–2 seconds on each client request. Local retries use the proxy's own attempt
-counter for their backoff.
-
-There is no circuit breaker. Retries are controlled by backoff, time limits, and
-attempt budgets.
+`PROXY_SDK_RETRY_CAP` (default `100`) bounds retry conversion using the `X-Stainless-Retry-Count` header (it does not raise client limits; for example, Claude Code 2.1.191 defaults to 10 retries and clamps `CLAUDE_CODE_MAX_RETRIES` to 15). When the upstream provides no `Retry-After`, the synthesized client delay scales exponentially from 1s to 30s (+ up to 1s jitter) based on that header (or stays 1–2s when the header is absent). If retry conversion is disabled (`PROXY_SDK_RETRY_CAP=0`) or exhausted, Responses and transient Gemini failures return terminal HTTP `400` because their SDKs may retry `5xx`/`429` regardless of `X-Should-Retry: false`.
 
 ## Model fallback
 
-For streaming Anthropic requests, a complete response with
-`stop_reason: "refusal"` can trigger a new attempt using
-`PROXY_REFUSAL_FALLBACK_MODEL` instead. The default model is `claude-opus-5`.
-Recognized Fable safeguards errors can trigger the same substitution before
-commit, even without a complete response stream.
+On streaming `POST /v1/messages` requests, if a buffered response finishes with `stop_reason: "refusal"` or fails pre-commit with a recognized Fable safeguard error, the proxy rewrites the top-level `"model"` field to `PROXY_REFUSAL_FALLBACK_MODEL` (default `claude-opus-5`) and re-issues the request once.
 
-Only the request's top-level `model` value changes; the other fields retain their
-values. The proxy logs `WARN` with the original and fallback model. Choose a model
-your gateway supports, or set the variable to `off`, `none`, `disabled`, or an
-empty value to disable fallback.
-
-The substitution happens at most once per client request. A refusal from the
-fallback model is delivered normally, as is a refusal that arrives after commit.
-The fallback receives a fresh local retry budget, but it shares the original
-request's time limits. Setting `PROXY_SDK_RETRY_CAP=0` does not disable this
-separate model substitution.
-
-Recognized safeguards errors can also trigger fallback when the upstream sends
-`x-gateway-retryable: false` or `x-should-retry: false`. Those headers govern retry
-classification; disable fallback separately with `PROXY_REFUSAL_FALLBACK_MODEL=off`
-if the original safeguards error should reach the client.
-
-Fallback does not apply to OpenAI Responses, Gemini, or non-streaming requests. It detects
-the structured refusal and recognized safeguards messages; it does not inspect
-ordinary assistant text for a refusal.
+- All other JSON fields (`max_tokens`, `thinking`, `tools`, etc.) preserve their JSON values.
+- The proxy logs `WARN` with the original and fallback models.
+- Model substitution happens at most once per client request, gets a fresh local retry counter within the remaining request window, and remains enabled even when `PROXY_SDK_RETRY_CAP=0` or when a recognized safeguard error carries `x-gateway-retryable: false` / `x-should-retry: false`.
+- Set `PROXY_REFUSAL_FALLBACK_MODEL` to `off`, `none`, `disabled`, or `""` to disable it. Refusal fallback does not apply to Responses, Gemini, or non-streaming calls.
 
 ## Workflow agents
 
-Claude Code's Workflow `agent()` calls have a per-agent stall watchdog. In the
-observed runtime, its default budget is 180 seconds without forwarded content.
-A 600-second buffering window could therefore hide an otherwise healthy response
-until the watchdog aborts it.
+Claude Code's Workflow `agent()` runtime enforces a per-agent content-stall watchdog (180s by default; `CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` controls a different path) that only resets when actual assistant content is delivered—SSE pings and comments do not count.
 
-The proxy recognizes the Workflow runtime marker, `workflow orchestration script`,
-in the request's `system` field and uses `PROXY_WORKFLOW_KEEPALIVE_MS` instead.
-The default is 10 seconds. Once that window has elapsed and real content is
-available, it forwards the buffered prefix and streams live. Interactive sessions
-and ordinary subagents retain their usual window. Workflow requests appear as
-`/wf` in the log.
-
-Keep this window below the agent's `stallMs`. Keepalive comments and ping events
-do not count as Workflow progress, so the proxy cannot fix a long gap in actual
-upstream content. A slow first output or a mid-turn pause that exceeds `stallMs`
-needs a larger script-side budget, such as `agent(prompt, {stallMs: 300000})`.
-`CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` controls a different path; there is no global
-override for this watchdog in the observed runtime.
+When the proxy detects the Workflow system-prompt marker (`workflow orchestration script` inside `system`), it labels the request `/wf` in the logs and uses `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10s) instead of the 10-minute window. Once 10s have elapsed and forwardable content is buffered, the proxy commits and streams live. If the upstream model itself goes silent for longer than the script's `stallMs`, raise `stallMs` in the workflow script (e.g., `agent(prompt, {stallMs: 300000})`).
 
 ## Stream validation and replay
 
-For Anthropic, the proxy checks stream order, event JSON, and accumulated tool or
-server-tool input JSON before delivering a buffered success. It combines tool
-`input_json_delta` fragments into one complete JSON delta so the client does not
-try to parse incomplete fragments. Buffered replay can also fill initial input
-and cache usage from final usage when a gateway supplied zero placeholders.
+- **Anthropic Messages:** Validates event sequence, event JSON, and accumulated `tool_use` / `server_tool_use` input JSON before replaying a buffered stream. Fragmented `input_json_delta` chunks are coalesced into a single valid JSON delta per tool block, and zero-placeholder `message_start` token counts are backfilled from `message_delta` usage when present.
+- **OpenAI Responses:** Requires a valid `response.completed` event (with non-empty string `id` and complete integer usage fields when present). During buffered/prefix replay, adjacent compatible `response.output_text.delta` frames are merged up to `PROXY_RESPONSES_REPLAY_DELTA_BYTES` (64 KiB) to avoid flooding the client queue; frames with logprobs or mismatched metadata stay untouched.
+- **Gemini SSE:** Validates JSON framing, candidate `finishReason` completion, and absence of in-band error objects, then replays original bytes unchanged.
 
-For Responses, validation focuses on completion and error events. Other content
-frames are handled to match Codex's lenient parser. During buffered or prefix replay,
-adjacent compatible text deltas can be combined to avoid flooding the client's
-notification queue. Live text and non-text frames are preserved. Frames with
-non-empty logprobs, ambiguous structure, or incompatible routing stay separate.
-Responses tool arguments are not combined by the proxy.
-
-The [stream settings](CONFIGURATION.md#stream-processing) control these behaviors.
-Response buffers spill from memory to temporary files and are released when the
-attempt finishes. Size limits also bound unfinished SSE events before parsing.
+See [Stream processing](CONFIGURATION.md#stream-processing) to tune or disable these checks.
 
 ## Retry limits and side effects
 
-The full buffering and local retry engine applies to streaming `POST` requests
-on the Messages and Responses routes. Other calls, including `count_tokens`, model
-listing, and `stream: false`, use one upstream attempt per client request. Their
-HTTP and connection failures can still be converted into client retries. If copying
-a successful body fails, the proxy aborts the response and logs `DROP`.
+Transactional buffering and local retries apply only to streaming `POST` requests on Messages, Responses, and Gemini SSE. Single-shot routes use one upstream attempt per client call; if a response body copy fails mid-transfer, the proxy aborts the connection and logs `DROP`.
 
-Retrying an upstream request may repeat work already performed by server-side or
-remote tools. Buffering prevents delivery of a failed attempt to the client; it
-does not provide provider-level idempotency. Use idempotency protection for those
-tools or keep such requests outside the proxy. To disable proxy retry conversion
-and local retries, set `PROXY_SDK_RETRY_CAP=0`; disable model substitution
-separately with `PROXY_REFUSAL_FALLBACK_MODEL=off`. Clients may still apply their
-own recovery after a committed stream fails.
-
-The proxy does not resume a partially delivered response. It cannot combine full
-response validation with immediate streaming for the same attempt without support
-from the gateway.
+Because retries re-send the upstream request, any server-side or remote MCP tool invoked by the provider may run more than once. Client-local tools are safe because the client only executes them after receiving a complete response. For remote tools with side effects, enforce idempotency at the tool layer or set `PROXY_SDK_RETRY_CAP=0` and `PROXY_REFUSAL_FALLBACK_MODEL=off`.

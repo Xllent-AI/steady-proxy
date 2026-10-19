@@ -1,11 +1,8 @@
 # Development
 
-steady-proxy requires Go 1.23 or later and uses only the standard library.
-Docker is optional for native development; the live CLI harness requires it.
+`steady-proxy` requires Go 1.23+ and uses only the Go standard library (`go.mod` has no external dependencies). Docker with Compose v2 is only needed for container builds and the live CLI test harness.
 
 ## Build and run
-
-From a checkout of the repository:
 
 ```bash
 make build
@@ -13,26 +10,15 @@ make build
 PROXY_UPSTREAM_URL=https://your-gateway.example.com ./steady-proxy
 ```
 
-The binary listens on `127.0.0.1:8789` by default. It reads environment variables
-directly and does not load `.env`. The README includes setup for
-[Claude Code](../README.md#claude-code), [Codex](../README.md#codex),
-[Gemini](../README.md#gemini), and [other API clients](../README.md#other-api-clients).
+The binary listens on `127.0.0.1:8789` by default and reads `PROXY_*` variables directly from the process environment (it does not load `.env`). See the [README](../README.md#client-setup) for client configuration.
 
-`make build` stamps the binary with `VERSION`, the Git commit, build date, and
-working-tree status. To build a versioned Docker image with explicit build
-metadata, run:
+`make build` embeds `VERSION`, the Git commit, build timestamp, and working-tree status into the binary (exposed via `--version` and `GET /__version`). To build a Docker image with version metadata:
 
 ```bash
 make docker-build
 ```
 
-This tags both `steady-proxy:<VERSION>` and `steady-proxy:latest`. Ordinary
-`docker compose up -d --build` also records the version, commit from the minimal
-Git metadata in its build context, and build timestamp. The running proxy exposes
-that information at `/__version`.
-
-For version bumps, local release previews, and tag-triggered publishing, see
-[releasing](RELEASING.md).
+This tags both `steady-proxy:<VERSION>` and `steady-proxy:latest`. For release packaging and publishing, see [Releasing](RELEASING.md).
 
 ## Tests and checks
 
@@ -42,36 +28,20 @@ go build ./...
 make test
 ```
 
-`make test` runs `go test -race ./...`, including unit and integration tests.
-CI also checks `gofmt` and builds the Docker image. Use focused tests for the
-behavior you change, then run the relevant broader checks before submitting it.
+`make test` runs `go test -race ./...` across all unit and integration suites. CI also enforces `gofmt`, runs `make release-test`, and verifies the Docker build.
 
 ### Live client harness
 
-[`test/live.sh`](../test/live.sh) runs a real `claude -p` client through a
-dockerized proxy against a mock gateway with controlled failures. It requires
-Docker with Compose v2, `curl`, `claude`, and GNU `timeout` on `PATH`. On macOS,
-install GNU coreutils and add its `gnubin` directory to `PATH` so the command is
-available as `timeout`. The default run takes about 10 minutes, including a
-generation longer than 300 seconds:
+[`test/live.sh`](../test/live.sh) exercises a real `claude -p` CLI client through a containerized proxy against a fault-injecting mock gateway (`testupstream`). It requires Docker with Compose v2, `curl`, `claude`, and GNU `timeout` (on macOS, install `coreutils` and add `gnubin` to `PATH`).
 
 ```bash
-./test/live.sh
+./test/live.sh              # full suite (~10m, includes a >300s long turn)
+DO_LONG=0 ./test/live.sh    # skip the 300s+ long-turn case
 ```
 
-To skip the long-generation case:
+The harness runs in an isolated Compose project on random loopback ports, makes no real upstream API calls by default, and cleans up containers on exit (retaining logs in a temporary directory on failure).
 
-```bash
-DO_LONG=0 ./test/live.sh
-```
-
-The harness uses a separate Compose project and test image, random loopback ports,
-and isolated client settings. By default, it makes no real model requests. It
-removes its test project on exit or interruption and retains failed-run logs in
-the temporary directory it prints.
-
-To add one real, potentially billed gateway call, export `ANTHROPIC_AUTH_TOKEN`
-and run:
+To include one live (billed) gateway test, export `ANTHROPIC_AUTH_TOKEN` and run:
 
 ```bash
 DO_REAL=1 PROXY_UPSTREAM_URL=https://your-gateway.example.com ./test/live.sh
@@ -79,23 +49,20 @@ DO_REAL=1 PROXY_UPSTREAM_URL=https://your-gateway.example.com ./test/live.sh
 
 ## Finding the code
 
-Read the [architecture guide](ARCHITECTURE.md) for the request lifecycle and
-[troubleshooting](TROUBLESHOOTING.md) for expected failure behavior.
+All production code lives in `package main`:
 
 | File | Responsibility |
 | --- | --- |
-| [`main.go`](../main.go) | Configuration, routing, deadlines, local retries, fallback, and access logs. |
-| [`wire.go`](../wire.go) | Shared protocol interface and Anthropic stream behavior. |
-| [`responses.go`](../responses.go) | OpenAI Responses completion, errors, keepalives, and replay. |
-| [`gemini.go`](../gemini.go) | Native Gemini candidate completion, usage, and unchanged SSE replay. |
-| [`gemini_errors.go`](../gemini_errors.go) | Google numeric/canonical error classification and rendering. |
-| [`sse.go`](../sse.go) | SSE capture, buffering, validation, tool JSON, and the transition to live output. |
-| [`classify.go`](../classify.go) | Failure classification and client retry responses. |
-| [`transport.go`](../transport.go) | Upstream deadline and byte-idle handling. |
-| [`requestlog.go`](../requestlog.go) | Payload archives, body capture, and credential redaction. |
-| [`version.go`](../version.go) | CLI and HTTP version reporting. |
-| [`testupstream/main.go`](../testupstream/main.go) | Mock gateway used by the live harness. |
+| [`main.go`](../main.go) | Config parsing, HTTP routing, request deadlines, local retry loop, refusal fallback, and access logging. |
+| [`wire.go`](../wire.go) | Shared `wireModel` protocol interface, route matching, and Anthropic stream interpretation. |
+| [`responses.go`](../responses.go) | OpenAI Responses stream completion, error handling, `response.proxy_keepalive`, and delta coalescing. |
+| [`gemini.go`](../gemini.go) | Native Gemini SSE candidate tracking, usage extraction, and replay. |
+| [`gemini_errors.go`](../gemini_errors.go) | Google numeric/canonical error classification, `RetryInfo` parsing, and error envelopes. |
+| [`sse.go`](../sse.go) | Shared SSE capture engine (`captureSSECore`), memory/disk spooling, JSON validation, tool-input normalization, and live cutover. |
+| [`classify.go`](../classify.go) | Error classification and `503` retry response rendering. |
+| [`transport.go`](../transport.go) | Upstream HTTP transport, header timeouts, and byte-idle reader. |
+| [`requestlog.go`](../requestlog.go) | Opt-in JSON payload archiving and credential redaction. |
+| [`version.go`](../version.go) | `--version` flag and `/__version` endpoint. |
+| [`testupstream/main.go`](../testupstream/main.go) | Deterministic fault-injecting mock gateway used by `test/live.sh`. |
 
-Protocol implementations share the buffering and retry engine through `wireModel`.
-When changing one, check both buffered and live delivery: an error before commit
-can become an HTTP retry, while an error after commit must terminate the stream.
+When modifying protocol behavior, check both buffered (`buffered()`) and post-commit (`live()`) paths: pre-commit failures can be discarded and retried as HTTP `503`, whereas post-commit failures must terminate the stream cleanly.

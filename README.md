@@ -1,55 +1,34 @@
 # steady-proxy
 
-steady-proxy exists so agents can work continuously through common API and gateway
-disruptions, with fewer interruptions that need you to restart a turn or type
-“continue.” It runs between your **agent or API client** and its gateway,
-protecting requests from dropped connections, broken streams, overload, and
-temporary errors.
-
-It provides:
-
-- **Buffering:** hold responses until they are complete, so a broken reply can be
-  retried before the agent sees it.
-- **Retries and backoff:** turn recoverable failures into automatic client retries,
-  with optional extra retries inside the proxy.
-- **Model fallback:** retry Anthropic refusals with a configured fallback model.
-- **Stream validation and repair:** catch malformed Anthropic streams, combine
-  fragmented tool input, and smooth buffered Responses text replay.
-- **Long-turn support:** use configurable buffering windows and keepalives, with
-  a shorter window for Claude Code Workflow agents.
-- **Diagnostics:** log request outcomes and optionally archive full request and
-  response data for debugging.
+`steady-proxy` is a local reverse proxy for AI agents and API clients. It sits between your client and API gateway, buffering streaming responses so dropped connections, truncated streams, rate limits, and gateway 5xx errors can be retried before the client sees a failed turn.
 
 ```text
-Agents / SDKs / applications → steady-proxy on localhost → your gateway
+Agents / SDKs / applications → steady-proxy (127.0.0.1:8789) → your gateway
 ```
 
-Stream protection supports **Anthropic Messages** (`/v1/messages`),
-**OpenAI Responses** (`/v1/responses`), and native **Gemini GenerateContent**
-(`/{version}/models/{model}:streamGenerateContent?alt=sse`). Claude Code and Codex
-are supported clients; other agents and SDK-based applications can use these
-routes with compatible timeout, retry, and SSE handling. Subagents using the same
-API settings are covered without terminal automation. See
-[client compatibility](docs/ARCHITECTURE.md#client-compatibility) for requirements
-and the behavior of other routes.
+### Key features
 
-## What to expect
+- **Transactional buffering:** Holds SSE responses until completion (or a configurable time window) so broken streams can be discarded and retried cleanly.
+- **Retry normalization:** Converts recoverable HTTP and pre-commit stream failures into standard `503` responses with `Retry-After` (plus optional in-proxy retries).
+- **Stream validation and repair:** Validates Anthropic event order and tool JSON, coalesces fragmented `input_json_delta` chunks, and merges bursty Responses text deltas on replay.
+- **Refusal fallback:** Optionally re-issues Anthropic refusals against a fallback model before committing the response.
+- **Workflow watchdog support:** Uses a short buffering window for Claude Code Workflow agents so their content-stall timer does not trip.
+- **Diagnostics:** Logs one-line request outcomes and optionally archives full request/response payloads for debugging.
 
-By default, Messages and Gemini SSE streams are buffered for up to 10 minutes.
-A response that finishes within that window appears all at once. Responses
-streams go live as soon as output arrives; you can enable full buffering to
-protect them from later stream failures.
+### Supported routes
 
-Before the proxy sends a response, it can discard a failed attempt and retry.
-After it starts streaming to the client, recovery depends on the client's own
-stream retry behavior. Invalid requests, exhausted retry budgets, and client
-timeouts can still stop a turn. See the [architecture guide](docs/ARCHITECTURE.md) for the
-behavior and limits of each mode.
+| API | Route | Default behavior |
+| --- | --- | --- |
+| **Anthropic Messages** | `POST /v1/messages` (`stream: true`) | Buffers up to 10 minutes (`600000` ms) until `message_stop`, then replays. Workflow agents switch to live streaming after 10 seconds once content is ready. |
+| **OpenAI Responses** | `POST /v1/responses` (`stream: true`) | Catches start-of-stream failures before commit, then streams live on first output. Set `PROXY_RESPONSES_EARLY_COMMIT=0` for 10-minute full buffering. |
+| **Gemini GenerateContent** | `POST /{version}/models/{model}:streamGenerateContent?alt=sse` (including Vertex AI publisher paths) | Buffers up to 10 minutes through clean EOF after all requested candidates finish. |
+| **Other routes** | `/v1/chat/completions`, `generateContent`, `countTokens`, non-SSE `streamGenerateContent`, `/v1/models`, non-streaming calls | Forwarded single-shot; HTTP and connection errors still normalize for client retry. |
+
+See [Architecture](docs/ARCHITECTURE.md#client-compatibility) for client compatibility details.
 
 ## Quick start
 
-You need Docker with Compose v2 and a gateway that supports your client's API.
-For a native installation, see [building and running from source](docs/DEVELOPMENT.md).
+Requires Docker with Compose v2 (or Go 1.23+ to [build from source](docs/DEVELOPMENT.md)).
 
 ```bash
 git clone https://github.com/Xllent-AI/steady-proxy
@@ -58,44 +37,38 @@ cp .env.example .env
 cp docker-compose.yml.example docker-compose.yml
 ```
 
-Edit `.env` and set your gateway URL:
+Set your gateway URL in `.env`:
 
 ```dotenv
 PROXY_UPSTREAM_URL=https://your-gateway.example.com
 ```
 
-Use the gateway root, or its required path prefix. The proxy appends the request
-path: `/v1/messages` becomes `https://your-gateway.example.com/v1/messages`.
-Do not add another `/v1` unless your gateway requires that extra prefix.
+Use the gateway root (or required prefix) without a trailing `/v1`—the proxy appends the incoming request path (`/v1/messages`, `/v1/responses`, etc.) verbatim.
 
-Start the proxy:
+Start the proxy and verify it responds:
 
 ```bash
 docker compose up -d --build
 curl -fsS http://127.0.0.1:8789/__version
 ```
 
-The version endpoint confirms that the proxy is running; it does not contact your
-gateway. Next, configure the client you use below. Keep your existing API
-credentials: the proxy forwards them to the gateway.
+`/__version` checks local proxy health only. The proxy forwards your client's existing API keys and auth headers to the gateway.
 
-Prebuilt Linux amd64 images are published to GitHub Container Registry:
+### Prebuilt container image
+
+Linux `amd64` images are published to GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/xllent-ai/steady-proxy:latest
 ```
 
-`latest` follows `main`; release tags such as `v0.1.1` select a release instead.
-To use a prebuilt image with the example Compose configuration, change its
-`image:` to `ghcr.io/xllent-ai/steady-proxy:latest`, remove the `build:` block, then
-run `docker compose pull && docker compose up -d`. See
-[container publishing](docs/RELEASING.md#container-images) for tagging and registry
-access details.
+`latest` tracks `main`; version tags (such as `v0.1.1`) pin a release. To run the prebuilt image with Compose, set `image: ghcr.io/xllent-ai/steady-proxy:latest` in `docker-compose.yml`, remove the `build:` block, and run `docker compose pull && docker compose up -d`. See [Releasing](docs/RELEASING.md#container-images).
+
+## Client setup
 
 ### Claude Code
 
-Merge this `env` block into `~/.claude/settings.json`, keeping your other settings
-and authentication values:
+Merge this `env` block into `~/.claude/settings.json` alongside your existing settings and credentials:
 
 ```json
 {
@@ -108,16 +81,11 @@ and authentication values:
 }
 ```
 
-The proxy sends no response headers while buffering. Both client timeouts must
-exceed the default 600,000 ms buffering window, and the idle watchdog must stay
-off. If you change that window, adjust the client timers with it; see
-[timeouts](docs/CONFIGURATION.md#timeouts).
+Because the proxy sends no HTTP headers while buffering, client timeouts must exceed the 600,000 ms buffering window and the idle watchdog must be disabled. If you change `PROXY_KEEPALIVE_MS`, update these client timeouts to match; see [Timeouts](docs/CONFIGURATION.md#timeouts).
 
 ### Codex
 
-In `~/.codex/config.toml`, update your **active provider's** section. Replace
-`your_provider` below with its existing name and preserve its authentication
-settings:
+Update your active provider section in `~/.codex/config.toml` (keep `/v1` in `base_url` and keep your auth settings):
 
 ```toml
 [model_providers.your_provider]
@@ -128,101 +96,61 @@ request_max_retries = 10
 stream_max_retries = 10
 ```
 
-Keep `/v1` in the client URL. The idle timeout above covers both the default
-streaming mode and the optional 10-minute buffering mode.
-
-For full buffering and up to three extra upstream attempts per client request,
-add these settings to `.env`, then run `docker compose up -d`:
+To enable full 10-minute buffering for Responses and up to 3 in-proxy retries per client attempt, add to `.env` and run `docker compose up -d`:
 
 ```dotenv
 PROXY_RESPONSES_EARLY_COMMIT=0
 PROXY_TRANSACTIONAL_LOCAL_RETRIES=3
 ```
 
-Full buffering delays visible output until completion or the buffering window
-ends. Extra retries apply to all three supported streaming APIs and must fit within
-the active window. See [retry budgets](docs/ARCHITECTURE.md#retry-budgets).
+Full buffering delays output until the turn completes (or the window expires). Local retries apply across Messages, Responses, and Gemini SSE within the active buffering window; see [Retry budgets](docs/ARCHITECTURE.md#retry-budgets).
 
 ### Gemini
 
-Use a gateway that accepts native Gemini requests, or set
-`PROXY_UPSTREAM_URL=https://generativelanguage.googleapis.com` for Google's
-Developer API. Point your SDK's HTTP base URL at `http://127.0.0.1:8789`, retaining
-its API version and model settings. The proxy forwards `x-goog-api-key`, bearer
-authentication, and query parameters unchanged; it does not translate protocols.
+Point your Gemini SDK or client base URL at `http://127.0.0.1:8789` and set `PROXY_UPSTREAM_URL` to your Gemini gateway (or `https://generativelanguage.googleapis.com`). The proxy forwards `x-goog-api-key`, Bearer tokens, and query parameters unchanged.
 
-For a direct SSE request, set `GEMINI_MODEL` to an available model and keep your
-existing `GEMINI_API_KEY`:
+Example streaming call:
 
 ```bash
 curl -N --max-time 720 \
   "http://127.0.0.1:8789/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-  -H 'Content-Type: application/json' \
+  -H "Content-Type: application/json" \
   -d '{"contents":[{"parts":[{"text":"Say hello."}]}]}'
 ```
 
-Gemini selects streaming through the method and `alt=sse`, not a `stream` body
-field. `generateContent` and `countTokens` remain single-shot JSON requests with
-Gemini-shaped HTTP errors. Standard Vertex AI project/location/publisher model
-paths are also recognized; keep the Vertex upstream host and bearer credentials.
-
-`PROXY_GEMINI_BUFFER_MS` controls the independent 600,000 ms buffering window.
-Set client timeouts above it and configure bounded retries for HTTP `503`, honoring
-`Retry-After`. After a timed switch to live output, keepalives are SSE comments;
-failed streams abort the HTTP transport and require client recovery.
+Set client timeouts above `PROXY_GEMINI_BUFFER_MS` (default 600,000 ms) and configure bounded retries on HTTP `503` honoring `Retry-After`. If a Gemini stream fails after committing to live output, the proxy aborts the HTTP transport so the client does not mistake a truncated stream for clean EOF.
 
 ### Other API clients
 
-Set your client's base URL so it sends Messages requests to
-`http://127.0.0.1:8789/v1/messages` or Responses requests to
-`http://127.0.0.1:8789/v1/responses`. Some SDKs append `/v1` themselves; configure
-the base URL to produce exactly one `/v1` in the request path.
+Point Messages clients at `http://127.0.0.1:8789/v1/messages` and Responses clients at `http://127.0.0.1:8789/v1/responses` (watch whether your SDK appends `/v1` automatically). Enable `stream: true`, set client timeouts above the buffering window, and retry HTTP `503` with `Retry-After`. See [Client compatibility](docs/ARCHITECTURE.md#client-compatibility).
 
-Keep authentication in the client and use `stream: true` for stream protection.
-Set client timeouts above the active buffering window and configure retries for
-HTTP `503`, respecting `Retry-After`. Extra proxy retries can absorb failures
-before a response starts, but recovery after streaming begins belongs to the
-client. Check the [compatibility requirements](docs/ARCHITECTURE.md#client-compatibility),
-especially for Responses clients with strict event parsing.
+### Verify traffic
 
-### Check a request
-
-Start a new client session and send a short prompt while watching:
+Send a test prompt and tail the proxy logs:
 
 ```bash
 docker compose logs -f proxy
 ```
 
-`OK` means the request was delivered. `RETRY` means the proxy asked the client to
-retry, and `FAIL` means it returned an error without requesting another attempt.
-See [reading the logs](docs/OPERATIONS.md#reading-the-logs) for examples and the
-other outcomes.
+Each request logs a single line starting with `OK` (delivered), `RETRY` (client asked to retry), `WARN` (model fallback), `FAIL` (terminal error), or `DROP` (stream failed after headers were already sent). See [Reading the logs](docs/OPERATIONS.md#reading-the-logs).
 
-## Before you use it
+## Security and operational notes
 
-Keep the proxy on **loopback**. It has no authentication of its own; anyone who
-can reach its port can send requests through it. Compose publishes the port only
-on `127.0.0.1`.
-
-Full payload archives are **off by default**. Enabling them saves prompts and
-responses unencrypted, without automatic retention. See
-[data handling](docs/OPERATIONS.md#data-handling) before enabling them.
-
-Retries repeat upstream work. Server-side or remote tools with side effects need
-their own idempotency protection. Buffering does not undo work already performed
-by the provider; see [retry limits and side effects](docs/ARCHITECTURE.md#retry-limits-and-side-effects).
+- **Bind to loopback only:** The proxy has no authentication of its own; anyone who can reach its port can relay requests through your gateway. Compose binds `127.0.0.1:8789` by default.
+- **Payload archives are unencrypted:** `PROXY_REQUEST_LOG_DIR` is off by default. When enabled, it writes full prompts and responses to disk without encryption or automatic retention; see [Data handling](docs/OPERATIONS.md#data-handling).
+- **Retries repeat upstream work:** Buffering hides failed attempts from the client, but cannot undo side effects already executed by server-side or remote tools. Ensure remote tools are idempotent; see [Retry limits and side effects](docs/ARCHITECTURE.md#retry-limits-and-side-effects).
 
 ## Documentation
 
-| Guide | Use it to… |
+| Guide | Contents |
 | --- | --- |
-| [Architecture](docs/ARCHITECTURE.md) | Understand client compatibility, buffering, retries, fallback, and Workflow agents. |
-| [Configuration](docs/CONFIGURATION.md) | Tune timeouts, retry budgets, storage limits, and gateway hints. |
-| [Operations](docs/OPERATIONS.md) | Read logs, capture payloads, and run the proxy persistently. |
-| [Troubleshooting](docs/TROUBLESHOOTING.md) | Match an error or symptom to its cause and next step. |
-| [Development](docs/DEVELOPMENT.md) | Build, test, and find the relevant source code. |
-| [Releasing](docs/RELEASING.md) | Preview release archives locally and publish through the tag workflow. |
+| [Architecture](docs/ARCHITECTURE.md) | Buffering lifecycle, commit points, retry budgets, refusal fallback, and Workflow agents. |
+| [Configuration](docs/CONFIGURATION.md) | Environment variables, client timeout matching, and upstream gateway headers. |
+| [Operations](docs/OPERATIONS.md) | Compose workflow, log format, payload archiving, and `systemd` service setup. |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Symptom lookup, error classification rules, and timeout debugging. |
+| [Development](docs/DEVELOPMENT.md) | Building from source, running unit and live tests, and code layout. |
+| [Releasing](docs/RELEASING.md) | Local release packaging, tag publishing, and GHCR container images. |
 
 ## License
 

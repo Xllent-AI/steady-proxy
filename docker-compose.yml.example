@@ -1,7 +1,6 @@
 # Copy to docker-compose.yml, set PROXY_UPSTREAM_URL in .env,
-# then run `docker compose up -d --build`.
-# See README.md for API client setup, including Claude Code and Codex examples.
-# Settings and defaults: docs/CONFIGURATION.md.
+# and start with: docker compose up -d --build
+# Client setup: README.md | Configuration reference: docs/CONFIGURATION.md
 services:
   proxy:
     build:
@@ -12,24 +11,23 @@ services:
         BUILD_DATE: "${PROXY_BUILD_DATE:-}"
         DIRTY: "${PROXY_DIRTY:-unknown}"
     image: steady-proxy:latest
-    # Run as the host user so PROXY_REQUEST_LOG_DIR dumps are owned by you, not
-    # root (readable without sudo). Bash does not export UID and has no GID, so
-    # this falls back to 1000:1000 unless you set both in .env (or export them).
+    # Run as host user so ./logs archives are owned by you instead of root.
+    # Set UID and GID in .env if your user is not 1000:1000.
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       PROXY_LISTEN_ADDR: "0.0.0.0:8789"
       PROXY_UPSTREAM_URL: "${PROXY_UPSTREAM_URL:?set PROXY_UPSTREAM_URL in .env to your real gateway}"
-      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-100}" # Backstop for the Stainless retry counter; not the client retry budget.
+      PROXY_SDK_RETRY_CAP: "${PROXY_SDK_RETRY_CAP:-100}"
       PROXY_TRANSACTIONAL_LOCAL_RETRIES: "${PROXY_TRANSACTIONAL_LOCAL_RETRIES:-0}"
       PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS: "${PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS:-10000}"
       PROXY_KEEPALIVE_MS: "${PROXY_KEEPALIVE_MS:-600000}"
-      PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}" # Shorter window for Workflow content progress; see docs/ARCHITECTURE.md.
-      PROXY_RESPONSES_KEEPALIVE_MS: "${PROXY_RESPONSES_KEEPALIVE_MS:-30000}" # Silent-start window when early commit is enabled.
-      PROXY_RESPONSES_BUFFER_MS: "${PROXY_RESPONSES_BUFFER_MS:-600000}" # Full-buffer window when early commit is disabled.
-      PROXY_GEMINI_BUFFER_MS: "${PROXY_GEMINI_BUFFER_MS:-600000}" # Native Gemini SSE buffering window; 0 disables the timed live switch.
-      PROXY_RESPONSES_EARLY_COMMIT: "${PROXY_RESPONSES_EARLY_COMMIT:-1}" # 0 buffers Responses; client idle timeout must exceed the buffer window.
-      PROXY_RESPONSES_REPLAY_DELTA_BYTES: "${PROXY_RESPONSES_REPLAY_DELTA_BYTES:-65536}" # Combine compatible text deltas during replay; 0 keeps raw replay.
-      PROXY_RESP_HEADER_TIMEOUT_MS: "${PROXY_RESP_HEADER_TIMEOUT_MS:-660000}" # Overrides the binary default of 60000 ms for slow gateway headers.
+      PROXY_WORKFLOW_KEEPALIVE_MS: "${PROXY_WORKFLOW_KEEPALIVE_MS:-10000}"
+      PROXY_RESPONSES_KEEPALIVE_MS: "${PROXY_RESPONSES_KEEPALIVE_MS:-30000}"
+      PROXY_RESPONSES_BUFFER_MS: "${PROXY_RESPONSES_BUFFER_MS:-600000}"
+      PROXY_GEMINI_BUFFER_MS: "${PROXY_GEMINI_BUFFER_MS:-600000}"
+      PROXY_RESPONSES_EARLY_COMMIT: "${PROXY_RESPONSES_EARLY_COMMIT:-1}"
+      PROXY_RESPONSES_REPLAY_DELTA_BYTES: "${PROXY_RESPONSES_REPLAY_DELTA_BYTES:-65536}"
+      PROXY_RESP_HEADER_TIMEOUT_MS: "${PROXY_RESP_HEADER_TIMEOUT_MS:-660000}"
       PROXY_UPSTREAM_BYTE_IDLE_MS: "${PROXY_UPSTREAM_BYTE_IDLE_MS:-600000}"
       PROXY_VALIDATE_JSON: "${PROXY_VALIDATE_JSON:-1}"
       PROXY_NORMALIZE_TOOL_JSON: "${PROXY_NORMALIZE_TOOL_JSON:-1}"
