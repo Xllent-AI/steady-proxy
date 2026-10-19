@@ -1,29 +1,19 @@
-# Running and observing steady-proxy
+# Operations
 
-The [quick start](../README.md#quick-start) covers installation and client setup.
-This guide covers routine operation, request logs, and payload capture.
+See the [README quick start](../README.md#quick-start) for initial setup. This guide covers day-to-day operation, log inspection, payload archiving, and running `steady-proxy` as a `systemd` service.
 
 ## Docker Compose
 
-Run these commands from the repository directory after copying
-`docker-compose.yml.example` to your local `docker-compose.yml` during setup:
+After copying `.env.example` to `.env` and `docker-compose.yml.example` to `docker-compose.yml`:
 
 ```bash
-docker compose up -d --build
-docker compose logs -f proxy
+docker compose up -d --build   # build and start
+docker compose logs -f proxy   # tail request logs
+docker compose up -d           # reload .env changes
+docker compose down            # stop
 ```
 
-After changing `.env`, apply it with `docker compose up -d`. To stop the service,
-run `docker compose down`.
-
-Compose runs the container as `${UID:-1000}:${GID:-1000}` so archived files can be
-owned by your host user. If your IDs differ, run `id -u` and `id -g`, then add
-their numeric results as `UID` and `GID` in `.env`. Bash does not export its `UID`
-variable by default and has no built-in `GID` variable. Exported values take
-precedence over `.env`.
-
-The example mounts the host's `./logs` directory at `/logs` in the container. The container
-working directory is `/`, so `PROXY_REQUEST_LOG_DIR=./logs` uses that mount.
+The container runs as `${UID:-1000}:${GID:-1000}` so payload archives in `./logs` are owned by your host user. If your host UID/GID is not `1000`, check `id -u` and `id -g` and set `UID` and `GID` in `.env` (Bash does not export `UID` by default and has no `GID` variable). The host `./logs` directory is mounted at `/logs` with container working directory `/`, so `PROXY_REQUEST_LOG_DIR=./logs` writes directly to `./logs`.
 
 ## Check the running version
 
@@ -31,12 +21,7 @@ working directory is `/`, so `PROXY_REQUEST_LOG_DIR=./logs` uses that mount.
 curl -fsS http://127.0.0.1:8789/__version
 ```
 
-This returns build metadata without making a gateway request. It confirms that
-the proxy is reachable, not that gateway authentication or model routing works.
-
-To check the full Messages path, send a short prompt from Claude Code, or run the
-following after exporting `ANTHROPIC_AUTH_TOKEN` and replacing `<your-model>` with
-a model supported by your gateway. This makes a real, potentially billed request.
+`/__version` returns build metadata locally without contacting your gateway. To test the end-to-end gateway path with a real (billed) request:
 
 ```bash
 curl -sS http://127.0.0.1:8789/v1/messages \
@@ -48,9 +33,7 @@ curl -sS http://127.0.0.1:8789/v1/messages \
 
 ## Reading the logs
 
-Request outcome logs are always enabled. `PROXY_VERBOSE=1` adds internal retry
-decisions and archive diagnostics. Each line has a date and time prefix; these
-illustrative examples omit it:
+Every proxied request logs one summary line. Setting `PROXY_VERBOSE=1` adds internal `[local-retry]` and `[request-log]` lines.
 
 ```text
 OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.41s
@@ -61,110 +44,60 @@ WARN  claude-fable-5/main  refusal -> retry with claude-opus-5  in=258.8k out=2.
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 ```
 
-| Outcome | Meaning |
-| --- | --- |
-| `OK` | The proxy delivered the response. `buffered` or `live` tells you how. |
-| `RETRY` | It returned a retryable error with a delay for the client. This does not prove the client retried. |
-| `WARN` | It switched to the fallback model; the later outcome reports that attempt's result. |
-| `FAIL` | It returned an error without requesting another attempt, usually because of an invalid request or the retry backstop. |
-| `DROP` | The response had already started when delivery failed. The client must handle the incomplete stream. |
+### Outcomes
 
-The fields after the outcome explain the request:
+| Tag | Meaning |
+| --- | --- |
+| `OK` | Response delivered (`buffered` or `live`). |
+| `RETRY` | Recoverable pre-commit failure; returned HTTP `503` with `Retry-After` so the client retries. |
+| `WARN` | Pre-commit Anthropic refusal or safeguard error triggered model fallback; a subsequent line logs the fallback outcome. |
+| `FAIL` | Non-retryable error (invalid request shape or exhausted retry cap) returned to the client. |
+| `DROP` | Stream or body transfer failed *after* `200 OK` headers were already sent; the client must handle recovery. |
+
+### Log fields
 
 | Field | Meaning |
 | --- | --- |
-| `model/main`, `model/sub`, `model/wf` | Requested model and detected caller kind. `requested->resolved` shows a different model reported by the upstream. |
-| `high` or another effort value | Requested Messages `output_config.effort`, Responses `reasoning.effort`, or Gemini `generationConfig.thinkingConfig.thinkingLevel` (lowercased). |
-| `in=… out=… tok` | Input and output token counts. Input includes cache reads and creation. |
-| `end_turn`, `completed`, etc. | The reported stop reason. |
-| `truncated_stream`, `sse_overloaded`, etc. | The classified failure code; use it to identify the actual cause. |
-| `502->503` | Original or classified failure status followed by the status sent to the client. A single value means no status change. |
-| `retry-after=2s` | Delay requested from the client. |
-| `attempt=N` | Client retry count from `X-Stainless-Retry-Count`, shown when positive. |
-| `proxy-retries=N` | Extra retries made inside the proxy under the configured local budget. |
-| `prun=N` | Longest sequence of consecutive upstream ping events; a large value can indicate a gap in useful content. |
-| `id=<hex>` | Correlation ID, present when payload archiving is enabled. |
+| `model/main`, `model/sub`, `model/wf` | Requested model and caller type (`requested->resolved` if the upstream reports a different model ID). Gemini model names come from the URL path. |
+| `high`, `medium`, etc. | Explicit effort level from Messages `output_config.effort`, Responses `reasoning.effort`, or Gemini `generationConfig.thinkingConfig.thinkingLevel` (`minimal`/`low`/`medium`/`high` in camelCase or `snake_case`, lowercased; never inferred from `thinkingBudget` or model defaults). |
+| `in=… out=… tok` | Input (including cache read/creation) and output token counts. |
+| `end_turn`, `completed`, etc. | Upstream stop/finish reason. |
+| `truncated_stream`, `sse_overloaded`, etc. | Classified failure code before status normalization. |
+| `502->503` | Upstream/classified HTTP status `->` status sent to the client. |
+| `retry-after=2s` | Backoff sent to the client in `Retry-After`. |
+| `attempt=N` | Client retry index from `X-Stainless-Retry-Count` (omitted when 0). |
+| `proxy-retries=N` | Extra pre-commit attempts made inside the proxy (`PROXY_TRANSACTIONAL_LOCAL_RETRIES`). |
+| `prun=N` | Longest run of consecutive upstream SSE pings (high values indicate a content-silent gap). |
+| `id=<hex>` | Archive correlation ID when `PROXY_REQUEST_LOG_DIR` is enabled. |
 
-Caller labels use Claude Code headers and the Workflow system-prompt marker.
-Requests without those signals appear as `main`, including requests from other
-applications; the label does not identify or restrict the client software.
+Caller suffixes (`/main`, `/sub`, `/wf`) are derived from Claude Code headers and the Workflow system-prompt marker; other clients appear as `/main`.
 
-Gemini thinking-level logging also accepts ProtoJSON snake_case field names.
-Only an explicit named level is reported; the proxy does not infer one from
-`thinkingBudget` or a model's default. The original request is forwarded unchanged.
-Gemini model labels and archived attempt models come from the model URL, not a
-body-level `model` field.
-
-Verbose `[local-retry]` lines include the cause, wait, and retry index.
-`skip=not-enough-time` explains why another attempt could not fit the time budget.
-The response headers also expose `X-Steady-Proxy-Mode` on streaming delivery and
-`X-Steady-Proxy-Reason` on synthesized errors.
+With `PROXY_VERBOSE=1`, `[local-retry]` lines log each internal retry cause, wait duration, and skips (such as `skip=not-enough-time`). Responses also carry `X-Steady-Proxy-Mode` on streamed deliveries and `X-Steady-Proxy-Reason` on synthesized error responses.
 
 ## Saving request and response data
 
-Enable payload capture only when you need the exact requests and upstream replies:
+To capture full request and response payloads for debugging, set:
 
 ```dotenv
 PROXY_REQUEST_LOG_DIR=./logs
 ```
 
-For Compose, add this to `.env` and run `docker compose up -d`. For the binary,
-set it in the launch environment. The proxy attempts to write one JSON archive per
-proxied client request, including non-streaming routes. Hidden retries and model
-fallback appear as separate entries in the same archive's `attempts` array.
+The proxy writes one JSON archive per client request (e.g., `v1-messages-20260621t143005-a1b2c3d4.json`, matching `id=a1b2c3d4` in the access log). Local retries and model fallback attempts are recorded inside the same file's `attempts` array.
 
-An archive filename looks like `v1-messages-20260621t143005-a1b2c3d4.json`. Its
-suffix matches both the log's `id=a1b2c3d4` and the archive's top-level `id`. To
-locate it, use `ls logs/*a1b2c3d4*.json` with the ID from your log.
+Archives use schema `steady-proxy.payload.v2` and include the client request envelope, redacted upstream URL, build metadata, per-attempt headers/bodies, retry delays, stream stats, and final outcome. Payloads are stored lossless in `data_base64` with `encoding`, `size`, and `sha256` metadata (unchanged retry bodies reference `request_body_ref`). Interrupted reads record `capture_error`.
 
-Archives use schema `steady-proxy.payload.v2`. They contain the original client
-request envelope, redacted upstream URL, proxy build metadata, upstream attempts,
-response or transport failures, retry waits, stream statistics, model changes,
-and final outcome. Bodies use base64 in `data_base64`, with `encoding`, byte
-`size`, and `sha256` metadata. Repeated request bodies may be referenced through
-`request_body_ref` instead of duplicated.
-
-Captured bytes can be restored exactly, including binary and image payloads.
-A failed or interrupted read may only capture part of a response; a
-`capture_error` field records a read interruption when available. Error-body
-capture obeys the upstream idle and request deadlines.
-
-Archiving is best effort. It does not fail the proxied request if the directory
-cannot be created or an archive cannot be written. Enable `PROXY_VERBOSE=1` to
-see `[request-log]` errors when an expected archive is missing.
+Archiving is best-effort and never fails a proxied call; set `PROXY_VERBOSE=1` to see `[request-log]` write errors.
 
 ### Data handling
 
-The proxy has no authentication of its own. Keep its listening port on loopback;
-Compose's published port already is. Anyone with access to the port can relay
-requests with credentials they supply and read `/__version`.
-
-Client authorization and provider-specific headers, including `x-goog-api-key`,
-are forwarded to `PROXY_UPSTREAM_URL`, along with query authentication such as `key`.
-The proxy does not follow redirects. Its HTTP transport honors
-`HTTP_PROXY`/`HTTPS_PROXY` and `NO_PROXY` in the proxy process environment, so a
-configured forward proxy is also part of the connection path.
-
-Request bodies are held in memory. Buffered responses spill beyond the configured
-memory threshold to temporary files in `PROXY_SPOOL_DIR`; those files are unlinked
-and closed when released. Use a tmpfs-backed spool directory if payloads must stay
-off persistent disk.
-
-Payload archives are different: they are persistent and **unencrypted**. Known
-credential headers and query parameters are redacted, including `Authorization`,
-`x-api-key`, `x-goog-api-key`, `Proxy-Authorization`, `key`, `api_key`, `api_token`,
-`access_token`, and `client_secret`. Redacted names are listed in `redactions`. Other headers and
-parameters remain, and **bodies are not inspected or redacted**. Base64 is an
-encoding, not encryption.
-
-There is no archive rotation, size cap, or retention policy. Turn capture off
-after reproducing a problem, or manage retention yourself. Keep archives in a
-directory you control and out of version control; `/logs/` is already ignored.
+- **Network exposure:** The proxy has no authentication. Keep `PROXY_LISTEN_ADDR` bound to loopback (`127.0.0.1`).
+- **Forwarded credentials & proxies:** Client auth headers (`Authorization`, `x-api-key`, `x-goog-api-key`, etc.) and query parameters (`key`) are forwarded to `PROXY_UPSTREAM_URL`. Upstream redirects are not followed. Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables are honored.
+- **Spool files:** Request bodies stay in memory; buffered responses over `PROXY_MAX_BUFFER_MEM_BYTES` spill to temporary files in `PROXY_SPOOL_DIR` and are unlinked immediately after the attempt. Point `PROXY_SPOOL_DIR` at `tmpfs` if spill files must not touch disk.
+- **Archive sensitivity & retention:** Archives are **unencrypted**. Known credential headers and query params (`Authorization`, `x-api-key`, `x-goog-api-key`, `Proxy-Authorization`, `key`, `api_key`, `api_token`, `access_token`, `client_secret`) are redacted and listed under `redactions`, but **request and response bodies are stored raw** (base64-encoded). There is no automatic rotation or retention—disable `PROXY_REQUEST_LOG_DIR` once debugging is complete.
 
 ## Run as a user service
 
-For a native installation, place a built binary at the path used below, then
-create `~/.config/systemd/user/steady-proxy.service`:
+For a native Linux install, copy the `steady-proxy` binary to `/opt/steady-proxy/steady-proxy` and create `~/.config/systemd/user/steady-proxy.service`:
 
 ```ini
 [Unit]
@@ -183,8 +116,7 @@ RestartSec=2
 WantedBy=default.target
 ```
 
-Replace the binary path and gateway URL for your installation, and configure the
-client as shown in the README. Enable the service and read its logs with:
+Enable and follow the service logs:
 
 ```bash
 systemctl --user daemon-reload
@@ -192,6 +124,4 @@ systemctl --user enable --now steady-proxy
 journalctl --user -u steady-proxy -f
 ```
 
-To keep a user service running after logout, the account needs systemd lingering
-enabled: `loginctl enable-linger "$USER"`. This may require administrator
-authorization on your host.
+To keep the service running when logged out, enable lingering: `loginctl enable-linger "$USER"`.
