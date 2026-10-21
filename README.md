@@ -56,7 +56,7 @@ curl -fsS http://127.0.0.1:8789/__version
 
 ### Prebuilt container image
 
-Linux `amd64` images are published to GitHub Container Registry:
+Linux `amd64` and `arm64` images are published to GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/xllent-ai/steady-proxy:latest

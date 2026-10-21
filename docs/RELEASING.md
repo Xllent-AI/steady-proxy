@@ -46,7 +46,7 @@ All steps use GitHub's built-in `GITHUB_TOKEN`; no external secrets are required
 
 ## Container images
 
-The [container workflow](../.github/workflows/docker-publish.yml) publishes Linux `amd64` images to `ghcr.io/xllent-ai/steady-proxy`:
+The [container workflow](../.github/workflows/docker-publish.yml) publishes multi-arch Linux `amd64` and `arm64` images to `ghcr.io/xllent-ai/steady-proxy`:
 
 - **Push to `main`:** Publishes `latest` and `sha-<full-commit-sha>`.
 - **Release published:** Publishes `<release-tag>` (e.g., `v0.1.1`) and `sha-<full-commit-sha>`. Release builds never overwrite `latest`.
