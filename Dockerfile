@@ -1,7 +1,11 @@
-# Build both the proxy and the test mock as static binaries.
-FROM golang:1.26 AS build
+# Build both the proxy and the test mock as static binaries. The build stage
+# runs natively on the builder and cross-compiles for the target platform, so
+# multi-arch builds need no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 COPY . .
+ARG TARGETOS
+ARG TARGETARCH
 ARG VERSION
 ARG COMMIT
 ARG BUILD_DATE
@@ -25,8 +29,9 @@ RUN set -eu; \
     d="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
     dirty_flag="${DIRTY:-unknown}"; \
     ldflags="-s -w -X main.version=$v -X main.commit=$c -X main.buildDate=$d -X main.dirty=$dirty_flag"; \
-    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$ldflags" -o /out/steady-proxy .; \
-    CGO_ENABLED=0 go build -trimpath -buildvcs=false -o /out/testupstream ./testupstream
+    export CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH"; \
+    go build -trimpath -buildvcs=false -ldflags "$ldflags" -o /out/steady-proxy .; \
+    go build -trimpath -buildvcs=false -o /out/testupstream ./testupstream
 
 # Minimal runtime; distroless/static ships CA certs (needed for upstream TLS).
 FROM gcr.io/distroless/static-debian12
