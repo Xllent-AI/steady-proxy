@@ -533,6 +533,9 @@ func mkResp(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
 }
 
+// The Messages route follows the Stainless SDK retry rule: 408/409/429/5xx are
+// retried; every other 4xx is the upstream's final answer unless its body
+// explicitly names a transient fault. (Real bodies: TestClassifyRealMessages.)
 func TestClassifyHTTP(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -543,8 +546,11 @@ func TestClassifyHTTP(t *testing.T) {
 		{"529", mkResp(529, `{"error":{"type":"overloaded_error"}}`), true},
 		{"429", mkResp(429, `{"error":{"type":"rate_limit_error"}}`), true},
 		{"400-invalid", mkResp(400, `{"error":{"type":"invalid_request_error","message":"messages.0: tool_use ids must..."}}`), false},
-		{"400-gateway", mkResp(400, `{"error":{"type":"api_error","message":"upstream gateway timeout"}}`), true},
-		{"401", mkResp(401, `{"error":{"type":"authentication_error","message":"invalid api key"}}`), true}, // auth now rides out (may be a temporary block)
+		{"400-generic-api-error", mkResp(400, `{"error":{"type":"api_error","message":"upstream gateway timeout"}}`), false},
+		{"400-names-overload", mkResp(400, `{"error":{"type":"overloaded_error","message":"gateway overloaded"}}`), true},
+		{"401", mkResp(401, `{"error":{"type":"authentication_error","message":"invalid api key"}}`), false},
+		{"403", mkResp(403, `{"error":{"type":"permission_error","message":"organization disabled"}}`), false},
+		{"404-html", mkResp(404, `<html>not found</html>`), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -801,5 +807,611 @@ func TestPingRunTripwire(t *testing.T) {
 	}
 	if st.maxPingRun != 3 {
 		t.Fatalf("maxPingRun=%d, want 3 (longest consecutive ping run)", st.maxPingRun)
+	}
+}
+
+// ---------------------------------------------------------------- helpers ----
+
+const (
+	pingFrame        = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+	messageStopFrame = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+)
+
+func contentBlockStopFrame(index int) string {
+	return sseJSON("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+}
+
+func messageDeltaFrame(stopReason string) string {
+	return sseJSON("message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": stopReason},
+		"usage": map[string]any{"output_tokens": 7},
+	})
+}
+
+// truncatedToolChunks is a tool input the token cap cut off inside a string.
+var truncatedToolChunks = []string{`{"session_id":`, `"s_1","prompt":"cut o`}
+
+// toolHead is a tool block of blockType up to and including its input deltas.
+func toolHead(blockType string, chunks []string) string {
+	var b strings.Builder
+	writeInputJSONPrelude(&b, blockType, "toolu_1", "Tool")
+	for _, c := range chunks {
+		writeInputJSONDelta(&b, c)
+	}
+	return b.String()
+}
+
+// toolStreamThenTail is a tool block carrying chunks, closed, then tail frames.
+func toolStreamThenTail(blockType string, chunks []string, tail ...string) string {
+	return toolHead(blockType, chunks) + contentBlockStopFrame(0) + strings.Join(tail, "")
+}
+
+func textHead() string {
+	return sseJSON("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_1"}}) +
+		sseJSON("content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}) +
+		sseJSON("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Hi"}})
+}
+
+func eventNames(body string) []string {
+	var parser sseParser
+	var names []string
+	for _, ev := range parser.feed([]byte(body)) {
+		names = append(names, ev.name)
+	}
+	return names
+}
+
+func captureWithStats(t *testing.T, s string) (*httptest.ResponseRecorder, captureStats, *failure) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	var st captureStats
+	_, f := captureSSE(ctx, cancel, rec, http.Header{}, strings.NewReader(s), &st)
+	return rec, st, f
+}
+
+// liveCapture streams parts through a 20ms transactional window with a 100ms gap
+// between parts, so the proxy commits live before the later parts arrive.
+func liveCapture(t *testing.T, parts []string) (*httptest.ResponseRecorder, bool, *failure) {
+	t.Helper()
+	useDefaultConfig(t)
+	cfg.upstreamByteIdle = 2 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r := &gapReader{ctx: ctx, chunks: parts, gap: 100 * time.Millisecond}
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, false, false)
+	return rec, wrote, f
+}
+
+// hangReader yields its chunks like gapReader, then stays open (no EOF) until
+// the context ends: an upstream that sent everything but keeps the connection.
+type hangReader struct{ gapReader }
+
+func (h *hangReader) Read(p []byte) (int, error) {
+	if h.i >= len(h.chunks) {
+		<-h.ctx.Done()
+		return 0, h.ctx.Err()
+	}
+	return h.gapReader.Read(p)
+}
+
+type liveStep struct {
+	out  [][]byte
+	done bool
+	fail *failure
+}
+
+// feedLive drives a wire's live() with every event of stream, as process does.
+func feedLive(w *anthropicWire, stream string) []liveStep {
+	var parser sseParser
+	var steps []liveStep
+	for _, ev := range parser.feed([]byte(stream)) {
+		out, done, fail := w.live(ev, ev.raw, nil)
+		steps = append(steps, liveStep{out, done, fail})
+	}
+	return steps
+}
+
+// --------------------------------------------- max_tokens-truncated tool input ----
+
+// A max_tokens stop cuts the tool input mid-JSON. Retrying regenerates the same
+// truncation and bills it again, so the stream is the upstream's final answer.
+func TestMaxTokensTruncatedToolInputIsDelivered(t *testing.T) {
+	joined := strings.Join(truncatedToolChunks, "")
+	const head = "message_start content_block_start content_block_delta content_block_stop"
+	for _, blockType := range []string{"tool_use", "server_tool_use"} {
+		for _, tc := range []struct {
+			name      string
+			tail      []string
+			wantNames string
+		}{
+			{"direct", []string{messageDeltaFrame("max_tokens"), messageStopFrame}, head + " message_delta message_stop"},
+			{"ping between", []string{pingFrame, "event: ping\n\n", messageDeltaFrame("max_tokens"), messageStopFrame}, head + " ping ping message_delta message_stop"},
+		} {
+			t.Run(blockType+"/"+tc.name, func(t *testing.T) {
+				useDefaultConfig(t)
+				rec, f := capture(t, toolStreamThenTail(blockType, truncatedToolChunks, tc.tail...))
+				if f != nil {
+					t.Fatalf("max_tokens-truncated tool input must be delivered, got %+v", *f)
+				}
+				body := rec.Body.String()
+				if deltas := inputJSONDeltas(t, body); len(deltas) != 1 || deltas[0] != joined {
+					t.Fatalf("want one coalesced partial delta %q, got %#v", joined, deltas)
+				}
+				if got := strings.Join(eventNames(body), " "); got != tc.wantNames {
+					t.Fatalf("event order:\n got: %s\nwant: %s", got, tc.wantNames)
+				}
+				if !strings.Contains(body, `"stop_reason":"max_tokens"`) {
+					t.Fatalf("message_delta must reach the client unchanged: %s", body)
+				}
+			})
+		}
+	}
+}
+
+func TestMaxTokensTruncatedToolInputKeepsRawFragmentsWhenNormalizationOff(t *testing.T) {
+	useDefaultConfig(t)
+	cfg.normalizeToolJSON = false
+	rec, f := capture(t, toolStreamThenTail("tool_use", truncatedToolChunks, messageDeltaFrame("max_tokens"), messageStopFrame))
+	if f != nil {
+		t.Fatalf("max_tokens-truncated tool input must be delivered, got %+v", *f)
+	}
+	deltas := inputJSONDeltas(t, rec.Body.String())
+	if len(deltas) != len(truncatedToolChunks) {
+		t.Fatalf("want the raw fragments, got %#v", deltas)
+	}
+	for i, want := range truncatedToolChunks {
+		if deltas[i] != want {
+			t.Fatalf("fragment %d = %q, want %q", i, deltas[i], want)
+		}
+	}
+}
+
+// Only a max_tokens stop excuses invalid tool input, and only when it is the very
+// next thing after the block closes.
+func TestInvalidToolInputRejectedUnlessMaxTokens(t *testing.T) {
+	textBlockStart := sseJSON("content_block_start", map[string]any{
+		"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "text", "text": ""},
+	})
+	for _, tc := range []struct {
+		name string
+		tail []string
+	}{
+		{"tool_use stop", []string{messageDeltaFrame("tool_use"), messageStopFrame}},
+		{"end_turn stop", []string{messageDeltaFrame("end_turn"), messageStopFrame}},
+		{"stop_sequence stop", []string{messageDeltaFrame("stop_sequence"), messageStopFrame}},
+		{"empty stop_reason", []string{messageDeltaFrame(""), messageStopFrame}},
+		{"no stop_reason", []string{"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":7}}\n\n", messageStopFrame}},
+		{"no message_delta", []string{messageStopFrame}},
+		{"content follows the invalid block", []string{textBlockStart, contentBlockStopFrame(1), messageDeltaFrame("max_tokens"), messageStopFrame}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useDefaultConfig(t)
+			rec, f := capture(t, toolStreamThenTail("tool_use", truncatedToolChunks, tc.tail...))
+			if f == nil || !f.transient || f.code != "malformed_sse" {
+				t.Fatalf("want transient malformed_sse for invalid tool input, got %+v", f)
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("a rejected attempt must not leak output: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMaxTokensTruncatedToolInputAcrossLiveHandoff(t *testing.T) {
+	joined := strings.Join(truncatedToolChunks, "")
+	head := toolHead("tool_use", truncatedToolChunks)
+	stop := contentBlockStopFrame(0)
+	tail := messageDeltaFrame("max_tokens") + messageStopFrame
+	const base = "message_start content_block_start content_block_delta content_block_stop"
+	for _, tc := range []struct {
+		name      string
+		parts     []string
+		wantNames string
+	}{
+		{"commit before the block closes", []string{head, stop, tail}, base + " message_delta message_stop"},
+		{"commit after the block closes", []string{head + stop, tail}, base + " message_delta message_stop"},
+		{"ping while held", []string{head, stop, pingFrame, tail}, base + " ping message_delta message_stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, wrote, f := liveCapture(t, tc.parts)
+			if f != nil || !wrote {
+				t.Fatalf("want live success, wrote=%v failure=%+v", wrote, f)
+			}
+			if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
+				t.Fatalf("want live mode, got %q", mode)
+			}
+			body := rec.Body.String()
+			if deltas := inputJSONDeltas(t, body); len(deltas) != 1 || deltas[0] != joined {
+				t.Fatalf("want one coalesced partial delta %q, got %#v", joined, deltas)
+			}
+			if got := strings.Join(eventNames(body), " "); got != tc.wantNames {
+				t.Fatalf("event order:\n got: %s\nwant: %s", got, tc.wantNames)
+			}
+		})
+	}
+}
+
+// A live stream cannot be retried, but invalid tool input that max_tokens does not
+// explain is still malformed: nothing from the held block may reach the client.
+func TestInvalidToolInputOnLiveStreamIsMalformedUnlessMaxTokens(t *testing.T) {
+	head := toolHead("tool_use", truncatedToolChunks)
+	stop := contentBlockStopFrame(0)
+	for _, tc := range []struct {
+		name string
+		next string
+	}{
+		{"end_turn", messageDeltaFrame("end_turn") + messageStopFrame},
+		{"message_stop without message_delta", messageStopFrame},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, wrote, f := liveCapture(t, []string{head, stop, tc.next})
+			if !wrote || f == nil || !f.transient || f.code != "malformed_sse" || f.delivered {
+				t.Fatalf("want committed malformed_sse abort, wrote=%v failure=%+v", wrote, f)
+			}
+			body := rec.Body.String()
+			for _, leaked := range []string{"input_json_delta", "content_block_stop", "message_delta", "message_stop"} {
+				if strings.Contains(body, leaked) {
+					t.Fatalf("held frames leaked %q: %s", leaked, body)
+				}
+			}
+		})
+	}
+}
+
+func TestAnthropicWireLiveHoldsInvalidToolBlock(t *testing.T) {
+	useDefaultConfig(t)
+	stream := toolStreamThenTail("tool_use", truncatedToolChunks, pingFrame, messageDeltaFrame("max_tokens"), messageStopFrame)
+	steps := feedLive(newAnthropicWire(false), stream)
+	// message_start, content_block_start, delta, delta, content_block_stop, ping, message_delta, message_stop
+	if len(steps) != 8 {
+		t.Fatalf("want 8 events, got %d", len(steps))
+	}
+	for i, s := range steps {
+		if s.fail != nil {
+			t.Fatalf("event %d: unexpected failure %+v", i, *s.fail)
+		}
+	}
+	for _, i := range []int{2, 3, 4, 5} {
+		if steps[i].out != nil {
+			t.Fatalf("event %d must be withheld, got %d frames", i, len(steps[i].out))
+		}
+	}
+	released := steps[6].out
+	if len(released) != 4 {
+		t.Fatalf("message_delta must release delta+stop+ping+itself, got %d frames", len(released))
+	}
+	if deltas := inputJSONDeltas(t, string(released[0])); len(deltas) != 1 || deltas[0] != strings.Join(truncatedToolChunks, "") {
+		t.Fatalf("released delta = %#v", deltas)
+	}
+	if !steps[7].done {
+		t.Fatalf("message_stop must end the stream")
+	}
+}
+
+// --------------------------------------------------------------- empty ping ----
+
+// The Anthropic SDK skips a ping without parsing its data, so a bare `event: ping`
+// is a valid keepalive; every other named event still needs JSON data.
+func TestCaptureAcceptsPingWithoutData(t *testing.T) {
+	for _, ping := range []string{"event: ping\n\n", "event: ping\ndata:\n\n"} {
+		t.Run(strings.ReplaceAll(ping, "\n", "|"), func(t *testing.T) {
+			useDefaultConfig(t)
+			s := strings.Replace(goodStream, "event: content_block_start", ping+"event: content_block_start", 1)
+			rec, f := capture(t, s)
+			if f != nil {
+				t.Fatalf("empty-data ping must be accepted, got %+v", *f)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, ping) || !strings.Contains(body, "message_stop") {
+				t.Fatalf("ping must be replayed as sent: %q", body)
+			}
+		})
+	}
+}
+
+func TestCaptureRejectsOtherNamedEventsWithoutData(t *testing.T) {
+	for _, name := range []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop", "error", "pong"} {
+		t.Run(name, func(t *testing.T) {
+			useDefaultConfig(t)
+			rec, f := capture(t, "event: "+name+"\n\n"+goodStream)
+			if f == nil || !f.transient || f.code != "malformed_sse" {
+				t.Fatalf("want transient malformed_sse, got %+v", f)
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("malformed stream should fail before commit, body=%q", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAnthropicWireLiveAcceptsPingWithoutData(t *testing.T) {
+	useDefaultConfig(t)
+	steps := feedLive(newAnthropicWire(false), "event: ping\n\n")
+	if len(steps) != 1 || steps[0].fail != nil || len(steps[0].out) != 1 || string(steps[0].out[0]) != "event: ping\n\n" {
+		t.Fatalf("live empty-data ping must pass through, got %+v", steps)
+	}
+}
+
+// ------------------------------------------------------------- usage backfill ----
+
+func usageMergeStream(startUsage, deltaUsage string) string {
+	return "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\",\"usage\":" + startUsage + "}}\n\n" +
+		usageMergeTail(deltaUsage)
+}
+
+// usageMergeTail is everything after message_start, ending in a message_delta
+// that carries deltaUsage.
+func usageMergeTail(deltaUsage string) string {
+	return "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":" + deltaUsage + "}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+// message_delta usage merges into message_start per field: a delta value wins only
+// when present and > 0. A delta that omits or zeroes a field must never erase the
+// real count message_start reported (it used to zero cache_read_input_tokens).
+func TestUsageBackfillMergesPerField(t *testing.T) {
+	for _, tc := range []struct {
+		name, start, delta string
+		want               testUsage
+		total              int
+		backfilled         bool
+		deltaKeepsInput    bool
+	}{
+		{
+			name:  "delta omits cache fields",
+			start: `{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":5000,"output_tokens":1}`,
+			delta: `{"input_tokens":7,"output_tokens":20}`,
+			want:  testUsage{Input: 7, CacheRead: 5000}, total: 5007, backfilled: true,
+		},
+		{
+			name:  "delta zeroes cache fields",
+			start: `{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":5000,"output_tokens":1}`,
+			delta: `{"input_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":20}`,
+			want:  testUsage{Input: 7, CacheRead: 5000}, total: 5007, backfilled: true,
+		},
+		{
+			name:  "delta carries only cache_read",
+			start: `{"input_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":1}`,
+			delta: `{"cache_read_input_tokens":40,"output_tokens":2}`,
+			want:  testUsage{Input: 3, CacheCreation: 100, CacheRead: 40}, total: 143, backfilled: true,
+		},
+		{
+			name:  "positive delta fields override",
+			start: `{"input_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":5000,"output_tokens":1}`,
+			delta: `{"input_tokens":7,"cache_creation_input_tokens":200,"cache_read_input_tokens":6000,"output_tokens":2}`,
+			want:  testUsage{Input: 7, CacheCreation: 200, CacheRead: 6000}, total: 6207, backfilled: true,
+		},
+		{
+			// Merged values equal message_start's: nothing to backfill, so neither
+			// frame is rewritten.
+			name:  "delta repeats input and zeroes the rest",
+			start: `{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":1}`,
+			delta: `{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":9}`,
+			want:  testUsage{Input: 10, CacheRead: 500}, total: 510, deltaKeepsInput: true,
+		},
+		{
+			name:  "delta without input usage",
+			start: `{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":1}`,
+			delta: `{"output_tokens":9}`,
+			want:  testUsage{Input: 10, CacheRead: 500}, total: 510,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useDefaultConfig(t)
+			rec, st, f := captureWithStats(t, usageMergeStream(tc.start, tc.delta))
+			if f != nil {
+				t.Fatalf("unexpected failure %+v", *f)
+			}
+			body := rec.Body.String()
+			if got := messageStartUsage(t, body); got != tc.want {
+				t.Errorf("replayed message_start usage = %+v, want %+v", got, tc.want)
+			}
+			if st.inTok != tc.total || st.inputTok != tc.want.Input || st.cacheCreationTok != tc.want.CacheCreation || st.cacheReadTok != tc.want.CacheRead {
+				t.Errorf("logged usage total=%d in/create/read=%d/%d/%d, want total=%d %+v",
+					st.inTok, st.inputTok, st.cacheCreationTok, st.cacheReadTok, tc.total, tc.want)
+			}
+			deltaUsage := messageDeltaUsage(t, body)
+			if tc.backfilled {
+				assertNoInputUsage(t, deltaUsage)
+			} else {
+				if _, has := deltaUsage["input_tokens"]; has != tc.deltaKeepsInput {
+					t.Errorf("message_delta usage = %#v, want input_tokens present=%v", deltaUsage, tc.deltaKeepsInput)
+				}
+				if !strings.Contains(body, `"usage":`+tc.start) {
+					t.Errorf("message_start must be replayed untouched when nothing differs: %s", body)
+				}
+			}
+		})
+	}
+}
+
+// The input fields leave message_delta only once message_start actually received
+// them; a message_start that cannot be patched must not lose the numbers.
+func TestUsageStrippedFromDeltaOnlyWhenBackfilled(t *testing.T) {
+	useDefaultConfig(t)
+	// message_start without a message object cannot take the backfill.
+	s := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" + usageMergeTail(`{"input_tokens":99,"output_tokens":3}`)
+	rec, st, f := captureWithStats(t, s)
+	if f != nil {
+		t.Fatalf("unexpected failure %+v", *f)
+	}
+	if st.inTok != 99 {
+		t.Errorf("inTok = %d, want 99", st.inTok)
+	}
+	if got := messageDeltaUsage(t, rec.Body.String()); got["input_tokens"] != float64(99) {
+		t.Errorf("message_delta lost its input usage although message_start was not patched: %#v", got)
+	}
+}
+
+// ------------------------------------------------------------- HTML escaping ----
+
+// Frames the proxy re-encodes must keep <, > and & literal; encoding/json would
+// otherwise rewrite them as \u003c, \u003e and \u0026.
+func TestToolInputCoalescingKeepsHTMLCharacters(t *testing.T) {
+	useDefaultConfig(t)
+	input := `{"cmd":"if a<b && c>d; then echo <a&b>; fi"}`
+	rec, f := capture(t, toolUseStream(splitEvery(input, 6)))
+	if f != nil {
+		t.Fatalf("unexpected failure %+v", *f)
+	}
+	body := rec.Body.String()
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(body, escaped) {
+			t.Fatalf("coalesced delta HTML-escaped %s: %s", escaped, body)
+		}
+	}
+	if !strings.Contains(body, `<a&b>`) {
+		t.Fatalf("coalesced delta lost literal <a&b>: %s", body)
+	}
+	if deltas := inputJSONDeltas(t, body); len(deltas) != 1 || deltas[0] != input {
+		t.Fatalf("coalesced input = %#v, want %q", deltas, input)
+	}
+}
+
+func TestUsageReencodingKeepsHTMLCharacters(t *testing.T) {
+	useDefaultConfig(t)
+	s := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_<1>&\",\"model\":\"m<&>\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":\"</end>\"},\"usage\":{\"input_tokens\":99,\"output_tokens\":3}}\n\n" +
+		messageStopFrame
+	rec, _, f := captureWithStats(t, s)
+	if f != nil {
+		t.Fatalf("unexpected failure %+v", *f)
+	}
+	body := rec.Body.String()
+	if got := messageStartUsage(t, body).Input; got != 99 {
+		t.Fatalf("test setup: message_start must have been backfilled, input=%d", got)
+	}
+	for _, want := range []string{`"id":"msg_<1>&"`, `"model":"m<&>"`, `"stop_sequence":"</end>"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("re-encoded frame lost literal %s:\n%s", want, body)
+		}
+	}
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(body, escaped) {
+			t.Errorf("re-encoded frame HTML-escaped %s:\n%s", escaped, body)
+		}
+	}
+}
+
+// ---------------------------------------------------------------- live path ----
+
+// Once message_stop is forwarded the stream is complete, even if the validator
+// flagged an ordering fault earlier; otherwise terminal() is never true.
+func TestAnthropicWireLiveDoneAtMessageStopAfterOrderFault(t *testing.T) {
+	useDefaultConfig(t)
+	w := newAnthropicWire(false)
+	steps := feedLive(w, textHead()+contentBlockStopFrame(0)+contentBlockStopFrame(0)+messageDeltaFrame("end_turn")+messageStopFrame)
+	if !w.val.invalid {
+		t.Fatalf("test setup: the duplicate content_block_stop must flag the validator")
+	}
+	for i, s := range steps {
+		if s.fail != nil {
+			t.Fatalf("event %d: live must not fail on an order fault, got %+v", i, *s.fail)
+		}
+		if want := i == len(steps)-1; s.done != want {
+			t.Fatalf("event %d: done=%v, want %v", i, s.done, want)
+		}
+	}
+}
+
+// A message_stop arriving while a tool block's input is still withheld (the
+// block never closed) must not end the stream cleanly: the client would get a
+// tool call without its arguments.
+func TestAnthropicWireLiveMessageStopWithWithheldToolInputFails(t *testing.T) {
+	useDefaultConfig(t)
+	w := newAnthropicWire(false)
+	steps := feedLive(w, toolHead("tool_use", []string{`{"path":`, `"/tmp/x"}`})+messageDeltaFrame("tool_use")+messageStopFrame)
+	last := steps[len(steps)-1]
+	if last.fail == nil || last.done || len(last.out) != 0 {
+		t.Fatalf("message_stop with withheld tool input must fail without forwarding, got done=%v out=%d fail=%+v", last.done, len(last.out), last.fail)
+	}
+}
+
+func TestLiveStreamEndsPromptlyAfterMessageStop(t *testing.T) {
+	useDefaultConfig(t)
+	cfg.upstreamByteIdle = 400 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	tail := contentBlockStopFrame(0) + contentBlockStopFrame(0) + messageDeltaFrame("end_turn") + messageStopFrame
+	r := &hangReader{gapReader{ctx: ctx, chunks: []string{textHead(), tail}, gap: 100 * time.Millisecond}}
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, false, false)
+	if f != nil || !wrote {
+		t.Fatalf("a complete live stream must end at message_stop (upstream still open), wrote=%v failure=%+v", wrote, f)
+	}
+	if rec.Header().Get("X-Steady-Proxy-Mode") != "live" || !strings.Contains(rec.Body.String(), "message_stop") {
+		t.Fatalf("want a live response carrying message_stop, mode=%q body=%q", rec.Header().Get("X-Steady-Proxy-Mode"), rec.Body.String())
+	}
+}
+
+// An in-band error that is the upstream's final answer is forwarded verbatim and
+// marked delivered; a transient one never reaches the client (the handler aborts
+// so the client's own stream retry takes over).
+func TestAnthropicWireLiveErrorForwarding(t *testing.T) {
+	useDefaultConfig(t)
+	for _, tc := range []struct {
+		typ, msg  string
+		forwarded bool
+	}{
+		{"authentication_error", "invalid x-api-key", true},
+		{"permission_error", "forbidden", true},
+		{"billing_error", "credits required", true},
+		{"not_found_error", "model: nope", true},
+		{"request_too_large", "too many bytes", true},
+		{"invalid_request_error", "bad request", true},
+		{"invalid_request_error", streamDisconnectMessage, false},
+		{"overloaded_error", "Overloaded", false},
+		{"rate_limit_error", "slow down", false},
+		{"api_error", "boom", false},
+		{"timeout_error", "timed out", false},
+		{"something_new", "unknown", false},
+	} {
+		t.Run(tc.typ+"/"+tc.msg, func(t *testing.T) {
+			frame := sseJSON("error", map[string]any{"type": "error", "error": map[string]string{"type": tc.typ, "message": tc.msg}})
+			steps := feedLive(newAnthropicWire(false), frame)
+			if len(steps) != 1 || steps[0].fail == nil || steps[0].done {
+				t.Fatalf("want one failing, not-done step, got %+v", steps)
+			}
+			s := steps[0]
+			if tc.forwarded {
+				if s.fail.transient || !s.fail.delivered || len(s.out) != 1 || string(s.out[0]) != frame {
+					t.Fatalf("want verbatim forward with delivered=true, got out=%q fail=%+v", s.out, *s.fail)
+				}
+				return
+			}
+			if !s.fail.transient || s.fail.delivered || s.out != nil {
+				t.Fatalf("a transient error must not be forwarded, got out=%q fail=%+v", s.out, *s.fail)
+			}
+		})
+	}
+}
+
+func TestLiveInBandErrorDelivery(t *testing.T) {
+	auth := sseJSON("error", map[string]any{"type": "error", "error": map[string]string{"type": "authentication_error", "message": "invalid x-api-key"}})
+	overloaded := sseJSON("error", map[string]any{"type": "error", "error": map[string]string{"type": "overloaded_error", "message": "Overloaded"}})
+
+	rec, wrote, f := liveCapture(t, []string{textHead(), auth})
+	if !wrote || f == nil || f.transient || !f.delivered {
+		t.Fatalf("want committed non-transient failure with delivered=true, wrote=%v failure=%+v", wrote, f)
+	}
+	if !strings.Contains(rec.Body.String(), auth) {
+		t.Fatalf("the upstream's error frame must reach the client verbatim: %q", rec.Body.String())
+	}
+
+	rec, wrote, f = liveCapture(t, []string{textHead(), overloaded})
+	if !wrote || f == nil || !f.transient || f.delivered {
+		t.Fatalf("want committed transient failure with delivered=false, wrote=%v failure=%+v", wrote, f)
+	}
+	if strings.Contains(rec.Body.String(), "overloaded_error") {
+		t.Fatalf("a transient error must not be forwarded: %q", rec.Body.String())
 	}
 }

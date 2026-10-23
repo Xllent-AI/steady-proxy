@@ -394,3 +394,66 @@ func TestE2ERefusalDeliveredWhenFeatureOff(t *testing.T) {
 		t.Fatalf("disabled feature must not re-issue; got %d attempts", got)
 	}
 }
+
+// The fallback is a Claude model, so only Claude requests are re-routed; another
+// vendor's refusal is that model's answer.
+func TestE2ERefusalFromNonClaudeModelIsDelivered(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, refusalStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.refusalFallback = "claude-opus-4-8"
+
+	rec := doStream(`{"stream":true,"model":"Qwen/Qwen3.8-Flash-Next"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"stop_reason":"refusal"`) || hits.Load() != 1 {
+		t.Fatalf("non-Claude refusal must be delivered without re-routing, got %d hits=%d body=%s", rec.Code, hits.Load(), rec.Body.String())
+	}
+}
+
+// The fallback is best-effort: when it cannot answer, the client gets the
+// requested model's own answer (refusal stream or safeguard error), never the
+// fallback's unrelated error.
+func TestE2EFailedFallbackDeliversOriginalAnswer(t *testing.T) {
+	const safeguard = `{"type":"error","error":{"type":"invalid_request_error","message":"Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup)."}}`
+	for _, c := range []struct {
+		name     string
+		original func(http.ResponseWriter)
+		status   int
+		body     string
+	}{
+		{"refusal", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, refusalStream)
+		}, 200, refusalStream},
+		{"safeguard", func(w http.ResponseWriter) {
+			w.WriteHeader(400)
+			io.WriteString(w, safeguard)
+		}, 400, safeguard},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				hits.Add(1)
+				if modelOf(b) == "claude-opus-4-8" {
+					w.WriteHeader(404)
+					io.WriteString(w, `{"type":"error","error":{"type":"not_found_error","message":"model: claude-opus-4-8"}}`)
+					return
+				}
+				c.original(w)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			cfg.refusalFallback = "claude-opus-4-8"
+
+			rec := doStream(`{"stream":true,"model":"claude-fable-5"}`)
+			if hits.Load() != 2 || rec.Code != c.status || rec.Body.String() != c.body {
+				t.Fatalf("want the original %d answer after a failed fallback, got hits=%d status=%d body=%s", c.status, hits.Load(), rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

@@ -8,37 +8,37 @@
 // format only affects how a stream is interpreted (terminal event, in-band error,
 // usage) — see wireModel in wire.go; the transactional engine is shared.
 //
-// ── DESIGN PRINCIPLE: a blind stabilizer ─────────────────────────────────────
+// ── DESIGN PRINCIPLE: a transparent stabilizer ───────────────────────────────
 //
 // This proxy is intentionally NOT a smart retry brain — your upstream gateway
 // already owns retry intelligence (routing, provider selection, backoff). The
-// proxy's only job is to keep the client alive through outages. So the whole
-// policy is one rule:
+// proxy's only job is to keep the client alive through outages without changing
+// what the upstream answered. So the whole policy is one rule:
 //
-//	Buffer the full response. On ANY failure, tell the client to wait and retry.
-//	Only give up on a request that can never succeed as written.
+//	Buffer the full response. Retry what a re-send can fix; relay everything
+//	else exactly as the upstream sent it.
 //
-// "Can never succeed" = a deterministic request-shape error (context too long,
-// malformed tool blocks, schema/validation, model-not-found — see
-// requestShapeSigs in classify.go). EVERYTHING else is retried, on purpose:
-// network outages, 5xx, rate limits, capacity ("no available providers"), auth
-// blocks, billing, and unknown 4xx. A temporary block is ridden out, not
-// surfaced. The cost: a genuinely bad key/credential surfaces late (after the
-// retry budget) rather than fast — an accepted trade for steadiness.
+// "A re-send can fix" follows the official SDKs: transport faults, stalled or
+// truncated streams, 408/409/429/5xx, an authoritative retry hint, or an error
+// body that explicitly names a transient fault (overloaded, rate limit,
+// timeout). Everything else — auth, billing, permission, not-found, validation,
+// redirects, an exhausted quota, any other 4xx — is the upstream's final answer:
+// relayed verbatim (body and headers) with `x-should-retry: false`, because an
+// identical retry would fail the same way and hide the real error.
 //
 // How it works (transactional mode):
 //   - For POST /v1/messages it withholds ALL downstream bytes until it has
 //     captured a complete, valid Anthropic SSE stream ending in `message_stop`.
 //     Only then does it write `200 OK` and replay the buffered stream.
 //   - For POST /v1/responses (Codex) the same engine buffers the OpenAI Responses
-//     SSE stream (terminal `response.completed`); a start-of-stream `error` /
-//     `response.failed` is caught pre-commit and converted to a retry, and once
-//     output appears it commits early and streams live. See wireModel (wire.go).
+//     SSE stream (terminal `response.completed` or `response.incomplete`); a
+//     transient start-of-stream `error` / `response.failed` is caught pre-commit
+//     and converted to a retry. See wireModel (wire.go).
 //   - Native Gemini streamGenerateContent?alt=sse buffers through clean EOF
 //     after all requested candidates finish, retaining trailing usage metadata.
 //     PROXY_GEMINI_BUFFER_MS bounds the hold before switching to live output.
-//   - Any failure before that commit point (connection error, 5xx, stalled or
-//     truncated stream, mid-stream `error` event, or a retryable status) is
+//   - A retryable failure before that commit point (connection error, 5xx,
+//     stalled or truncated stream, transient in-band error, retryable status) is
 //     turned into a *retryable* response: it stamps `x-should-retry: true` plus a
 //     `Retry-After` backoff, so Claude Code's own SDK retry loop waits and
 //     transparently re-sends. Claude Code 2.1.191 clamps
@@ -51,8 +51,9 @@
 //     those specific shapes on dedicated paths that ignore `x-should-retry` and
 //     give up after ~3 tries (e.g. "Repeated 529 Overloaded errors"); masking
 //     them as a generic 503 keeps every retry inside the SDK loop above.
-//   - Request-shape errors are passed through with `x-should-retry: false`, so
-//     they surface instead of looping forever.
+//   - After commit nothing is replayed: a terminal in-band error frame is
+//     forwarded and ends the stream; any other failure aborts the response so
+//     no client mistakes a cut-off stream for a complete answer.
 //
 // Re-issuing /v1/messages is safe here because the client never saw a partial
 // response, and Claude Code executes tools only after a COMPLETE response — so a
@@ -364,7 +365,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 				reqWho, effortField(reqEffort), reason, cfg.refusalFallback, since(reqStart), rec.idField())
 		}
 		body = swapped
-		reqWho = who(r, body)
+		reqWho = from + "~>" + who(r, body) // keep the requested model visible in every later line
 		// The fallback is a fresh logical request: grant it a full hidden local-retry
 		// budget rather than inheriting what the refusing model already spent. Both
 		// the explicit (proxyRetries) and the legacy (legacyFastUsed) budgets reset so
@@ -375,22 +376,33 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 
+	// A refusal fallback is best-effort: the refusing model's own answer (a
+	// complete refusal stream or a safeguard error) is held while the fallback is
+	// tried, and delivered if the fallback cannot answer.
+	var heldRefusal *bufferedStream
+	var heldSafeguard *failure
+	defer func() {
+		if heldRefusal != nil {
+			heldRefusal.sp.discard()
+		}
+	}()
+	firstWho := reqWho
+
 	// With PROXY_TRANSACTIONAL_LOCAL_RETRIES=0, preserve the old behavior:
 	// initial attempt + at most one cheap local retry for fast pre-header faults.
 	// When enabled, use the explicit local retry budget for any transient
 	// uncommitted transactional failure.
 	for {
-		// Refusal fallback: if the upstream returns a COMPLETE stream whose
+		// Refusal fallback: if a Claude model returns a COMPLETE stream whose
 		// stop_reason is "refusal", re-issue once with the fallback model instead of
 		// handing the refusal back to the client. Arm interception only when a real
-		// substitution is possible — the body names a concrete model other than the
-		// fallback. A concrete model guarantees the later swapModel succeeds (so the
-		// discarded refusal can always be re-issued), and it bounds this to a single
-		// swap: the retried body targets the fallback model, so it is never armed
-		// again (no recursion). The swap itself is deferred to the refusal branch so
-		// the happy path never marshals a fallback body it won't use.
+		// substitution is possible — the body names a Claude model other than the
+		// fallback. A concrete model guarantees the later swapModel succeeds, and it
+		// bounds this to a single swap: the retried body targets the fallback model,
+		// so it is never armed again (no recursion). Other vendors' models are never
+		// silently re-routed to a different provider.
 		reqModel := modelOf(body)
-		interceptRefusal := isMessages && cfg.refusalFallback != "" && reqModel != "?" && reqModel != cfg.refusalFallback
+		interceptRefusal := isMessages && cfg.refusalFallback != "" && isClaudeModel(reqModel) && reqModel != cfg.refusalFallback
 
 		rec.beginAttempt(body, reqWho, proxyRetries)
 		resp, started, stopDeadline, rtErr := roundTripBefore(ctx, r, body, commitBy)
@@ -414,15 +426,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			respBody, readErr := readHTTPErrorBody(resp, rec)
-			last = classifyHTTPErrorForPath(ctx, r.URL.Path, resp, respBody, readErr)
-			last.origStatus = resp.StatusCode
-			rec.noteAttemptFailure(last, "http_error")
-			resp.Body.Close()
-			if interceptRefusal {
-				if reason := refusalFallbackFailureReason(last); reason != "" && swapToFallback(reason, nil) {
-					continue
-				}
+			last = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec)
+			if interceptRefusal && isModelSafeguardRefusal(last) && swapToFallback("safeguard", nil) {
+				safeguard := last
+				heldSafeguard = &safeguard
+				continue
 			}
 			if tryLocalRetry(last) {
 				continue
@@ -441,15 +449,42 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !isEventStream(resp.Header.Get("Content-Type")) {
-			copyResponseBodyToArchive(resp, rec)
+			// Not a stream any wire can validate, but a complete body is still the
+			// upstream's answer: re-sending would only repeat it and re-bill the
+			// generation. Buffer it under the same no-output deadline as an error
+			// body (the deadline stays armed until the body closes) and byte-idle
+			// bound, so a broken or stalled body is still a clean pre-commit retry.
+			rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
+			sp, readFail := bufferNonSSE(ctx, resp, rec)
 			resp.Body.Close()
-			last = failure{transient: true, status: http.StatusBadGateway, atype: "api_error",
-				code: "unexpected_content_type", message: "upstream returned non-SSE to a streaming request"}
-			rec.noteAttemptFailure(last, "unexpected_content_type")
-			if tryLocalRetry(last) {
-				continue
+			if readFail != nil {
+				last = *readFail
+				rec.noteAttemptFailure(last, "non_sse_read_error")
+				if tryLocalRetry(last) {
+					continue
+				}
+				break
 			}
-			break
+			for k, v := range safeResponseHeaders(resp.Header) {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			err := sp.replayRaw(w)
+			sp.discard()
+			if err != nil {
+				// Headers are committed and the length is not declared, so a short
+				// replay would end as a clean, truncated success: abort instead.
+				rec.noteAttemptResult("drop")
+				rec.note("DROP", resp.StatusCode, resp.StatusCode, "non_sse_replay_failed")
+				log.Printf("DROP  %s%s  non_sse_replay_failed -> committed  %s%s", reqWho, effortField(reqEffort), since(reqStart), rec.idField())
+				panic(http.ErrAbortHandler)
+			}
+			rec.noteAttemptResult("success")
+			log.Printf("OK    %s%s  %d  %s  non-sse %s  %s%s%s%s",
+				reqWho, effortField(reqEffort), resp.StatusCode, hbytes(sp.total), dash(resp.Header.Get("Content-Type")), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
+			rec.noteProxyRetries(proxyRetries)
+			rec.note("OK", resp.StatusCode, resp.StatusCode, "")
+			return
 		}
 
 		// CAPTURE: buffer+validate (transactional), or commit+stream live past the
@@ -462,7 +497,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// The stream engine now owns the same absolute commit deadline; it can
 		// switch to live output without the pre-stream timer killing the body.
 		stopDeadline()
-		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wireFor(r.URL.Path, body, interceptRefusal), commitBy)
+		wire := wireFor(r.URL.Path, body, interceptRefusal)
+		wrote, fail := captureSSECore(ctx, cancel, w, resp.Header, resp.Body, &st, kaWindow, gated, earlyCommit, wire, commitBy)
 		resp.Body.Close()
 		rec.noteAttemptStats(&st)
 		if fail == nil {
@@ -474,38 +510,48 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rec.noteAttemptFailure(*fail, "sse_failure")
-		// Refusal fallback: either a complete stream that ended in
-		// stop_reason="refusal", or a pre-commit safeguard error reported outside
-		// the normal stream path. Nothing was committed downstream, so swap in the
-		// fallback model and re-issue on the next loop iteration. This is a
-		// substitution, not a transient retry: it does not consume the local-retry
-		// or SDK-retry budget, and it happens at most once per request (see above).
-		if !wrote && interceptRefusal {
-			if reason := refusalFallbackFailureReason(*fail); reason != "" && swapToFallback(reason, &st) {
+		if st.heldRefusal != nil {
+			// A complete stream that ended in stop_reason="refusal". Nothing was
+			// committed downstream, so swap in the fallback model and re-issue on the
+			// next iteration. This is a substitution, not a transient retry: it does
+			// not consume the local-retry or SDK-retry budget, and it happens at most
+			// once per request (see above).
+			refusal := &bufferedStream{sp: st.heldRefusal, header: resp.Header, wire: wire, st: &st}
+			st.heldRefusal = nil
+			if swapToFallback("refusal", &st) {
+				heldRefusal = refusal
 				continue
 			}
+			// The body could not be rewritten: the refusal is still the complete answer.
+			heldRefusal = refusal
+			deliverHeldRefusal(w, heldRefusal, firstWho, reqEffort, reqStart, retryCount, rec, "swap_failed")
+			return
 		}
-		if !wrote && fail.code == refusalFallbackCode {
-			// Unreachable: interception is only armed for a concrete model, which
-			// guarantees swapModel succeeds. Guard anyway — the buffered refusal is
-			// already discarded, so surface a clean error rather than strand the
-			// client on a silent hang.
-			last = failure{status: http.StatusBadGateway, atype: "api_error",
-				code: "refusal_fallback_swap_failed", message: "could not rewrite request to fallback model"}
-			break
+		if !wrote && interceptRefusal && isModelSafeguardRefusal(*fail) && swapToFallback("safeguard", &st) {
+			safeguard := *fail
+			heldSafeguard = &safeguard
+			continue
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
+			if fail.delivered {
+				// The upstream's own terminal error frame reached the client, so the
+				// stream ended the way the protocol defines; nothing to abort.
+				log.Printf("FAIL  %s%s  %s -> delivered in-stream  out=%s tok  %s%s%s%s",
+					whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
+				rec.noteAttemptResult("fail")
+				rec.noteProxyRetries(proxyRetries)
+				rec.note("FAIL", http.StatusOK, http.StatusOK, fail.code)
+				return
+			}
 			log.Printf("DROP  %s%s  %s -> committed, client recovery required  out=%s tok  %s%s%s%s%s",
 				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
 			rec.noteAttemptResult("drop")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
-			if geminiStream {
-				// Gemini readers use transport EOF, not a terminal SSE event. A clean
-				// HTTP end here could turn a truncated response into apparent success.
-				panic(http.ErrAbortHandler)
-			}
-			return
+			// Abort the HTTP response on every wire: a clean end would let an SDK
+			// that finalizes from its snapshot (or Gemini, which has no terminal
+			// event at all) accept the cut-off stream as a complete answer.
+			panic(http.ErrAbortHandler)
 		}
 		last = *fail
 		if tryLocalRetry(last) {
@@ -514,10 +560,19 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 
-	// FAILED before committing. One rule: retry unless it's a request-shape error
-	// (or we've hit the backstop). On retry, supply a Retry-After backoff so the
-	// client waits before re-sending.
+	// FAILED before committing. Retry only what can succeed on a re-send (or until
+	// the backstop); on retry, supply a Retry-After backoff so the client waits.
 	canRetry := last.transient && budgetLeft()
+	if !canRetry && (heldRefusal != nil || heldSafeguard != nil) {
+		log.Printf("WARN  %s%s  fallback %s failed: %s -> delivering the original answer  %s%s",
+			reqWho, effortField(reqEffort), cfg.refusalFallback, last.code, since(reqStart), rec.idField())
+		if heldRefusal != nil {
+			deliverHeldRefusal(w, heldRefusal, firstWho, reqEffort, reqStart, retryCount, rec, last.code)
+			return
+		}
+		last = *heldSafeguard
+		reqWho = firstWho
+	}
 	retryAfter := 0
 	if canRetry {
 		retryAfter = last.retryAfter
@@ -527,7 +582,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 	tag := "RETRY" // converted to x-should-retry=true; the SDK will re-send
 	if !canRetry {
-		tag = "FAIL" // surfaced to the user (request-shape, or retry backstop hit)
+		tag = "FAIL" // surfaced to the client (the upstream's final answer, or retry backstop hit)
 	}
 	// surface() collapses every retryable failure to a generic 503+api_error so
 	// Claude Code can't recognize it as overloaded/rate-limit/timeout and bypass
@@ -538,7 +593,71 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		tag, reqWho, effortField(reqEffort), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
 	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
-	writeErr(w, canRetry, sStatus, sType, msgFor(last), retryAfter, last.code)
+	writeFailure(w, r.URL.Path, last, canRetry, sStatus, sType, retryAfter)
+}
+
+// bufferedStream is a complete, validated upstream stream held in its spool.
+type bufferedStream struct {
+	sp     *spool
+	header http.Header
+	wire   wireModel
+	st     *captureStats
+}
+
+// deliverHeldRefusal replays the original model's complete refusal exactly as a
+// buffered commit would have, after the fallback model could not answer.
+func deliverHeldRefusal(w http.ResponseWriter, b *bufferedStream, reqWho, reqEffort string, reqStart time.Time, retryCount int, rec *reqRecorder, fallbackCode string) {
+	writeStreamHead(w, b.header, "buffered", b.st)
+	err := b.wire.replayBuffered(b.sp, w, b.st)
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	if err != nil {
+		log.Printf("DROP  %s%s  refusal_replay_failed -> committed  %s%s", reqWho, effortField(reqEffort), since(reqStart), rec.idField())
+		rec.note("DROP", http.StatusOK, http.StatusOK, "refusal_replay_failed")
+		panic(http.ErrAbortHandler)
+	}
+	log.Printf("OK    %s%s  in=%s out=%s tok  %s  %s  %s%s  fallback-failed=%s%s",
+		whoWithResolvedModel(reqWho, b.st.model), effortField(reqEffort), htok(b.st.inTok), htok(b.st.outTok), dash(b.st.stop), b.st.mode, since(reqStart), att(retryCount), fallbackCode, rec.idField())
+	rec.note("OK", http.StatusOK, http.StatusOK, "")
+}
+
+// writeFailure surfaces a pre-commit failure. A terminal upstream HTTP error is
+// the upstream's own answer and is replayed verbatim (status adjusted only where
+// the route's client would otherwise auto-retry it); everything else is
+// synthesized in the route's native error envelope.
+func writeFailure(w http.ResponseWriter, path string, f failure, canRetry bool, status int, atype string, retryAfter int) {
+	if !f.transient && f.upstream != nil {
+		h := w.Header()
+		for k, v := range safeResponseHeaders(f.upstream.header) {
+			h[k] = v
+		}
+		h.Set("X-Should-Retry", "false")
+		h.Set("X-Steady-Proxy-Reason", f.code)
+		if status != f.upstream.status {
+			// The status was changed only to stop a status-based SDK retry; its
+			// retry delay must not contradict that.
+			h.Del("Retry-After")
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(f.upstream.body)
+		return
+	}
+	errorWriterFor(path)(w, canRetry, status, atype, msgFor(f), retryAfter, f.code)
+}
+
+// classifyUpstreamHTTPError reads and classifies one non-2xx upstream response,
+// keeping the complete reply when it is the upstream's final answer.
+func classifyUpstreamHTTPError(ctx context.Context, path string, resp *http.Response, rec *reqRecorder) failure {
+	b, complete, readErr := readHTTPErrorBody(resp, rec)
+	f := classifyHTTPErrorForPath(ctx, path, resp, b, readErr)
+	f.origStatus = resp.StatusCode
+	if !f.transient && readErr == nil && complete && resp.StatusCode >= 400 {
+		f.upstream = &upstreamReply{status: resp.StatusCode, header: resp.Header.Clone(), body: b}
+	}
+	rec.noteAttemptFailure(f, "http_error")
+	resp.Body.Close()
+	return f
 }
 
 // readBody reads the request body with a hard cap, reporting overflow rather
@@ -552,7 +671,10 @@ func readBody(r *http.Request) (body []byte, tooBig bool, err error) {
 	return body, false, err
 }
 
-const httpErrorClassifyBytes = 64 << 10
+// httpErrorBodyBytes bounds an upstream error body kept for classification and
+// verbatim replay. A longer body is classified from its prefix and, being
+// incomplete, surfaced as a synthesized error instead.
+const httpErrorBodyBytes = 1 << 20
 
 type prefixCapture struct {
 	buf bytes.Buffer
@@ -570,31 +692,65 @@ func (p *prefixCapture) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func readHTTPErrorBody(resp *http.Response, rec *reqRecorder) ([]byte, error) {
+// readHTTPErrorBody returns up to httpErrorBodyBytes of the error body and
+// whether that is the whole body.
+func readHTTPErrorBody(resp *http.Response, rec *reqRecorder) ([]byte, bool, error) {
 	body := withByteIdle(resp.Body, cfg.upstreamByteIdle)
 	defer body.stop()
 	if rec == nil {
-		return io.ReadAll(io.LimitReader(body, httpErrorClassifyBytes))
+		b, err := io.ReadAll(io.LimitReader(body, httpErrorBodyBytes+1))
+		if len(b) > httpErrorBodyBytes {
+			return b[:httpErrorBodyBytes], false, err
+		}
+		return b, true, err
 	}
 	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
-	prefix := &prefixCapture{max: httpErrorClassifyBytes}
+	prefix := &prefixCapture{max: httpErrorBodyBytes}
 	dst := io.MultiWriter(prefix, rec.respWriter())
-	_, err := io.Copy(dst, body)
+	n, err := io.Copy(dst, body)
 	rec.noteResponseReadError(err)
-	return prefix.buf.Bytes(), err
+	return prefix.buf.Bytes(), n <= httpErrorBodyBytes, err
 }
 
-func copyResponseBodyToArchive(resp *http.Response, rec *reqRecorder) {
-	if rec == nil {
-		return
+// spoolSink adapts a spool to io.Writer, remembering its own write failure so a
+// spool fault is not mistaken for an upstream read error.
+type spoolSink struct {
+	sp  *spool
+	err error
+}
+
+func (s *spoolSink) Write(p []byte) (int, error) {
+	if err := s.sp.write(p); err != nil {
+		s.err = err
+		return 0, err
 	}
-	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
-	if sink := rec.respWriter(); sink != nil {
-		body := withByteIdle(resp.Body, cfg.upstreamByteIdle)
-		defer body.stop()
-		_, err := io.Copy(sink, body)
-		rec.noteResponseReadError(err)
+	return len(p), nil
+}
+
+// bufferNonSSE reads a whole non-SSE 2xx body into a spool under the same size
+// and byte-idle bounds as a captured stream, teeing it into the archive.
+func bufferNonSSE(ctx context.Context, resp *http.Response, rec *reqRecorder) (*spool, *failure) {
+	sink := &spoolSink{sp: newSpool()}
+	body := withByteIdle(resp.Body, cfg.upstreamByteIdle)
+	defer body.stop()
+	var dst io.Writer = sink
+	if archive := rec.respWriter(); archive != nil {
+		dst = io.MultiWriter(sink, archive)
 	}
+	_, err := io.Copy(dst, body)
+	rec.noteResponseReadError(err)
+	if err == nil {
+		return sink.sp, nil
+	}
+	sink.sp.discard()
+	if sink.err != nil {
+		return nil, classifyBufferError(sink.err)
+	}
+	if body.timedOut.Load() && ctx.Err() == nil {
+		return nil, &failure{transient: true, status: 504, atype: "timeout_error", code: "upstream_idle", message: "upstream stalled with no bytes"}
+	}
+	f := classifyTransport(err, ctx)
+	return nil, &f
 }
 
 // proxyOnce is a plain single-shot reverse proxy for non-transactional routes.
@@ -602,7 +758,6 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
 	defer cancel()
-	writeErr := errorWriterFor(r.URL.Path)
 	reqWho := who(r, body)
 	reqEffort := reasoningEffortOf(r.URL.Path, body)
 	rec.beginAttempt(body, reqWho, 0)
@@ -620,17 +775,13 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		f = classifyTransport(err, ctx)
 		rec.noteAttemptFailure(f, "transport_error")
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
-		respBody, readErr := readHTTPErrorBody(resp, rec)
-		f = classifyHTTPErrorForPath(ctx, r.URL.Path, resp, respBody, readErr)
-		f.origStatus = resp.StatusCode
-		rec.noteAttemptFailure(f, "http_error")
-		resp.Body.Close()
+		f = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec)
 	default:
 		failed = false
 	}
 	if failed {
-		// Same one rule as the transactional path: retry transient faults within
-		// the backstop, with a Retry-After backoff so the client waits.
+		// Same rule as the transactional path: retry transient faults within the
+		// backstop, with a Retry-After backoff so the client waits.
 		retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 		canRetry := f.transient && retryCount < cfg.sdkRetryCap
 		retryAfter := 0
@@ -646,7 +797,7 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 		sStatus, sType := retrySurfaceFor(r.URL.Path, f, canRetry)
 		log.Printf("%-5s %s%s  %s %s%s  %s%s%s", tag, reqWho, effortField(reqEffort), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
-		writeErr(w, canRetry, sStatus, sType, msgFor(f), retryAfter, f.code)
+		writeFailure(w, r.URL.Path, f, canRetry, sStatus, sType, retryAfter)
 		return
 	}
 	defer resp.Body.Close()
@@ -737,12 +888,14 @@ func copyForwardHeaders(dst, src http.Header) {
 	}
 }
 
+// safeResponseHeaders keeps the upstream's end-to-end headers, including
+// Content-Encoding: raw relays forward the body bytes unchanged.
 func safeResponseHeaders(src http.Header) http.Header {
 	drop := connectionTokens(src)
 	out := http.Header{}
 	for k, vv := range src {
 		lk := strings.ToLower(k)
-		if hopByHop[lk] || drop[lk] || lk == "content-encoding" {
+		if hopByHop[lk] || drop[lk] {
 			continue
 		}
 		out[k] = append([]string(nil), vv...)
@@ -820,6 +973,9 @@ func whoWithResolvedModel(reqWho, resolvedModel string) string {
 	if reqModel == resolvedModel {
 		return reqWho
 	}
+	if _, fallback, swapped := strings.Cut(reqModel, "~>"); swapped && fallback == resolvedModel {
+		return reqWho
+	}
 	if reqModel == "" || reqModel == "?" {
 		return resolvedModel + agent
 	}
@@ -853,13 +1009,13 @@ func retryField(secs int) string {
 
 func logLocalRetry(reqWho, effort string, f failure, wait time.Duration, retryNum, retryMax, sdkAttempt int, mode string) {
 	vlog("[local-retry] %s%s %s %s wait=%s retry=%d/%d%s%s",
-		reqWho, effortField(effort), f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond),
+		reqWho, effortField(effort), f.code, itoa(origStatusOf(f)), wait.Round(time.Millisecond),
 		retryNum, retryMax, att(sdkAttempt), localRetryModeField(mode))
 }
 
 func logLocalRetrySkip(reqWho, effort string, f failure, wait time.Duration, sdkAttempt int, reason string) {
 	vlog("[local-retry] %s%s %s %s wait=%s skip=%s%s",
-		reqWho, effortField(effort), f.code, statusField(origStatusOf(f), statusFor(f)), wait.Round(time.Millisecond), reason, att(sdkAttempt))
+		reqWho, effortField(effort), f.code, itoa(origStatusOf(f)), wait.Round(time.Millisecond), reason, att(sdkAttempt))
 }
 
 func localRetryModeField(mode string) string {
@@ -983,27 +1139,27 @@ func reasoningEffortOf(path string, body []byte) string {
 
 // refusalFallbackCode is the sentinel failure code captureSSE returns when a
 // complete stream ended in stop_reason "refusal" AND refusal interception was
-// armed for the request. It never reaches the client: the handler recognizes it,
-// rewrites the request to the fallback model, and re-issues (see handle()).
+// armed for the request. It never reaches the client: the engine hands the
+// buffered refusal to the handler, which rewrites the request to the fallback
+// model and re-issues (see handle()).
 const refusalFallbackCode = "refusal_fallback"
 
-// refusalFallbackFailureReason reports whether an uncommitted failure should be
-// treated as a model refusal and re-issued with the configured fallback model.
-func refusalFallbackFailureReason(f failure) string {
-	if f.code == refusalFallbackCode {
-		return "refusal"
-	}
-	if isModelSafeguardRefusal(f) {
-		return "safeguard"
-	}
-	return ""
+// isClaudeModel reports whether a request names a Claude model, the only family
+// whose refusals are re-issued: substituting a different vendor's model would
+// silently re-route the prompt to another provider.
+func isClaudeModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "claude")
 }
 
 // isModelSafeguardRefusal catches Fable's pre-stream guardrail shape. Claude Code
 // records these as synthetic API errors, not as the normal SSE
 // message_delta.stop_reason="refusal" path, so the stream-only interception above
-// never sees them.
+// never sees them. Only a terminal failure qualifies: a transient error that
+// merely mentions the phrase is retried like any other.
 func isModelSafeguardRefusal(f failure) bool {
+	if f.transient {
+		return false
+	}
 	msg := strings.ToLower(f.message)
 	return strings.Contains(msg, "safeguards flagged this message") ||
 		strings.Contains(msg, "claude code can't respond to this request with fable")
@@ -1027,11 +1183,11 @@ func loadRefusalFallback(lookup func(string) (string, bool)) string {
 
 // swapModel returns a copy of the JSON request body with only its top-level
 // "model" field replaced by model. Every other top-level field is preserved as a
-// raw message and re-emitted byte-for-byte (numbers are never reformatted, unlike
-// a decode into map[string]any), so max_tokens, tools, thinking budgets, etc. are
-// untouched; only the object's key order may change, which is JSON-insignificant.
-// ok is false when the body is not a JSON object or has no "model" field, in which
-// case the caller must not substitute.
+// raw message (numbers are never reformatted, unlike a decode into
+// map[string]any), so max_tokens, tools, thinking budgets, etc. keep their JSON
+// values. The output is compacted and its keys sorted, both JSON-insignificant;
+// HTML characters are not escaped. ok is false when the body is not a JSON object
+// or has no "model" field, in which case the caller must not substitute.
 func swapModel(body []byte, model string) (out []byte, ok bool) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -1045,11 +1201,13 @@ func swapModel(body []byte, model string) (out []byte, ok bool) {
 		return nil, false
 	}
 	m["model"] = mv
-	out, err = json.Marshal(m)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
 		return nil, false
 	}
-	return out, true
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), true
 }
 
 // refusalFallbackDesc renders the configured fallback model for the startup log,

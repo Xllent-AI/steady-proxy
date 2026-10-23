@@ -225,8 +225,10 @@ func (g *geminiWire) accept(ev event, st *captureStats) *failure {
 		return malformedSSE("invalid JSON or field shape in Gemini stream event")
 	}
 	// Both data-only Google envelopes and explicitly named error events must be
-	// caught even with PROXY_VALIDATE_JSON=0, including after a finishReason.
-	if ev.name == "error" || len(chunk.Error) != 0 {
+	// caught even with PROXY_VALIDATE_JSON=0, including after a finishReason. A
+	// literal "error": null is an unset field on a data chunk, not an error.
+	hasError := len(chunk.Error) != 0 && string(chunk.Error) != "null"
+	if ev.name == "error" || hasError {
 		if f := classifyGeminiSSEError(data); f != nil {
 			return f
 		}

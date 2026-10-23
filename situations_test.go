@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+// classifyHTTPError classifies one upstream error exactly as the Messages route
+// does (classifyHTTPErrorForPath), recording the raw status like the handler.
+func classifyHTTPError(resp *http.Response) failure {
+	b, err := io.ReadAll(resp.Body)
+	f := classifyHTTPErrorForPath(context.Background(), "/v1/messages", resp, b, err)
+	f.origStatus = resp.StatusCode
+	return f
+}
+
 // §2: a fully-framed event with broken JSON must become a retry, not reach the
 // client as "JSON Parse error: Unexpected identifier".
 func TestMalformedJSONEventConverts(t *testing.T) {
@@ -22,29 +31,33 @@ func TestMalformedJSONEventConverts(t *testing.T) {
 	}
 }
 
-// §4: only request-shape errors must surface (never retried) — they can never
-// succeed as written. §3: everything else is retried, including auth/billing and
-// transient statuses (blind-stabilizer policy).
+// HTTP errors follow the Stainless SDK retry rule: 408/409/429/5xx are retried,
+// every other 4xx is the upstream's final answer. Covers real Anthropic bodies,
+// including the auth/billing/not-found/validation shapes once retried forever.
 func TestClassifyRealMessages(t *testing.T) {
-	perm := []struct {
+	terminal := []struct {
 		status int
 		body   string
+		code   string
 	}{
-		{400, `{"error":{"type":"invalid_request_error","message":"Missing Tool Result Block"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"duplicate tool_use ID in conversation history"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"unexpected tool_use_id found in tool_result blocks"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"due to tool use concurrency issues. Run /rewind"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"Extra inputs are not permitted: context_management"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"Unexpected value(s) for the anthropic-beta header"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"max_tokens must be greater than thinking.budget_tokens"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"image dimensions exceed max allowed size"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"prompt is too long for the context window"}}`},
-		{400, `{"error":{"type":"invalid_request_error","message":"context length exceeded: 250000 > 200000"}}`},
+		{400, `{"error":{"type":"invalid_request_error","message":"Missing Tool Result Block"}}`, "request_shape"},
+		{400, `{"error":{"type":"invalid_request_error","message":"duplicate tool_use ID in conversation history"}}`, "request_shape"},
+		{400, `{"error":{"type":"invalid_request_error","message":"prompt is too long for the context window"}}`, "request_shape"},
+		{400, `{"error":{"type":"invalid_request_error","message":"max_tokens: 64001 > 64000, which is the maximum allowed number of output tokens for claude-opus-4-1-20250805"}}`, "http_400"},
+		{400, `{"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}`, "http_400"},
+		{401, `{"error":{"type":"authentication_error","message":"invalid x-api-key"}}`, "http_401"},
+		{401, `<html><body>401 Authorization Required</body></html>`, "http_401"},
+		{402, `{"error":{"type":"billing_error","message":"Usage credits required for 1M context"}}`, "http_402"},
+		{403, `{"error":{"type":"permission_error","message":"This organization has been disabled."}}`, "http_403"},
+		{404, `{"error":{"type":"not_found_error","message":"model: claude-nonexistent"}}`, "http_404"},
+		{413, `{"error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}`, "http_413"},
+		{418, `{"error":{"type":"api_error","message":"teapot"}}`, "http_418"},
+		{429, `{"error":{"type":"rate_limit_error","message":"prompt is too long for this tier"}}`, "http_429"},
 	}
-	for _, c := range perm {
+	for _, c := range terminal {
 		f := classifyHTTPError(mkResp(c.status, c.body))
-		if f.transient {
-			t.Errorf("status %d %q: want REQUEST-SHAPE (surface), got transient %+v", c.status, c.body, f)
+		if f.transient || f.status != c.status || f.code != c.code || f.origStatus != c.status {
+			t.Errorf("status %d %q: want terminal %d/%s, got %+v", c.status, c.body, c.status, c.code, f)
 		}
 	}
 
@@ -56,35 +69,71 @@ func TestClassifyRealMessages(t *testing.T) {
 		{500, `{"error":{"type":"api_error","message":"Internal server error"}}`},
 		{429, `{"error":{"type":"rate_limit_error","message":"Server is temporarily limiting requests"}}`},
 		{503, `{"error":{"type":"api_error","message":"temporary capacity issue"}}`},
-		// auth / billing / policy now RIDE OUT instead of surfacing (might be a temporary block).
-		{401, `{"error":{"type":"authentication_error","message":"Invalid API key"}}`},
-		{403, `{"error":{"type":"permission_error","message":"This organization has been disabled."}}`},
-		{402, `{"error":{"type":"billing_error","message":"Usage credits required for 1M context"}}`},
-		// guards against re-adding broad sigs: these contain "must be"/"unsupported"
-		// but are auth/routing → must still retry, not surface.
-		{401, `{"error":{"type":"authentication_error","message":"authentication token must be provided"}}`},
-		{403, `{"error":{"type":"permission_error","message":"unsupported region for this account"}}`},
-		// unknown 4xx: don't guess, retry.
-		{418, `{"error":{"type":"api_error","message":"teapot"}}`},
+		{408, `{"error":{"type":"timeout_error","message":"request timeout"}}`},
+		{409, `{"error":{"type":"api_error","message":"conflict"}}`},
+		// A 4xx whose body explicitly names a transient fault rides it out.
+		{400, `{"error":{"type":"overloaded_error","message":"gateway overloaded"}}`},
 	}
 	for _, c := range trans {
 		f := classifyHTTPError(mkResp(c.status, c.body))
 		if !f.transient {
 			t.Errorf("status %d %q: want TRANSIENT (retry), got %+v", c.status, c.body, f)
 		}
-		// A retryable 4xx (other than 429) MUST be normalized to 502 — the SDK may
-		// refuse to retry a raw 4xx by status, regardless of x-should-retry.
-		if c.status >= 400 && c.status < 500 && c.status != 429 && f.status != 502 {
+		// A retryable 4xx outside 408/409/429 MUST be normalized to 502 — the SDK
+		// refuses to retry a raw 4xx by status, regardless of x-should-retry.
+		if c.status == 400 && f.status != 502 {
 			t.Errorf("status %d %q: retryable 4xx must normalize to 502, got %d", c.status, c.body, f.status)
 		}
-		// ...but the RAW upstream status must still be preserved for the logs, so a
-		// retryable 401 reads as 401->503, not the misleading 502->503.
-		if f.origStatus != c.status {
-			t.Errorf("status %d %q: origStatus must keep raw status, got %d", c.status, c.body, f.origStatus)
-		}
+		// ...but the RAW upstream status is preserved for the logs.
 		if got := origStatusOf(f); got != c.status {
 			t.Errorf("status %d %q: origStatusOf=%d, want raw %d", c.status, c.body, got, c.status)
 		}
+	}
+}
+
+// Redirects are not followed, so a 3xx is a terminal configuration error whose
+// message names the target without its (possibly credential-bearing) query.
+func TestClassifyRedirectIsTerminal(t *testing.T) {
+	resp := mkResp(308, "")
+	resp.Header.Set("Location", "https://new.example.com/v1/messages?key=secret")
+	f := classifyHTTPError(resp)
+	if f.transient || f.code != "upstream_redirect_308" || f.status != http.StatusBadGateway {
+		t.Fatalf("want terminal upstream_redirect_308/502, got %+v", f)
+	}
+	if !strings.Contains(f.message, "https://new.example.com/v1/messages") || strings.Contains(f.message, "secret") {
+		t.Fatalf("redirect message must name the target without its query: %q", f.message)
+	}
+}
+
+// 408/409 keep the upstream's Retry-After, which also suppresses the 250ms
+// legacy fast retry.
+func TestClassify408HonorsRetryAfter(t *testing.T) {
+	resp := mkResp(409, `{"error":{"message":"busy"}}`)
+	resp.Header.Set("Retry-After", "30")
+	if f := classifyHTTPError(resp); !f.transient || f.retryAfter != 30 {
+		t.Fatalf("want transient with retryAfter=30, got %+v", f)
+	}
+}
+
+// In-band Anthropic errors use the same identities as HTTP: documented
+// permanent types are final; transient and unknown types ride out.
+func TestClassifySSEErrorTypes(t *testing.T) {
+	for typ, status := range map[string]int{
+		"authentication_error": 401, "billing_error": 402, "permission_error": 403,
+		"not_found_error": 404, "request_too_large": 413, "invalid_request_error": 400,
+	} {
+		f := classifySSEError(`{"type":"error","error":{"type":"` + typ + `","message":"m"}}`)
+		if f.transient || f.status != status || f.atype != typ {
+			t.Errorf("%s: want terminal %d, got %+v", typ, status, f)
+		}
+	}
+	for _, typ := range []string{"overloaded_error", "rate_limit_error", "api_error", "timeout_error", "something_new"} {
+		if f := classifySSEError(`{"type":"error","error":{"type":"` + typ + `","message":"m"}}`); !f.transient {
+			t.Errorf("%s: want transient, got %+v", typ, f)
+		}
+	}
+	if f := classifySSEError(`{"type":"error","error":{"type":"context_length_exceeded","message":"prompt is too long"}}`); f.transient {
+		t.Errorf("unknown type naming a request-shape problem must be terminal, got %+v", f)
 	}
 }
 

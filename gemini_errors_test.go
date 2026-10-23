@@ -7,6 +7,14 @@ import (
 	"testing"
 )
 
+// QuotaFailure details as the Gemini API sends them: a per-day quota stays
+// exhausted until the day rolls over, a per-minute one clears on its own. Both
+// carry the RetryInfo that only the per-minute case may honor.
+const (
+	geminiDailyQuotaDetails  = `[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"29s"}]`
+	geminiMinuteQuotaDetails = `[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"29s"}]`
+)
+
 func TestClassifyGeminiHTTPError(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -14,32 +22,53 @@ func TestClassifyGeminiHTTPError(t *testing.T) {
 		body      string
 		transient bool
 		status    int
+		code      string // terminal failures only
 	}{
-		{"invalid-argument", 400, `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"invalid contents"}}`, false, 400},
-		{"not-found", 404, `{"error":{"code":404,"status":"NOT_FOUND","message":"model does not exist"}}`, false, 404},
-		{"normalized-native-status", 400, `{"error":{"code":400,"status":" invalid_argument ","message":"invalid contents"}}`, false, 400},
-		{"numeric-400", 400, `{"error":{"code":400,"message":"invalid contents"}}`, false, 400},
-		{"numeric-404", 404, `{"error":{"code":404,"message":"model does not exist"}}`, false, 404},
-		{"http-400-fallback", 400, `{"error":{"message":"bad request"}}`, false, 400},
-		{"http-404-fallback", 404, `{"error":{"message":"missing resource"}}`, false, 404},
-		{"billing-precondition", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"enable billing on your project"}}`, true, 502},
-		{"region-precondition", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"unsupported region for this account"}}`, true, 502},
-		{"auth-precondition", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"authentication is required"}}`, true, 502},
-		{"unauthenticated", 401, `{"error":{"code":401,"status":"UNAUTHENTICATED","message":"invalid API key"}}`, true, 502},
-		{"permission-denied", 403, `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"permission denied"}}`, true, 502},
-		{"invalid-key-invalid-argument", 400, `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key.","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com"}]}}`, true, 502},
-		{"quota", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}`, true, 429},
-		{"internal", 500, `{"error":{"code":500,"status":"INTERNAL","message":"internal error"}}`, true, 500},
-		{"unavailable", 503, `{"error":{"code":503,"status":"UNAVAILABLE","message":"busy"}}`, true, 503},
-		{"unknown-named-status", 400, `{"error":{"code":400,"status":"UNKNOWN","message":"temporary gateway fault"}}`, true, 502},
-		{"new-named-status", 404, `{"error":{"code":404,"status":"NEW_PROVIDER_ERROR","message":"temporary gateway fault"}}`, true, 502},
-		{"unnamed-unknown", 418, `{"error":{"code":418,"message":"unknown provider fault"}}`, true, 502},
-		{"named-status-beats-numeric-400", 400, `{"error":{"code":400,"status":"UNAVAILABLE","message":"temporary capacity issue"}}`, true, 502},
-		{"native-request-shape-on-403", 403, `{"error":{"code":403,"status":"INVALID_ARGUMENT","message":"bad request"}}`, false, 403},
-		{"numeric-envelope-owns-fallback", 403, `{"error":{"code":400,"message":"bad request"}}`, false, 403},
-		{"specific-request-signature", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"prompt is too long for the context window"}}`, false, 400},
-		{"specific-signature-on-unknown", 403, `{"error":{"code":403,"status":"UNKNOWN","message":"context length exceeded"}}`, false, 403},
-		{"metadata-is-not-request-message", 403, `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"access denied","details":[{"description":"context length"}]}}`, true, 502},
+		{"invalid-argument", 400, `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"invalid contents"}}`, false, 400, "request_shape"},
+		{"not-found", 404, `{"error":{"code":404,"status":"NOT_FOUND","message":"model does not exist"}}`, false, 404, "request_shape"},
+		{"normalized-native-status", 400, `{"error":{"code":400,"status":" invalid_argument ","message":"invalid contents"}}`, false, 400, "request_shape"},
+		{"numeric-400", 400, `{"error":{"code":400,"message":"invalid contents"}}`, false, 400, "http_400"},
+		{"numeric-404", 404, `{"error":{"code":404,"message":"model does not exist"}}`, false, 404, "http_404"},
+		{"http-400-fallback", 400, `{"error":{"message":"bad request"}}`, false, 400, "http_400"},
+		{"http-404-fallback", 404, `{"error":{"message":"missing resource"}}`, false, 404, "http_404"},
+
+		// An identical retry cannot fix any of these, whatever the message says.
+		{"billing-precondition", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"enable billing on your project"}}`, false, 400, "request_shape"},
+		{"region-precondition", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"unsupported region for this account"}}`, false, 400, "request_shape"},
+		{"auth-precondition", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"authentication is required"}}`, false, 400, "request_shape"},
+		{"unauthenticated", 401, `{"error":{"code":401,"status":"UNAUTHENTICATED","message":"invalid API key"}}`, false, 401, "request_shape"},
+		{"permission-denied", 403, `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"permission denied"}}`, false, 403, "request_shape"},
+		{"invalid-key-invalid-argument", 400, `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key.","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com"}]}}`, false, 400, "request_shape"},
+		{"out-of-range", 400, `{"error":{"code":400,"status":"OUT_OF_RANGE","message":"offset is past the end"}}`, false, 400, "request_shape"},
+		{"already-exists", 400, `{"error":{"code":400,"status":"ALREADY_EXISTS","message":"resource exists"}}`, false, 400, "request_shape"},
+
+		// 429 is retried unless the body names a fault a retry cannot fix.
+		{"quota", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}`, true, 429, ""},
+		{"quota-per-minute", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted","details":` + geminiMinuteQuotaDetails + `}}`, true, 429, ""},
+		{"quota-per-day", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted","details":` + geminiDailyQuotaDetails + `}}`, false, 429, "http_429"},
+		{"quota-per-day-among-per-minute", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"},{"quotaId":"GenerateContentInputTokensPerModelPerDay-FreeTier"}]}]}}`, false, 429, "http_429"},
+		{"per-day-id-outside-quota-failure", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.PreconditionFailure","violations":[{"quotaId":"PerDay"}]}]}}`, true, 429, ""},
+		{"malformed-quota-violations", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":"PerDay"}]}}`, true, 429, ""},
+		{"429-request-fault", 429, `{"error":{"code":429,"status":"INVALID_ARGUMENT","message":"bad request"}}`, false, 429, "http_429"},
+		{"429-request-signature-without-status", 429, `{"error":{"code":429,"message":"prompt is too long"}}`, false, 429, "http_429"},
+
+		{"internal", 500, `{"error":{"code":500,"status":"INTERNAL","message":"internal error"}}`, true, 500, ""},
+		{"unavailable", 503, `{"error":{"code":503,"status":"UNAVAILABLE","message":"busy"}}`, true, 503, ""},
+		// A 4xx whose status names a transient fault is retried.
+		{"unknown-named-status", 400, `{"error":{"code":400,"status":"UNKNOWN","message":"temporary gateway fault"}}`, true, 502, ""},
+		{"deadline-exceeded-on-4xx", 400, `{"error":{"code":400,"status":"DEADLINE_EXCEEDED"}}`, true, 502, ""},
+		{"aborted-on-4xx", 400, `{"error":{"code":400,"status":"ABORTED"}}`, true, 502, ""},
+		{"named-status-beats-numeric-400", 400, `{"error":{"code":400,"status":"UNAVAILABLE","message":"temporary capacity issue"}}`, true, 502, ""},
+		// Without a table entry the HTTP status decides: unknown 4xx is final.
+		{"new-named-status", 404, `{"error":{"code":404,"status":"NEW_PROVIDER_ERROR","message":"temporary gateway fault"}}`, false, 404, "http_404"},
+		{"unnamed-unknown", 418, `{"error":{"code":418,"message":"unknown provider fault"}}`, false, 418, "http_418"},
+		{"native-request-shape-on-403", 403, `{"error":{"code":403,"status":"INVALID_ARGUMENT","message":"bad request"}}`, false, 403, "request_shape"},
+		{"numeric-envelope-owns-fallback", 403, `{"error":{"code":400,"message":"bad request"}}`, false, 403, "http_403"},
+		{"specific-request-signature", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"prompt is too long for the context window"}}`, false, 400, "request_shape"},
+		// The message only speaks for an envelope with no status of its own.
+		{"status-beats-message-signature", 403, `{"error":{"code":403,"status":"UNKNOWN","message":"context length exceeded"}}`, true, 502, ""},
+		{"signature-without-status", 403, `{"error":{"code":403,"message":"context length exceeded"}}`, false, 403, "request_shape"},
+		{"metadata-is-not-request-message", 403, `{"error":{"code":403,"message":"access denied","details":[{"description":"context length"}]}}`, false, 403, "http_403"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -56,8 +85,8 @@ func TestClassifyGeminiHTTPError(t *testing.T) {
 			if f.message != envelope.Error.Message {
 				t.Fatalf("numeric error.code must not lose message: got %q, want %q", f.message, envelope.Error.Message)
 			}
-			if !f.transient && f.code != "request_shape" {
-				t.Fatalf("want request_shape reason, got %+v", f)
+			if !f.transient && f.code != tc.code {
+				t.Fatalf("want terminal reason %q, got %+v", tc.code, f)
 			}
 		})
 	}
@@ -70,10 +99,11 @@ func TestGeminiArrayHTTPErrorRetryPolicy(t *testing.T) {
 		error     string
 		transient bool
 	}{
-		{"invalid-key", 400, `{"code":400,"status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID"}]`, true},
+		{"invalid-key", 400, `{"code":400,"status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID"}]`, false},
 		{"invalid-request", 400, `{"code":400,"status":"INVALID_ARGUMENT"`, false},
-		{"billing", 400, `{"code":400,"status":"FAILED_PRECONDITION"`, true},
+		{"billing", 400, `{"code":400,"status":"FAILED_PRECONDITION"`, false},
 		{"quota", 429, `{"code":429,"status":"RESOURCE_EXHAUSTED"`, true},
+		{"daily-quota", 429, `{"code":429,"status":"RESOURCE_EXHAUSTED","details":` + geminiDailyQuotaDetails, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte(" \n[{\"error\":" + tc.error + `,"message":"native detail"}}]`)
@@ -85,9 +115,11 @@ func TestGeminiArrayHTTPErrorRetryPolicy(t *testing.T) {
 	}
 }
 
+// 408/409 and 5xx are retried whatever the body says; 429 is not in this list
+// because a body naming a request fault makes it final (see TestClassifyGeminiHTTPError).
 func TestGeminiHTTPStatusPrecedence(t *testing.T) {
 	body := []byte(`{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"context length exceeded"}}`)
-	for _, status := range []int{408, 409, 429, 500, 502, 503, 504} {
+	for _, status := range []int{408, 409, 500, 502, 503, 504} {
 		t.Run(itoa(status), func(t *testing.T) {
 			f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: status}, body)
 			if !f.transient || f.status != status {
@@ -147,7 +179,7 @@ func TestGeminiHTTPRetryAfter(t *testing.T) {
 		want   int
 	}{
 		{"quota-backoff", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}`, "11", 11},
-		{"billing-backoff", 400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"billing unavailable"}}`, "9", 9},
+		{"retryable-4xx-backoff", 400, `{"error":{"code":400,"status":"UNAVAILABLE","message":"capacity unavailable"}}`, "9", 9},
 		{"server-backoff", 503, `{"error":{"code":503,"status":"UNAVAILABLE","message":"busy"}}`, "3", 3},
 		{"absent-backoff", 429, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}`, "", 0},
 		{"malformed-backoff", 503, `{"error":{"code":503,"status":"UNAVAILABLE"}}`, "not a delay", 0},
@@ -211,34 +243,39 @@ func TestClassifyGeminiSSEError(t *testing.T) {
 		body      string
 		transient bool
 		status    int
+		orig      int    // the in-band code, or the HTTP status of the canonical name when there is no code
+		code      string // terminal failures only
 	}{
-		{"invalid-argument", `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad contents"}}`, false, 400},
-		{"not-found", `{"error":{"code":404,"status":"NOT_FOUND","message":"bad model"}}`, false, 404},
-		{"numeric-400", `{"error":{"code":400}}`, false, 400},
-		{"numeric-404", `{"error":{"code":404}}`, false, 404},
-		{"invalid-argument-without-code", `{"error":{"status":"INVALID_ARGUMENT"}}`, false, 400},
-		{"not-found-without-code", `{"error":{"status":"NOT_FOUND"}}`, false, 404},
-		{"billing-without-code", `{"error":{"status":"FAILED_PRECONDITION","message":"enable billing"}}`, true, 502},
-		{"region", `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"unsupported region"}}`, true, 502},
-		{"auth-without-code", `{"error":{"status":"UNAUTHENTICATED"}}`, true, 502},
-		{"invalid-key-invalid-argument", `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key.","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID"}]}}`, true, 502},
-		{"permission-without-code", `{"error":{"status":"PERMISSION_DENIED"}}`, true, 502},
-		{"quota-without-code", `{"error":{"status":"RESOURCE_EXHAUSTED"}}`, true, 429},
-		{"internal-without-code", `{"error":{"status":"INTERNAL"}}`, true, 500},
-		{"unknown-canonical-without-code", `{"error":{"status":"UNKNOWN"}}`, true, 500},
-		{"unavailable-without-code", `{"error":{"status":"UNAVAILABLE"}}`, true, 503},
-		{"deadline-without-code", `{"error":{"status":"DEADLINE_EXCEEDED"}}`, true, 504},
-		{"aborted-without-code", `{"error":{"status":"ABORTED"}}`, true, 409},
-		{"already-exists-without-code", `{"error":{"status":"ALREADY_EXISTS"}}`, true, 409},
-		{"cancelled-without-code", `{"error":{"status":"CANCELLED"}}`, true, 502},
-		{"unimplemented-without-code", `{"error":{"status":"UNIMPLEMENTED"}}`, true, 501},
-		{"data-loss-without-code", `{"error":{"status":"DATA_LOSS"}}`, true, 500},
-		{"out-of-range-is-not-added-request-shape", `{"error":{"status":"OUT_OF_RANGE"}}`, true, 502},
-		{"unknown-native-status", `{"error":{"status":"NEW_PROVIDER_ERROR"}}`, true, 502},
-		{"normalized-native-status", `{"error":{"status":" unavailable "}}`, true, 503},
-		{"numeric-status-precedes-derived-status", `{"error":{"code":503,"status":"INVALID_ARGUMENT"}}`, true, 503},
-		{"invalid-numeric-code-uses-native-status", `{"error":{"code":-1,"status":"NOT_FOUND"}}`, false, 404},
-		{"specific-signature", `{"error":{"status":"FAILED_PRECONDITION","message":"context length exceeded"}}`, false, 400},
+		{"invalid-argument", `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad contents"}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"not-found", `{"error":{"code":404,"status":"NOT_FOUND","message":"bad model"}}`, false, 404, 404, "gemini_sse_request_shape"},
+		{"numeric-400", `{"error":{"code":400}}`, false, 400, 400, "gemini_sse_http_400"},
+		{"numeric-404", `{"error":{"code":404}}`, false, 404, 404, "gemini_sse_http_404"},
+		{"invalid-argument-without-code", `{"error":{"status":"INVALID_ARGUMENT"}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"not-found-without-code", `{"error":{"status":"NOT_FOUND"}}`, false, 404, 404, "gemini_sse_request_shape"},
+		{"billing-without-code", `{"error":{"status":"FAILED_PRECONDITION","message":"enable billing"}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"region", `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"unsupported region"}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"auth-without-code", `{"error":{"status":"UNAUTHENTICATED"}}`, false, 401, 401, "gemini_sse_request_shape"},
+		{"invalid-key-invalid-argument", `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key.","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID"}]}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"permission-without-code", `{"error":{"status":"PERMISSION_DENIED"}}`, false, 403, 403, "gemini_sse_request_shape"},
+		{"out-of-range-without-code", `{"error":{"status":"OUT_OF_RANGE"}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"quota-without-code", `{"error":{"status":"RESOURCE_EXHAUSTED"}}`, true, 429, 429, ""},
+		{"quota-per-minute", `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":` + geminiMinuteQuotaDetails + `}}`, true, 429, 429, ""},
+		{"quota-per-day", `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":` + geminiDailyQuotaDetails + `}}`, false, 429, 429, "gemini_sse_http_429"},
+		{"internal-without-code", `{"error":{"status":"INTERNAL"}}`, true, 500, 500, ""},
+		{"unknown-canonical-without-code", `{"error":{"status":"UNKNOWN"}}`, true, 500, 500, ""},
+		{"unavailable-without-code", `{"error":{"status":"UNAVAILABLE"}}`, true, 503, 503, ""},
+		{"deadline-without-code", `{"error":{"status":"DEADLINE_EXCEEDED"}}`, true, 504, 504, ""},
+		{"aborted-without-code", `{"error":{"status":"ABORTED"}}`, true, 409, 409, ""},
+		{"already-exists-without-code", `{"error":{"status":"ALREADY_EXISTS"}}`, true, 409, 409, ""},
+		{"cancelled-without-code", `{"error":{"status":"CANCELLED"}}`, false, 499, 499, "gemini_sse_http_499"},
+		{"unimplemented-without-code", `{"error":{"status":"UNIMPLEMENTED"}}`, true, 501, 501, ""},
+		{"data-loss-without-code", `{"error":{"status":"DATA_LOSS"}}`, true, 500, 500, ""},
+		{"unknown-native-status", `{"error":{"status":"NEW_PROVIDER_ERROR"}}`, true, 502, 0, ""},
+		{"normalized-native-status", `{"error":{"status":" unavailable "}}`, true, 503, 503, ""},
+		{"numeric-status-precedes-derived-status", `{"error":{"code":503,"status":"INVALID_ARGUMENT"}}`, true, 503, 503, ""},
+		{"invalid-numeric-code-uses-native-status", `{"error":{"code":-1,"status":"NOT_FOUND"}}`, false, 404, 404, "gemini_sse_request_shape"},
+		{"specific-signature", `{"error":{"status":"FAILED_PRECONDITION","message":"context length exceeded"}}`, false, 400, 400, "gemini_sse_request_shape"},
+		{"signature-without-status", `{"error":{"code":400,"message":"context length exceeded"}}`, false, 400, 400, "gemini_sse_request_shape"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,8 +283,10 @@ func TestClassifyGeminiSSEError(t *testing.T) {
 			if f == nil || f.transient != tc.transient || f.status != tc.status {
 				t.Fatalf("want transient=%v status=%d, got %+v", tc.transient, tc.status, f)
 			}
-			if f.origStatus != 0 {
-				t.Fatalf("SSE error has no raw HTTP error status: %+v", f)
+			// Logs must show the status the upstream reported, not the 502 or
+			// normalized status the failure is surfaced with.
+			if f.origStatus != tc.orig {
+				t.Fatalf("origStatus=%d, want %d: %+v", f.origStatus, tc.orig, f)
 			}
 			var envelope struct {
 				Error struct{ Message string } `json:"error"`
@@ -258,10 +297,19 @@ func TestClassifyGeminiSSEError(t *testing.T) {
 			if f.message != envelope.Error.Message {
 				t.Fatalf("native SSE message lost: %+v", f)
 			}
-			if !f.transient && f.code != "gemini_sse_request_shape" {
-				t.Fatalf("want Gemini SSE request-shape reason, got %+v", f)
+			if !f.transient && f.code != tc.code {
+				t.Fatalf("want terminal reason %q, got %+v", tc.code, f)
 			}
 		})
+	}
+}
+
+// A retried 4xx is normalized to 502 for the client; the in-band code still
+// reaches the logs through origStatus.
+func TestClassifyGeminiSSEErrorLogsRealStatusOfRetried4xx(t *testing.T) {
+	f := classifyGeminiSSEError(`{"error":{"code":400,"status":"UNAVAILABLE","message":"capacity"}}`)
+	if f == nil || !f.transient || f.status != 502 || origStatusOf(*f) != 400 {
+		t.Fatalf("want a transient 502 logged as the upstream 400, got %+v", f)
 	}
 }
 
@@ -284,12 +332,34 @@ func TestGeminiMalformedErrors(t *testing.T) {
 	}
 }
 
-func TestGeminiIncompleteHTTPErrorCannotEstablishValidationFailure(t *testing.T) {
-	for _, body := range []string{`{"error":{"code":400,`, `{"error":{"status":"INVALID_ARGUMENT","message":`, "not JSON"} {
-		f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: 400}, []byte(body))
-		if !f.transient || f.status != 502 {
-			t.Fatalf("incomplete error metadata became terminal: %+v", f)
-		}
+// A body that is not a Google envelope, or decodes as one without error.status,
+// has no Google identity to key on, so it is judged like any other route's: by
+// HTTP status, the Anthropic error type, and request-shape phrases.
+func TestGeminiNonEnvelopeBodyUsesSharedVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		http      int
+		body      string
+		transient bool
+		status    int
+		code      string
+	}{
+		{"plain-text-400", 400, "not JSON", false, 400, "http_400"},
+		{"truncated-json-400", 400, `{"error":{"code":400,`, false, 400, "http_400"},
+		{"plain-text-401", 401, "Unauthorized", false, 401, "http_401"},
+		{"request-shape-phrase", 400, "<html>prompt is too long</html>", false, 400, "request_shape"},
+		{"string-code-with-transient-type", 400, `{"error":{"type":"overloaded_error","code":"overloaded","message":"busy"}}`, true, 502, "retryable_4xx_400"},
+		{"anthropic-shaped-transient-on-401", 401, `{"error":{"type":"overloaded_error","message":"busy"}}`, true, 502, "retryable_4xx_401"},
+		{"anthropic-shaped-auth-401", 401, `{"error":{"type":"authentication_error","message":"bad key"}}`, false, 401, "http_401"},
+		{"plain-text-429", 429, "Too Many Requests", true, 429, "rate_limit"},
+		{"request-shape-phrase-on-429", 429, "not JSON: prompt is too long", false, 429, "http_429"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: tc.http}, []byte(tc.body))
+			if f.transient != tc.transient || f.status != tc.status || f.code != tc.code {
+				t.Fatalf("want transient=%v status=%d code=%s, got %+v", tc.transient, tc.status, tc.code, f)
+			}
+		})
 	}
 }
 
@@ -304,7 +374,9 @@ func TestWriteGeminiError(t *testing.T) {
 		wantCanonical string
 	}{
 		{"retry-surface", 503, "api_error", true, 7, 503, "UNAVAILABLE"},
-		{"retry-hides-rate-limit-identity", 503, "RESOURCE_EXHAUSTED", true, 3, 503, "UNAVAILABLE"},
+		{"forced-400-keeps-quota", 400, "RESOURCE_EXHAUSTED", false, 0, 400, "RESOURCE_EXHAUSTED"},
+		{"forced-400-keeps-unavailable", 400, "UNAVAILABLE", false, 0, 400, "UNAVAILABLE"},
+		{"forced-400-keeps-normalized-quota", 400, " resource_exhausted ", false, 0, 400, "RESOURCE_EXHAUSTED"},
 		{"invalid-request", 400, "invalid_request_error", false, 0, 400, "INVALID_ARGUMENT"},
 		{"native-precondition", 400, "FAILED_PRECONDITION", false, 0, 400, "FAILED_PRECONDITION"},
 		{"normalized-native-precondition", 400, " failed_precondition ", false, 0, 400, "FAILED_PRECONDITION"},
@@ -314,7 +386,9 @@ func TestWriteGeminiError(t *testing.T) {
 		{"quota", 429, "rate_limit_error", false, 0, 429, "RESOURCE_EXHAUSTED"},
 		{"internal", 500, "api_error", false, 0, 500, "INTERNAL"},
 		{"deadline", 504, "timeout_error", false, 0, 504, "DEADLINE_EXCEEDED"},
-		{"native-status-must-agree-with-http", 404, "INVALID_ARGUMENT", false, 0, 404, "NOT_FOUND"},
+		{"canonical-status-survives-http-mismatch", 404, "INVALID_ARGUMENT", false, 0, 404, "INVALID_ARGUMENT"},
+		{"non-canonical-status-derived", 404, "NEW_PROVIDER_ERROR", false, 0, 404, "NOT_FOUND"},
+		{"ok-is-not-an-error-status", 503, "OK", false, 0, 503, "UNAVAILABLE"},
 		{"default-status", 0, "api_error", false, 0, 502, "UNKNOWN"},
 	}
 	message := "steady-proxy: quoted \"failure\"\nwith detail"

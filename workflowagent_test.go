@@ -246,6 +246,43 @@ func TestWindowGateOpensOnToolBlockStop(t *testing.T) {
 	}
 }
 
+// TestWindowGateTruncatedToolBlockDeliveredLive covers a max_tokens-truncated tool
+// input behind the gate: the block stop still counts as progress (the gate opens
+// and the stream commits live), but the invalid input's frames are held until the
+// next event proves max_tokens cut it. They must then reach the client in order.
+func TestWindowGateTruncatedToolBlockDeliveredLive(t *testing.T) {
+	useDefaultConfig(t)
+	cfg.upstreamByteIdle = 5 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r := &gapReader{ctx: ctx, chunks: []string{
+		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\"}}\n\n",
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"cut o\"}}\n\n",
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}, gap: 40 * time.Millisecond}
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
+
+	if f != nil || !wrote {
+		t.Fatalf("a max_tokens-truncated tool input must be delivered, wrote=%v failure=%+v", wrote, f)
+	}
+	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
+		t.Fatalf("the completed tool block after grace should commit live, got %q", mode)
+	}
+	body := rec.Body.String()
+	if deltas := inputJSONDeltas(t, body); len(deltas) != 1 || deltas[0] != `{"q":"cut o` {
+		t.Fatalf("want the upstream's partial input as one delta, got %#v", deltas)
+	}
+	const want = "message_start content_block_start content_block_delta content_block_stop message_delta message_stop"
+	if got := strings.Join(eventNames(body), " "); got != want {
+		t.Fatalf("event order:\n got: %s\nwant: %s", got, want)
+	}
+}
+
 // dataThenEOFReader returns `first` on the first read, then (after `delay`) the
 // `second` chunk together with io.EOF in a single read — exercising the standard
 // io contract where a Reader may return n>0 with a terminal error in one call.
