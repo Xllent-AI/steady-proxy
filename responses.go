@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -20,17 +21,26 @@ import (
 //	event: response.output_text.delta
 //	data: {"type":"response.output_text.delta", ...}
 //
-// A stream is complete at `response.completed`. `response.incomplete` (a token-capped
-// / content-filtered stop) is NOT a completion: Codex raises a retryable stream error
-// on it, so the proxy converts it to a retry too. Failures arrive either as a
-// top-level `error` event or as a terminal `response.failed` carrying
-// `response.error{code,message}` — Codex treats both as fatal and does NOT retry
-// them, which is the failure this proxy exists to absorb. Unlike the Anthropic wire there is no tool-input-JSON
-// coalescing to do (Codex accumulates argument deltas itself) and no refusal
-// fallback (it targets GPT models), so the model just tracks completion, catches
-// in-band errors, scrapes usage, and forwards raw bytes.
+// A stream ends at one of two terminals, and the proxy delivers either verbatim:
+// `response.completed`, or `response.incomplete` (a token-capped / content-filtered
+// stop). The OpenAI API defines incomplete as a legitimate end of the turn and Codex
+// >= 0.163 treats it as terminal (openai/codex PR #53451, issue #38831); older Codex
+// retries it on its own, so a proxy retry would only repeat that and re-bill the
+// generation. A terminal snapshot that Codex's ResponseCompleted parse would reject
+// (a response.completed, or an incomplete with reason "interrupted", which Codex
+// parses as a completion) fails at that event as responses_invalid_completed.
+//
+// Failures arrive either as a top-level `error` event or as a terminal
+// `response.failed` carrying `response.error{code,message}` — Codex treats both as
+// fatal and does NOT retry them, which is the failure this proxy exists to absorb. A
+// transient one is retried before commit and DROPped after it; a terminal one is
+// surfaced before commit and delivered in-stream after it.
+//
+// Unlike the Anthropic wire there is no tool-input-JSON coalescing to do (Codex
+// accumulates argument deltas itself) and no refusal fallback (it targets GPT
+// models), so the model just tracks content, catches in-band errors, scrapes usage,
+// and forwards raw bytes.
 type openaiWire struct {
-	sawCompleted     bool // a valid response.completed seen -> deliverable (incomplete is a retry, not this)
 	sawContent       bool // a real output/reasoning/tool event seen -> early commit OK
 	replayDeltaBytes int  // buffered/prefix replay coalescing target; 0 preserves raw frames
 }
@@ -45,7 +55,8 @@ func (o *openaiWire) scrape(ev event, st *captureStats) {
 	if st == nil {
 		return
 	}
-	switch responsesEventType(ev) {
+	typ := responsesEventType(ev)
+	switch typ {
 	case "response.created", "response.in_progress":
 		var m struct {
 			Response struct {
@@ -67,6 +78,9 @@ func (o *openaiWire) scrape(ev event, st *captureStats) {
 						Cached int `json:"cached_tokens"`
 					} `json:"input_tokens_details"`
 				} `json:"usage"`
+				IncompleteDetails struct {
+					Reason string `json:"reason"`
+				} `json:"incomplete_details"`
 			} `json:"response"`
 		}
 		if json.Unmarshal([]byte(ev.data), &m) != nil {
@@ -77,6 +91,14 @@ func (o *openaiWire) scrape(ev event, st *captureStats) {
 		}
 		if m.Response.Status != "" {
 			st.stop = m.Response.Status
+		}
+		if typ == "response.incomplete" {
+			// The reason (max_output_tokens / content_filter / …) is what tells an
+			// operator why the turn ended short, so it rides along in the stop field.
+			st.stop = "incomplete"
+			if r := m.Response.IncompleteDetails.Reason; r != "" {
+				st.stop += ":" + r
+			}
 		}
 		if in := m.Response.Usage.Input; in > 0 {
 			// input_tokens is the TOTAL input incl. the cached portion; split it so
@@ -97,23 +119,27 @@ func (o *openaiWire) scrape(ev event, st *captureStats) {
 
 func (o *openaiWire) buffered(ev event, st *captureStats) (bool, *failure) {
 	t := responsesEventType(ev)
-	// Terminal error frames are inspected even with JSON validation off — deciding
-	// what happens to them is the whole point of this route.
-	if isResponsesErrorFrame(t) {
-		if fail := o.dispositionError(ev, t); fail != nil {
+	switch {
+	case isResponsesErrorFrame(t):
+		// Terminal error frames are inspected even with JSON validation off — deciding
+		// what happens to them is the whole point of this route.
+		fail, native := classifyResponsesFrame(ev, t)
+		if !native {
 			return false, fail // convert to a retry / surface non-retryable
 		}
 		// deliver-native: this terminal error (e.g. context-window) is one Codex
 		// recovers from itself, so the buffered stream — including this frame — is
 		// handed over byte-for-byte instead of being converted.
-		o.sawCompleted = true
 		return true, nil
-	}
-	if t == "response.incomplete" {
-		// Codex has an explicit response.incomplete arm that raises a RETRYABLE stream
-		// error (ApiError::Stream) — it is NOT a completion. Convert it so the proxy
-		// never records success: pre-commit this becomes a retry.
-		return false, responsesIncompleteFailure(ev)
+	case t == "response.completed" || t == "response.incomplete":
+		// Fail HERE, under its own code, instead of leaving the stream unterminated for
+		// EOF to report as truncated_stream: the stream did terminate, and the log must
+		// name the malformed terminal. Pre-commit this becomes a retry. A valid
+		// incomplete is a legitimate terminal (see the file header), delivered verbatim.
+		if !responsesTerminalValid(ev, t) {
+			return false, responsesInvalidCompleted()
+		}
+		return true, nil
 	}
 	// No per-frame content validation: Codex's Responses parser is lenient — it
 	// tolerates missing/null fields (Option<_>) and skips any frame it cannot
@@ -123,33 +149,47 @@ func (o *openaiWire) buffered(ev event, st *captureStats) (bool, *failure) {
 	// diverge from Codex (needlessly converting a stream Codex would accept). The
 	// transactional guarantee is at the STREAM level: only a parseable terminal
 	// completes it, and a truncated/erroring stream converts to a retry.
-	o.advance(ev, t)
-	if o.sawCompleted {
-		return true, nil
+	//
+	// Only real model output makes the stream forwardable. Every other frame
+	// (response.created / in_progress / queued / metadata / unknown) deliberately is
+	// not: committing on it would push a start-of-stream error past the commit
+	// boundary and forfeit the hidden local-retry protection this route exists for.
+	if isResponsesOutputEvent(t) {
+		o.sawContent = true
 	}
 	return false, nil
 }
 
 func (o *openaiWire) live(ev event, raw []byte, st *captureStats) ([][]byte, bool, *failure) {
 	t := responsesEventType(ev)
-	if isResponsesErrorFrame(t) {
-		if fail := o.dispositionError(ev, t); fail != nil {
-			return nil, false, fail // post-commit -> caller DROPs the stream
+	switch {
+	case isResponsesErrorFrame(t):
+		fail, native := classifyResponsesFrame(ev, t)
+		if fail.transient && !native {
+			// The fault may clear on a re-send, but the response is already streaming:
+			// DROP so the client's own stream retry re-issues the request.
+			return nil, false, fail
 		}
-		// deliver-native terminal error: forward it verbatim and end.
-		o.sawCompleted = true
+		// A terminal verdict is the upstream's final answer and an identical re-send
+		// fails the same way, so a DROP would only send the client into a retry loop.
+		// Forward the upstream's own frame — Codex maps cyber_policy, invalid_prompt,
+		// insufficient_quota, context_length_exceeded … to its fatal errors itself —
+		// and mark it delivered so the stream ends cleanly.
+		fail.delivered = true
+		return [][]byte{raw}, true, fail
+	case t == "response.completed" || t == "response.incomplete":
+		if !responsesTerminalValid(ev, t) {
+			// Forward the frame — it is what the upstream sent, and the client applies
+			// its own parse exactly as on a direct connection — but do not count it as
+			// a completion: fail at this event so the handler DROPs (delivered=false)
+			// rather than logging a clean success.
+			return [][]byte{raw}, false, responsesInvalidCompleted()
+		}
 		return [][]byte{raw}, true, nil
-	}
-	if t == "response.incomplete" {
-		// Post-commit: Codex would raise a retryable stream error on this terminal, so
-		// DROP (truncate) rather than forward it as a clean completion; Codex's native
-		// stream-retry then re-issues.
-		return nil, false, responsesIncompleteFailure(ev)
 	}
 	// Forward verbatim (see buffered): Codex owns its own lenient per-frame parse, so
 	// the proxy does not second-guess content frames on the live path either.
-	o.advance(ev, t)
-	return [][]byte{raw}, o.sawCompleted, nil
+	return [][]byte{raw}, false, nil
 }
 
 func (o *openaiWire) replayBuffered(sp *spool, w io.Writer, st *captureStats) error {
@@ -684,36 +724,15 @@ func (o *openaiWire) keepalive() []byte {
 	return []byte("event: response.proxy_keepalive\ndata: {\"type\":\"response.proxy_keepalive\"}\n\n")
 }
 
-// advance updates completion/content state from one NON-error event.
-func (o *openaiWire) advance(ev event, t string) {
-	switch {
-	case t == "response.completed":
-		// Codex only counts this terminal if its `response` deserializes as
-		// ResponseCompleted (see responsesCompletedValid). A completed Codex would
-		// reject does NOT terminate the buffered stream, so it stays un-committed and
-		// EOF converts it to a truncated_stream retry (which may fetch a clean terminal),
-		// exactly as Codex would fail-and-retry rather than silently succeed.
-		if responsesCompletedValid(ev) {
-			o.sawCompleted = true
-		}
-	case isResponsesOutputEvent(t):
-		// real model output -> an early commit can start streaming live.
-		o.sawContent = true
-	}
-	// Everything else (response.created / in_progress / queued / metadata / any
-	// other lifecycle or unknown frame) is deliberately NOT treated as forwardable
-	// content: committing on it would push a start-of-stream error past the commit
-	// boundary and forfeit the hidden local-retry protection this route exists for.
-}
-
 // responsesCompletedValid mirrors Codex's ResponseCompleted deserialize (codex-rs
 // codex-api/src/sse/responses.rs): the terminal counts ONLY if `response` is present
 // with a non-empty string `id`, AND — when a `usage` object is present — that object
 // carries integer `input_tokens`, `output_tokens`, and `total_tokens` (the required
 // i64 fields; the *_details sub-objects are optional). A missing/non-string id, or a
 // present-but-incomplete usage, is a frame Codex would reject as a stream error, so
-// the proxy must not record it as success. `usage` absent or null is fine (Codex's
-// field is `#[serde(default)] Option`).
+// the proxy must not record it as success: the caller fails the stream at that event
+// (responsesInvalidCompleted). `usage` absent or null is fine (Codex's field is
+// `#[serde(default)] Option`).
 //
 // One deliberate stricter-than-Codex check: an EMPTY id ("") is rejected even though
 // Codex's `id: String` would deserialize it. The invariant is that a stream replayed
@@ -766,30 +785,34 @@ func responsesCompletedValid(ev event) bool {
 	return true
 }
 
-// responsesIncompleteFailure converts a response.incomplete terminal into a
-// retryable failure, matching how Codex classifies it: its response.incomplete arm
-// raises ApiError::Stream (a retryable stream error), NOT a completion. Keyed as
-// transient so a pre-commit incomplete rides out as a retry and a post-commit one
-// DROPs — never logged as a clean success.
-func responsesIncompleteFailure(ev event) *failure {
-	return &failure{transient: true, status: 502, atype: "api_error", code: "responses_incomplete",
-		message: "incomplete response returned, reason: " + responsesIncompleteReason(ev)}
+// responsesTerminalValid applies Codex's terminal parse. Codex reads an
+// incomplete snapshot as a ResponseCompleted only for reason "interrupted"
+// (ending the turn without end_turn); every other reason is its terminal
+// ResponseIncomplete, built without that parse.
+func responsesTerminalValid(ev event, t string) bool {
+	if t == "response.incomplete" {
+		var m struct {
+			Response struct {
+				IncompleteDetails struct {
+					Reason string `json:"reason"`
+				} `json:"incomplete_details"`
+			} `json:"response"`
+		}
+		if json.Unmarshal([]byte(ev.data), &m) != nil || m.Response.IncompleteDetails.Reason != "interrupted" {
+			return true
+		}
+	}
+	return responsesCompletedValid(ev)
 }
 
-// responsesIncompleteReason best-effort extracts response.incomplete_details.reason
-// (max_output_tokens / content_filter / …) for the log; "unknown" if absent.
-func responsesIncompleteReason(ev event) string {
-	var m struct {
-		Response struct {
-			IncompleteDetails struct {
-				Reason string `json:"reason"`
-			} `json:"incomplete_details"`
-		} `json:"response"`
-	}
-	if json.Unmarshal([]byte(ev.data), &m) == nil && m.Response.IncompleteDetails.Reason != "" {
-		return m.Response.IncompleteDetails.Reason
-	}
-	return "unknown"
+// responsesInvalidCompleted is the failure for a terminal snapshot Codex's
+// ResponseCompleted parse would reject (see responsesTerminalValid). It is raised at
+// that frame under its own code: the stream did terminate, so waiting for EOF would
+// misreport it as truncated_stream. Transient, because a re-send may fetch a clean
+// terminal and it cannot loop a legitimate stream, which never emits one.
+func responsesInvalidCompleted() *failure {
+	return &failure{transient: true, status: 502, atype: "api_error", code: "responses_invalid_completed",
+		message: "upstream terminal response snapshot is malformed (needs a response id and complete integer usage)"}
 }
 
 // isResponsesErrorFrame reports whether an event type is a terminal error frame:
@@ -824,13 +847,18 @@ func isResponsesOutputEvent(t string) bool {
 	return false
 }
 
-// dispositionError decides what to do with a terminal error frame:
+// classifyResponsesFrame classifies a terminal error frame and reports whether Codex
+// recovers from it natively:
 //
-//	fail != nil -> convert (retry / surface non-retryable); the frame is NOT
-//	               forwarded to Codex.
-//	fail == nil -> deliver the native frame to Codex, which recovers from it on
-//	               its own (context-window exhaustion drives Codex's compaction path;
-//	               converting it to a synthetic error would hide it from that handler).
+//	native == true  -> the buffered path hands the frame to Codex untouched: Codex
+//	                   recovers on its own (context-window exhaustion drives Codex's
+//	                   compaction path; converting it to a synthetic error would hide
+//	                   it from that handler).
+//	native == false -> the buffered path converts it: a transient fault becomes a
+//	                   retry, a terminal one is surfaced; the frame is NOT forwarded.
+//
+// Live mode cannot convert (headers are already sent): it forwards a terminal
+// verdict's own frame (fail.delivered) and DROPs a transient one.
 //
 // Native delivery is gated on the frame being a `response.failed`: Codex's
 // context-compaction (is_context_window_error) lives ONLY in its response.failed
@@ -838,12 +866,9 @@ func isResponsesOutputEvent(t string) bool {
 // ignored, then the stream fails EOF-before-completion), so forwarding one natively
 // would yield a generic retry, never compaction — such an error is classified and
 // converted instead (a context error there surfaces as a deterministic 400).
-func (o *openaiWire) dispositionError(ev event, t string) *failure {
+func classifyResponsesFrame(ev event, t string) (fail *failure, native bool) {
 	typ, code, msg := parseResponsesError(ev, t)
-	if t == "response.failed" && isCodexRecoverableError(code) {
-		return nil
-	}
-	return classifyResponsesError(typ, code, msg)
+	return classifyResponsesError(typ, code, msg), t == "response.failed" && isCodexRecoverableError(code)
 }
 
 // parseResponsesError extracts (type, code, message) from either terminal error
@@ -912,48 +937,167 @@ func responsesEventType(ev event) string {
 	return ""
 }
 
-// classifyResponsesError maps an OpenAI Responses error (type/code/message) to a
-// failure. Same principle as the Anthropic path: ride out everything transient
-// (overload, rate limit, capacity, auth, api errors) and surface ONLY a
-// deterministic request-shape error, which can never succeed as written.
-func classifyResponsesError(errType, errCode, message string) *failure {
-	t := strings.ToLower(strings.TrimSpace(errType))
-	c := strings.ToLower(strings.TrimSpace(errCode))
-	msg := strings.ToLower(message)
-	// A specific, recognized code owns the classification. Gateways sometimes
-	// attach a generic invalid_request_error type to capacity and timeout faults.
+// responsesFault is the retry-relevant identity of an OpenAI error, read once by
+// responsesFaultOf. The in-band classifier and the HTTP body rule both consume it, so
+// one error cannot be "retry" on one path and "terminal" on the other.
+type responsesFault int
+
+const (
+	// No explicit identity: server_error, api_error, unrecognized types.
+	faultUnknown responsesFault = iota
+	faultTimeout
+	faultRateLimit
+	faultOverloaded
+	// The request itself can never succeed as written.
+	faultRequestShape
+	// Exhausted quota or plan limit: waiting does not refill it.
+	faultQuota
+	// The caller was refused: authentication_error, permission_error, not_found_error.
+	faultRejected
+)
+
+// responsesRequestTooLarge anchors OpenAI's per-request TPM overflow ("Request too
+// large for … on tokens per min (TPM): Limit 30000, Requested 35000. The input or
+// output tokens must be reduced in order to run successfully."). It arrives as a 429
+// with the transient code rate_limit_exceeded, yet no wait shrinks the request.
+const responsesRequestTooLarge = "must be reduced in order to run successfully"
+
+// responsesFaultOf reads the identity of an OpenAI error from its normalized
+// (lowercased, trimmed) type and code and its lowercased message.
+func responsesFaultOf(t, c, msg string) responsesFault {
+	// A specific, recognized code owns the classification: gateways attach a generic
+	// invalid_request_error type to capacity and timeout faults, and a
+	// rate_limit_error type to exhausted quota.
 	switch {
-	case isResponsesRequestShapeCode(c):
-		t = "invalid_request_error"
+	case isResponsesQuotaIdentity(t), isResponsesQuotaIdentity(c):
+		return faultQuota
+	case strings.Contains(msg, responsesRequestTooLarge), isResponsesRequestShapeCode(c):
+		return faultRequestShape
 	case c == "request_timeout":
-		t = "timeout_error"
+		return faultTimeout
 	case c == "rate_limit_exceeded":
-		t = "rate_limit_error"
-	case c == "server_is_overloaded" || c == "overloaded":
-		t = "overloaded_error"
+		return faultRateLimit
+	case c == "server_is_overloaded", c == "overloaded":
+		return faultOverloaded
 	}
-	switch {
-	case t == "timeout_error":
+	switch t {
+	case "timeout_error":
+		return faultTimeout
+	case "rate_limit_error":
+		return faultRateLimit
+	case "overloaded_error", "service_unavailable_error":
+		return faultOverloaded
+	case "invalid_request_error":
+		return faultRequestShape
+	case "":
+		// The Anthropic-derived phrases are evidence only when the upstream named no
+		// type. An explicit server/transient type (server_error "unexpected value
+		// returned by backend provider") is a backend fault that the next attempt may
+		// not repeat, so a phrase must not turn it terminal.
+		if anyContains(msg, requestShapeSigs) {
+			return faultRequestShape
+		}
+	default:
+		if responsesRejectedStatus(t) != 0 {
+			return faultRejected
+		}
+	}
+	return faultUnknown
+}
+
+// responsesIdent normalizes an error type or code for comparison.
+func responsesIdent(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// isResponsesQuotaIdentity reports whether an error type or code names an exhausted
+// quota or plan limit, which a retry cannot refill.
+func isResponsesQuotaIdentity(s string) bool {
+	switch s {
+	case "insufficient_quota",
+		// Codex ChatGPT-plan limits: the allowance is spent (or never included Codex)
+		// until the plan resets.
+		"usage_limit_reached", "usage_not_included":
+		return true
+	}
+	return false
+}
+
+// responsesRejectedStatus maps the OpenAI error types that say the caller itself was
+// refused to their HTTP status, or 0 for any other type. Over HTTP the status already
+// makes these final; in-band there is no status, so the type has to say it.
+func responsesRejectedStatus(t string) int {
+	switch t {
+	case "authentication_error":
+		return http.StatusUnauthorized
+	case "permission_error":
+		return http.StatusForbidden
+	case "not_found_error":
+		return http.StatusNotFound
+	}
+	return 0
+}
+
+// classifyResponsesError maps an OpenAI Responses error (type/code/message) to a
+// failure. Same principle as the Anthropic path: ride out everything that may clear
+// (overload, rate limit, timeout, and every error naming no identity) and surface
+// what an identical re-send cannot fix: a request-shape error, exhausted quota, and
+// a refused caller (authentication / permission / not found), which is as final
+// in-band as its HTTP status is over HTTP.
+func classifyResponsesError(errType, errCode, message string) *failure {
+	t, c := responsesIdent(errType), responsesIdent(errCode)
+	switch responsesFaultOf(t, c, strings.ToLower(message)) {
+	case faultTimeout:
 		return &failure{transient: true, status: 504, atype: "timeout_error", code: "responses_timeout", message: message}
-	case t == "rate_limit_error":
+	case faultRateLimit:
 		// The advertised delay is commonly only in the message ("Please try again
 		// in 11.054s"). Preserve it so both hidden local retries and the surfaced
 		// 503 wait the real amount instead of the proxy's short fallback backoff.
 		return &failure{transient: true, status: 429, atype: "rate_limit_error", code: "responses_rate_limit", message: message, retryAfter: parseRetryAfterFromMessage(message)}
-	case t == "overloaded_error" || t == "service_unavailable_error":
+	case faultOverloaded:
 		return &failure{transient: true, status: 529, atype: "overloaded_error", code: "responses_overloaded", message: message}
-	case t == "invalid_request_error" || anyContains(msg, requestShapeSigs):
-		return &failure{transient: false, status: 400, atype: "invalid_request_error", code: "responses_request_shape", message: message}
-	default:
-		// api_error, server_error, timeout, authentication, permission, not_found,
-		// unknown -> transient: a temporary block is ridden out, not surfaced.
-		return &failure{transient: true, status: 502, atype: "api_error", code: "responses_error", message: message}
+	case faultQuota:
+		// Keep the quota identity as the type and a 429 as the status: surfaceFor
+		// keeps 429, which Codex treats as terminal and words as a usage limit.
+		qtype := t
+		if !isResponsesQuotaIdentity(qtype) {
+			qtype = c
+		}
+		return &failure{status: http.StatusTooManyRequests, atype: qtype, code: "responses_quota", message: message}
+	case faultRequestShape:
+		return &failure{status: http.StatusBadRequest, atype: "invalid_request_error", code: "responses_request_shape", message: message}
+	case faultRejected:
+		return &failure{status: responsesRejectedStatus(t), atype: t, code: "responses_" + t, message: message}
 	}
+	// api_error, server_error and unknown types carry no evidence either way: a
+	// temporary block is ridden out, not surfaced.
+	return &failure{transient: true, status: 502, atype: "api_error", code: "responses_error", message: message}
 }
 
-// retryAfterMsgRe extracts an advertised delay from a rate-limit message such as
-// "Please try again in 11.054s" / "try again in 500ms" / "try again in 2m".
-var retryAfterMsgRe = regexp.MustCompile(`(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s|m)`)
+// retryAfterMsgRe finds the advertised delay in a rate-limit message: one or more
+// number+unit terms after "try again in". retryAfterTermRe splits them. Both compact
+// Go durations ("11.054s", "500ms", "1m30s", "1h2m") and spelled-out ones ("2
+// milliseconds", "6 seconds") occur.
+var (
+	retryAfterMsgRe  = regexp.MustCompile(`(?i)try again in\s+((?:[0-9]+(?:\.[0-9]+)?\s*[a-z]+\s*)+)`)
+	retryAfterTermRe = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)`)
+)
+
+// retryAfterUnitSeconds returns the length in seconds of a duration unit, or 0 for
+// anything else. Units match whole words, so "milliseconds" is never read as "m".
+func retryAfterUnitSeconds(unit string) float64 {
+	switch strings.ToLower(unit) {
+	case "ms", "millisecond", "milliseconds":
+		return 0.001
+	case "s", "sec", "secs", "second", "seconds":
+		return 1
+	case "m", "min", "mins", "minute", "minutes":
+		return 60
+	case "h", "hour", "hours":
+		return 3600
+	}
+	return 0
+}
 
 // parseRetryAfterFromMessage returns the advertised retry delay in whole seconds
 // (rounded up, min 1), or 0 when the message carries none.
@@ -962,24 +1106,24 @@ func parseRetryAfterFromMessage(message string) int {
 	if m == nil {
 		return 0
 	}
-	val, err := strconv.ParseFloat(m[1], 64)
-	if err != nil || val <= 0 {
+	var total float64
+	for _, term := range retryAfterTermRe.FindAllStringSubmatch(m[1], -1) {
+		unit := retryAfterUnitSeconds(term[2])
+		val, err := strconv.ParseFloat(term[1], 64)
+		if unit == 0 || err != nil {
+			break // keep what parsed cleanly; an unknown unit vouches for nothing after it
+		}
+		total += val * unit
+	}
+	if total <= 0 {
 		return 0
 	}
-	switch strings.ToLower(m[2]) {
-	case "ms":
-		val /= 1000
-	case "m":
-		val *= 60
+	if total >= math.MaxInt32 {
+		return math.MaxInt32
 	}
-	secs := int(val)
-	if float64(secs) < val { // round up any fractional second
-		secs++
-	}
-	if secs < 1 {
-		secs = 1
-	}
-	return secs
+	// The epsilon absorbs float noise (2000 * 0.001 is not exactly 2) so a whole
+	// number of seconds is not rounded up to the next one.
+	return max(1, int(math.Ceil(total-1e-9)))
 }
 
 // isResponsesRequestShapeCode reports whether an OpenAI error `code` names a
@@ -1002,13 +1146,14 @@ func isResponsesRequestShapeCode(code string) bool {
 }
 
 // classifyResponsesHTTPErrorBytes classifies a pre-SSE HTTP error for the OpenAI
-// Responses route. It shares the status/header handling with the Anthropic path
-// but routes the 4xx request-shape decision through classifyResponsesError, so
-// there is a SINGLE OpenAI error brain (keyed on type+code+message) for both
-// in-band SSE errors and HTTP-level errors — an OpenAI request-shape can never
-// slip through as "retry forever" on one path but not the other.
+// Responses route. The shared classifier owns the status rule (408/409/429/5xx are
+// transient, every other 4xx is the upstream's final answer); responsesErrorVerdict
+// refines it only where the body names an explicit identity. Both it and the in-band
+// classifier read that identity through responsesFaultOf, so there is a SINGLE
+// OpenAI error brain (keyed on type+code+message) for in-band SSE errors and
+// HTTP-level errors alike.
 func classifyResponsesHTTPErrorBytes(resp *http.Response, b []byte) failure {
-	f := classifyHTTPErrorBytesShaped(resp, b, responsesRequestShaped)
+	f := classifyHTTPErrorBytesShaped(resp, b, responsesErrorVerdict)
 	// The advertised backoff for an OpenAI rate limit is commonly only in the error
 	// message ("Please try again in 11.054s"), not a Retry-After header. The shared
 	// classifier's status branches (429/5xx) read only the header, so parse the
@@ -1024,8 +1169,24 @@ func classifyResponsesHTTPErrorBytes(resp *http.Response, b []byte) failure {
 	return f
 }
 
-func responsesRequestShaped(atype, code, msg, _ string) bool {
-	return !classifyResponsesError(atype, code, msg).transient
+// responsesErrorVerdict is the Responses wire's HTTP errorBodyRule. The status owns
+// the retry decision, so the body speaks only for an explicit identity:
+//
+//   - a timeout / rate-limit / overload type or code is transient, even on a 4xx
+//     (gateways attach 400 to a dropped stream or a capacity fault);
+//   - a request-shape code or type, or an exhausted quota or plan limit, is
+//     permanent, which also keeps a 429 from being retried;
+//   - anything else — authentication, permission, not_found, server_error,
+//     api_error, a flat body such as vLLM's — names no retry-relevant identity: a 4xx
+//     stays terminal and a 5xx transient, by status alone.
+func responsesErrorVerdict(atype, code, msg, _ string) errorVerdict {
+	switch responsesFaultOf(responsesIdent(atype), responsesIdent(code), strings.ToLower(msg)) {
+	case faultTimeout, faultRateLimit, faultOverloaded:
+		return verdictTransient
+	case faultRequestShape, faultQuota:
+		return verdictPermanent
+	}
+	return verdictUnknown
 }
 
 // classifyHTTPErrorForPath applies read failures before body heuristics, retaining

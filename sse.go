@@ -246,6 +246,7 @@ type captureStats struct {
 	stop                  string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
 	model                 string    // resolved model echoed back by the upstream
 	respTee               io.Writer // optional: when set, every raw response event is teed here (request-log)
+	heldRefusal           *spool    // complete buffered refusal handed to the caller on the refusal sentinel; the caller must discard it
 }
 
 // ------------------------------------------------------------- captureSSE ---
@@ -302,7 +303,11 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 // caught pre-commit and converted to a retry.
 func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, earlyCommit bool, model wireModel, commitBy time.Time) (bool, *failure) {
 	sp := newSpool()
-	defer sp.discard()
+	defer func() {
+		if st == nil || st.heldRefusal != sp {
+			sp.discard()
+		}
+	}()
 	parser := &sseParser{maxEventBytes: max(cfg.maxResponseBytes, 1)}
 	committed := false
 	headerWritten := false
@@ -316,15 +321,7 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 		if headerWritten {
 			return
 		}
-		for k, v := range safeResponseHeaders(upstreamHdr) {
-			w.Header()[k] = v
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("X-Steady-Proxy-Mode", mode)
-		if st != nil {
-			st.mode = mode
-		}
-		w.WriteHeader(http.StatusOK)
+		writeStreamHead(w, upstreamHdr, mode, st)
 		headerWritten = true
 	}
 
@@ -501,15 +498,17 @@ func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.
 		if *committed {
 			// Live mode: headers are already sent, so we can't convert to a
 			// retryable status — but never forward the raw special identity
-			// (overloaded_error / response.failed). model.live ends the stream as a
-			// DROP on an in-band error so the client's native truncated-stream retry
-			// takes over, and the access log keeps the true cause.
+			// (overloaded_error / response.failed) of a transient fault. model.live
+			// ends the stream on an in-band error; it returns the frames the client
+			// should still receive (e.g. a terminal error frame, with
+			// fail.delivered) alongside the failure.
 			out, done, fail := model.live(ev, ev.raw, st)
-			if fail != nil {
-				return true, fail, true
-			}
 			for _, p := range out {
 				w.Write(p)
+			}
+			if fail != nil {
+				flush()
+				return true, fail, true
 			}
 			if len(out) == 0 {
 				w.Write(model.keepalive())
@@ -523,9 +522,18 @@ func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.
 		// uncommitted: validate + advance without touching the spool, then buffer.
 		done, fail := model.buffered(ev, st)
 		if fail != nil {
-			// In-band error, malformed/out-of-order event, or the refusal sentinel:
-			// nothing is downstream yet, so discard and let the caller convert to a
-			// retry (or, for the sentinel, swap in the fallback model).
+			if fail.code == refusalFallbackCode {
+				// A complete refusal: keep it (terminal event included) so the
+				// caller can deliver it if the fallback model cannot answer.
+				if err := sp.write(ev.raw); err != nil {
+					sp.discard()
+					return false, classifyBufferError(err), true
+				}
+				st.heldRefusal = sp
+				return false, fail, true
+			}
+			// In-band error or malformed/out-of-order event: nothing is downstream
+			// yet, so discard and let the caller convert to a retry.
 			sp.discard()
 			return false, fail, true
 		}
@@ -553,8 +561,28 @@ func replayCaptured(sp *spool, model wireModel, w io.Writer, st *captureStats, w
 	return nil
 }
 
+// writeStreamHead commits a 200 SSE response carrying the upstream's safe headers.
+func writeStreamHead(w http.ResponseWriter, upstreamHdr http.Header, mode string, st *captureStats) {
+	for k, v := range safeResponseHeaders(upstreamHdr) {
+		w.Header()[k] = v
+	}
+	// The stream is parsed and re-framed as plain SSE text, never relayed as an
+	// encoded body.
+	w.Header().Del("Content-Encoding")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Steady-Proxy-Mode", mode)
+	if st != nil {
+		st.mode = mode
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func validateSSEEventShape(ev event) *failure {
 	switch {
+	case ev.name == "ping" && ev.data == "":
+		// The Anthropic SDK skips a ping before it reads data, so a bare
+		// `event: ping` is a valid keepalive. Every other named event needs data.
+		return nil
 	case ev.name != "" && ev.data == "":
 		return malformedSSE("stream event missing JSON data")
 	case ev.name == "" && ev.data != "":
@@ -569,8 +597,15 @@ func validateSSEEventShape(ev event) *failure {
 // tool/server-tool input_json_delta fragments form invalid JSON. Claude Code reports
 // that downstream as "JSON Parse error: Unexpected EOF"; in transactional mode
 // we can classify it before committing bytes.
+//
+// The one excused case is a max_tokens stop: the token cap cut the input
+// mid-JSON, and a retry regenerates the same truncation and bills it again, so
+// that stream is the upstream's final answer. stop_reason only arrives in the
+// message_delta after the block stop, so the verdict waits for the event that
+// follows an invalid block (see judgeTruncatedToolInput).
 type toolJSONValidator struct {
-	blocks map[int]*toolJSONBlock
+	blocks    map[int]*toolJSONBlock
+	truncated bool // a tool block closed with invalid input; the next event decides
 }
 
 type toolJSONBlock struct {
@@ -587,6 +622,16 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 	if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
 		return malformedSSE("invalid JSON in stream event")
 	}
+	if v.truncated {
+		switch judgeTruncatedToolInput(ev, &p) {
+		case truncWait:
+		case truncExcused:
+			v.truncated = false
+		default:
+			return malformedSSE(invalidToolInputMessage)
+		}
+		return nil
+	}
 	switch p.Type {
 	case "content_block_start":
 		if blockUsesInputJSON(p.ContentBlock.Type) {
@@ -594,7 +639,7 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 				v.blocks = map[int]*toolJSONBlock{}
 			}
 			if len(p.ContentBlock.Input) > 0 && !json.Valid(p.ContentBlock.Input) {
-				return malformedSSE("invalid tool input JSON in stream event")
+				return malformedSSE(invalidToolInputMessage)
 			}
 			v.blocks[p.Index] = &toolJSONBlock{jsonInput: true}
 		}
@@ -618,7 +663,7 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 		b := v.blocks[p.Index]
 		if b != nil {
 			if b.jsonInput && b.sawInputDelta && b.input.Len() > 0 && !validJSONObject(b.input.Bytes()) {
-				return malformedSSE("invalid tool input JSON in stream event")
+				v.truncated = true
 			}
 			delete(v.blocks, p.Index)
 		}
@@ -628,6 +673,33 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 
 func malformedSSE(message string) *failure {
 	return &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: message}
+}
+
+// invalidToolInputMessage is the failure text for tool input that is not JSON.
+const invalidToolInputMessage = "invalid tool input JSON in stream event"
+
+// truncVerdict is the outcome for the event that follows a tool block whose
+// accumulated input is not valid JSON.
+type truncVerdict int
+
+const (
+	truncReject  truncVerdict = iota // not excused: a malformed stream
+	truncWait                        // ping: says nothing, keep waiting
+	truncExcused                     // message_delta stop_reason=max_tokens: the cap cut the input
+)
+
+// judgeTruncatedToolInput decides what an invalid tool input means from the
+// event right after its block closes. Only a max_tokens stop excuses it; a ping
+// may sit in between, as the API allows ping events anywhere in the stream.
+func judgeTruncatedToolInput(ev event, p *streamPayload) truncVerdict {
+	switch {
+	case ev.name == "ping":
+		return truncWait
+	case p.Type == "message_delta" && p.Delta.StopReason == "max_tokens":
+		return truncExcused
+	default:
+		return truncReject
+	}
 }
 
 // scrapeUsage pulls the friendly numbers out of the events that carry them.
@@ -672,11 +744,14 @@ func scrapeUsage(ev event, st *captureStats) {
 		}
 		if json.Unmarshal([]byte(ev.data), &d) == nil {
 			// Some Anthropic-compatible gateways put the authoritative input usage
-			// on message_delta rather than message_start. Prefer the latest non-zero
-			// total so GPT-routed streams do not log "in=0".
-			if in := totalInputTokens(d.Usage.Input, d.Usage.CacheCreation, d.Usage.CacheRead); in > 0 {
+			// on message_delta rather than message_start. Merge it per field: a
+			// delta value overrides only when present and > 0, so a delta carrying
+			// input_tokens alone keeps message_start's cache counts instead of
+			// zeroing them, and GPT-routed streams do not log "in=0".
+			u := d.Usage
+			if u.Input > 0 || u.CacheCreation > 0 || u.CacheRead > 0 {
 				st.deltaInputUsage = true
-				st.setInputUsage(d.Usage.Input, d.Usage.CacheCreation, d.Usage.CacheRead)
+				st.setInputUsage(positiveOr(u.Input, st.inputTok), positiveOr(u.CacheCreation, st.cacheCreationTok), positiveOr(u.CacheRead, st.cacheReadTok))
 			}
 			if d.Usage.Output > 0 {
 				st.outTok = d.Usage.Output
@@ -698,6 +773,17 @@ func (st *captureStats) setInputUsage(input, cacheCreation, cacheRead int) {
 	st.inTok = totalInputTokens(input, cacheCreation, cacheRead)
 }
 
+// positiveOr returns v when it is a real count, else the value already held.
+func positiveOr(v, held int) int {
+	if v > 0 {
+		return v
+	}
+	return held
+}
+
+// shouldBackfillMessageStartUsage reports whether the usage merged from
+// message_start and message_delta differs from what message_start carried, so
+// a delta that merely repeats (or zeroes) the start numbers changes nothing.
 func (st *captureStats) shouldBackfillMessageStartUsage() bool {
 	if !cfg.validateJSON || st == nil || !st.deltaInputUsage || st.inTok <= 0 {
 		return false
@@ -721,6 +807,7 @@ type streamPayload struct {
 	Delta struct {
 		Type        string `json:"type"`
 		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
 }
 
@@ -731,24 +818,25 @@ func replayBuffered(r io.Reader, w io.Writer, st *captureStats) error {
 func replayBufferedWithNormalizer(r io.Reader, w io.Writer, st *captureStats, toolNorm *toolJSONReplayNormalizer) error {
 	parser := &sseParser{}
 	buf := make([]byte, 32*1024)
+	backfill := st != nil && st.shouldBackfillMessageStartUsage()
 	startPatched := false
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
 			for _, ev := range parser.feed(buf[:n]) {
 				raw := ev.raw
-				if st != nil && st.shouldBackfillMessageStartUsage() && !startPatched && ev.name == "message_start" {
-					patched, ok := backfillMessageStartUsage(ev, st)
-					if ok {
+				switch {
+				case backfill && !startPatched && ev.name == "message_start":
+					if patched, ok := backfillMessageStartUsage(ev, st); ok {
 						raw = patched
 						startPatched = true
 					}
-				}
-				if st != nil && st.shouldBackfillMessageStartUsage() && ev.name == "message_delta" {
-					patched, ok := stripMessageDeltaInputUsage(ev)
-					if ok {
+				case startPatched && ev.name == "message_delta":
+					// The input usage now lives in message_start. Strip it from the
+					// delta only once that backfill happened: a message_start that
+					// could not be patched must not lose the numbers.
+					if patched, ok := stripMessageDeltaInputUsage(ev); ok {
 						raw = patched
-						ev.raw = raw
 					}
 				}
 				out, err := toolNorm.accept(ev, raw)
@@ -773,6 +861,11 @@ func replayBufferedWithNormalizer(r io.Reader, w io.Writer, st *captureStats, to
 
 type toolJSONReplayNormalizer struct {
 	blocks map[int]*toolReplayBlock
+	// held is the coalesced delta and content_block_stop of a tool block whose
+	// input is not valid JSON, plus any pings since, kept until the next event
+	// says whether max_tokens cut the input (see judgeTruncatedToolInput). Live
+	// streaming cannot look ahead, so the frames wait here instead of failing.
+	held [][]byte
 }
 
 type toolReplayBlock struct {
@@ -783,17 +876,33 @@ type toolReplayBlock struct {
 }
 
 func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error) {
-	if normalizeToolJSONEnabled() {
-		if f := validateSSEEventShape(ev); f != nil {
-			return nil, errInvalidSSEEventShape
-		}
-	}
-	if !normalizeToolJSONEnabled() || ev.data == "" {
+	if !normalizeToolJSONEnabled() {
 		return [][]byte{raw}, nil
 	}
+	if f := validateSSEEventShape(ev); f != nil {
+		return nil, errInvalidSSEEventShape
+	}
 	var p streamPayload
-	if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
-		return nil, err
+	if ev.data != "" {
+		if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
+			return nil, err
+		}
+	}
+	if n.held != nil {
+		switch judgeTruncatedToolInput(ev, &p) {
+		case truncWait:
+			n.held = append(n.held, raw)
+			return nil, nil
+		case truncExcused:
+			out := append(n.held, raw)
+			n.held = nil
+			return out, nil
+		default:
+			return nil, errInvalidToolJSON
+		}
+	}
+	if ev.data == "" {
+		return [][]byte{raw}, nil
 	}
 	switch p.Type {
 	case "content_block_start":
@@ -830,14 +939,28 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 			delete(n.blocks, p.Index)
 			return append(b.rawDeltas, raw), nil
 		}
-		if !validJSONObject(b.input.Bytes()) {
-			return nil, errInvalidToolJSON
-		}
 		delete(n.blocks, p.Index)
+		if !validJSONObject(b.input.Bytes()) {
+			// Cut off or garbled: the upstream's own max_tokens answer or a
+			// malformed stream, depending on the next event. Hold both frames.
+			n.held = [][]byte{toolInputDeltaEvent(p.Index, b.input.String()), raw}
+			return nil, nil
+		}
 		return [][]byte{toolInputDeltaEvent(p.Index, b.input.String()), raw}, nil
 	default:
 		return [][]byte{raw}, nil
 	}
+}
+
+// withholding reports tool input still withheld for a block that has not
+// closed: ending the stream now would hand the client a tool call without it.
+func (n *toolJSONReplayNormalizer) withholding() bool {
+	for _, b := range n.blocks {
+		if len(b.rawDeltas) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 var errInvalidToolJSON = errors.New("invalid tool input JSON")
@@ -905,24 +1028,41 @@ func blockUsesInputJSON(blockType string) bool {
 }
 
 func toolInputDeltaEvent(index int, partial string) []byte {
-	payload := map[string]any{
+	frame, err := encodeSSEFrame("content_block_delta", map[string]any{
 		"type":  "content_block_delta",
 		"index": index,
 		"delta": map[string]string{
 			"type":         "input_json_delta",
 			"partial_json": partial,
 		},
-	}
-	data, err := json.Marshal(payload)
+	})
 	if err != nil {
 		return nil
 	}
-	return []byte("event: content_block_delta\ndata: " + string(data) + "\n\n")
+	return frame
 }
 
 func validJSONObject(p []byte) bool {
 	p = bytes.TrimSpace(p)
 	return len(p) > 0 && p[0] == '{' && json.Valid(p)
+}
+
+// encodeSSEFrame renders one SSE event for a payload the proxy re-encodes.
+// HTML escaping is off: encoding/json's default rewrites <, > and & as \u003c,
+// \u003e and \u0026, silently changing the text of a tool input or message the
+// proxy only meant to re-frame.
+func encodeSSEFrame(name string, payload any) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteString("event: ")
+	buf.WriteString(name)
+	buf.WriteString("\ndata: ")
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil { // ends the data line with "\n"
+		return nil, err
+	}
+	buf.WriteByte('\n') // the blank line that terminates the event
+	return buf.Bytes(), nil
 }
 
 func backfillMessageStartUsage(ev event, st *captureStats) ([]byte, bool) {
@@ -943,11 +1083,11 @@ func backfillMessageStartUsage(ev event, st *captureStats) ([]byte, bool) {
 	usage["cache_creation_input_tokens"] = st.cacheCreationTok
 	usage["cache_read_input_tokens"] = st.cacheReadTok
 
-	data, err := json.Marshal(root)
+	frame, err := encodeSSEFrame("message_start", root)
 	if err != nil {
 		return nil, false
 	}
-	return []byte("event: message_start\ndata: " + string(data) + "\n\n"), true
+	return frame, true
 }
 
 func stripMessageDeltaInputUsage(ev event) ([]byte, bool) {
@@ -969,11 +1109,11 @@ func stripMessageDeltaInputUsage(ev event) ([]byte, bool) {
 	if !changed {
 		return nil, false
 	}
-	data, err := json.Marshal(root)
+	frame, err := encodeSSEFrame("message_delta", root)
 	if err != nil {
 		return nil, false
 	}
-	return []byte("event: message_delta\ndata: " + string(data) + "\n\n"), true
+	return frame, true
 }
 
 func onReadErr(err error, ctx context.Context, committed bool, flush func()) (bool, *failure) {

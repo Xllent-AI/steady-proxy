@@ -136,6 +136,14 @@ func (g *geminiWire) buffered(ev event, st *captureStats) (bool, *failure) {
 func (g *geminiWire) live(ev event, raw []byte, st *captureStats) ([][]byte, bool, *failure) {
 	if f := g.accept(ev, st); f != nil {
 		g.failed = true
+		if !f.transient {
+			// Only a classified upstream error frame is terminal (malformed data
+			// is transient). It is the upstream's final answer: an abort would send
+			// the client into a retry that cannot succeed, so deliver the frame
+			// verbatim and end the stream cleanly, as a direct connection would.
+			f.delivered = true
+			return [][]byte{raw}, false, f
+		}
 		return nil, false, f
 	}
 	return [][]byte{raw}, false, nil
@@ -225,8 +233,10 @@ func (g *geminiWire) accept(ev event, st *captureStats) *failure {
 		return malformedSSE("invalid JSON or field shape in Gemini stream event")
 	}
 	// Both data-only Google envelopes and explicitly named error events must be
-	// caught even with PROXY_VALIDATE_JSON=0, including after a finishReason.
-	if ev.name == "error" || len(chunk.Error) != 0 {
+	// caught even with PROXY_VALIDATE_JSON=0, including after a finishReason. A
+	// literal "error": null is an unset field on a data chunk, not an error.
+	hasError := len(chunk.Error) != 0 && string(chunk.Error) != "null"
+	if ev.name == "error" || hasError {
 		if f := classifyGeminiSSEError(data); f != nil {
 			return f
 		}

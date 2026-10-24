@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"io"
 	"log"
 	"net/http"
@@ -125,17 +126,125 @@ func TestE2ETruncatedStreamBecomesRetryable(t *testing.T) {
 	}
 }
 
-func TestE2EPermanent400PassesThrough(t *testing.T) {
+// A terminal upstream error is the upstream's final answer: one attempt even
+// with a local-retry budget, and the client receives its body and headers
+// unchanged. Codex retries every status but 400/429, so the Responses route
+// keeps the body but answers 400.
+func TestE2ETerminalErrorRelayedVerbatim(t *testing.T) {
+	const body = `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_1"}`
+	for _, c := range []struct {
+		path string
+		want int
+	}{{"/v1/messages", 401}, {"/v1/responses", 400}} {
+		t.Run(c.path, func(t *testing.T) {
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Request-Id", "req_1")
+				w.WriteHeader(401)
+				io.WriteString(w, body)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.txLocalRetries = 3
+			cfg.localBackoffCap = 0
+			rec := httptest.NewRecorder()
+			handle(rec, httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(`{"stream":true,"model":"m"}`)))
+			if hits.Load() != 1 || rec.Code != c.want || rec.Body.String() != body {
+				t.Fatalf("want one attempt relayed as %d verbatim, got hits=%d status=%d body=%s", c.want, hits.Load(), rec.Code, rec.Body.String())
+			}
+			if rec.Header().Get("Request-Id") != "req_1" || rec.Header().Get("X-Should-Retry") != "false" || rec.Header().Get("X-Steady-Proxy-Reason") != "http_401" {
+				t.Fatalf("relay must keep upstream headers and mark it final: %v", rec.Header())
+			}
+		})
+	}
+}
+
+// A gateway may compress an error despite Accept-Encoding: identity. The relayed
+// bytes stay encoded, so the encoding header must travel with them.
+func TestE2EEncodedTerminalErrorKeepsContentEncoding(t *testing.T) {
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	io.WriteString(zw, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+	zw.Close()
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(400)
-		io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"prompt is too long for context"}}`)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(401)
+		w.Write(gz.Bytes())
 	}))
 	defer up.Close()
 	setupForTest(up.URL)
-
 	rec := doStream(`{"stream":true,"model":"m"}`)
-	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
-		t.Fatalf("permanent 400 must NOT be retried; want false, got %q", got)
+	if rec.Code != 401 || rec.Header().Get("Content-Encoding") != "gzip" || !bytes.Equal(rec.Body.Bytes(), gz.Bytes()) {
+		t.Fatalf("encoded error must be relayed with its encoding: status=%d headers=%v", rec.Code, rec.Header())
+	}
+}
+
+// A streaming request answered with a complete non-SSE 2xx is still the
+// upstream's answer: relayed once, unchanged, never re-sent.
+func TestE2ENonSSESuccessRelayedOnce(t *testing.T) {
+	var hits atomic.Int32
+	const body = `{"id":"msg_1","type":"message","content":[{"type":"text","text":"<Hi & bye>"}]}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.txLocalRetries = 3
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if hits.Load() != 1 || rec.Code != 200 || rec.Body.String() != body || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("want one verbatim relay, got hits=%d status=%d headers=%v body=%s", hits.Load(), rec.Code, rec.Header(), rec.Body.String())
+	}
+}
+
+// A non-SSE 2xx whose body breaks before its declared end is buffered, so it
+// stays a clean pre-commit retry instead of a short success.
+func TestE2ENonSSEBrokenBodyRetried(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "100")
+			io.WriteString(w, `{"id":"msg_1"`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, goodStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = 0
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if hits.Load() != 2 || rec.Code != 200 || !strings.HasPrefix(rec.Body.String(), "event: message_start") {
+		t.Fatalf("want the broken body retried, got hits=%d status=%d body=%s", hits.Load(), rec.Code, rec.Body.String())
+	}
+}
+
+// A non-SSE body that trickles past the no-output window is cut at that
+// deadline like an error body, so the client is not held past its timeouts.
+func TestE2ENonSSEBodyObeysBufferDeadline(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"msg_1",`)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.keepaliveMs = 100 * time.Millisecond
+	started := time.Now()
+	rec := doStream(`{"stream":true,"model":"m"}`)
+	if elapsed := time.Since(started); elapsed > time.Second || rec.Code != 503 || rec.Header().Get("X-Steady-Proxy-Reason") != "deadline" {
+		t.Fatalf("want a prompt retryable deadline, got status=%d reason=%q after %s", rec.Code, rec.Header().Get("X-Steady-Proxy-Reason"), elapsed)
 	}
 }
 
@@ -229,16 +338,16 @@ func TestE2EPreStream529NormalizedToGeneric(t *testing.T) {
 	}
 }
 
-// Blind-stabilizer policy: a transient failure must be retried AND carry a
-// Retry-After backoff so the client waits before re-sending. Covers a 5xx and an
-// auth 4xx (which now retries instead of surfacing).
+// A transient failure must be retried AND carry a Retry-After backoff so the
+// client waits before re-sending. Covers a 5xx and a rate limit without its own
+// Retry-After.
 func TestE2ERetryableCarriesBackoff(t *testing.T) {
 	cases := []struct {
 		name, body string
 		status     int
 	}{
 		{"503", `{"error":{"type":"api_error","message":"upstream unavailable"}}`, 503},
-		{"401", `{"error":{"type":"authentication_error","message":"Invalid API key"}}`, 401},
+		{"429", `{"error":{"type":"rate_limit_error","message":"slow down"}}`, 429},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -502,8 +611,8 @@ func TestE2ESSEDisconnectAfterCommitDoesNotReplay(t *testing.T) {
 	// Release the error only after the client has observed actual response content.
 	releaseError <- struct{}{}
 	rest, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("a committed failure must abort the response, not end it cleanly")
 	}
 	received.Write(rest)
 	body := received.String()

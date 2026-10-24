@@ -354,7 +354,7 @@ func TestGeminiInBandErrorsFailBeforeAndAfterFinish(t *testing.T) {
 		{"native invalid argument", `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad request"}}`, "", false},
 		{"native not found", `{"error":{"code":404,"status":"NOT_FOUND","message":"model missing"}}`, "", false},
 		{"named error", `{"error":{"code":503,"status":"UNAVAILABLE","message":"overloaded"}}`, "error", true},
-		{"null error envelope", `{"error":null}`, "", true},
+		{"named error with null envelope", `{"error":null}`, "error", true},
 		{"missing named error envelope", `{}`, "error", true},
 		{"empty named error", ``, "error", true},
 	} {
@@ -374,8 +374,15 @@ func TestGeminiInBandErrorsFailBeforeAndAfterFinish(t *testing.T) {
 					if live {
 						var out [][]byte
 						out, done, f = wire.live(ev, ev.raw, nil)
-						if len(out) != 0 {
-							t.Fatalf("in-band error must not be forwarded: %q", out)
+						// A terminal error is the upstream's answer and is delivered
+						// verbatim; a transient one is never forwarded (the abort
+						// hands recovery to the client).
+						if f == nil || f.transient {
+							if len(out) != 0 || (f != nil && f.delivered) {
+								t.Fatalf("transient in-band error must not be forwarded: %q", out)
+							}
+						} else if !f.delivered || len(out) != 1 || string(out[0]) != string(ev.raw) {
+							t.Fatalf("terminal in-band error must be delivered verbatim: delivered=%v out=%q", f.delivered, out)
 						}
 					} else {
 						done, f = wire.buffered(ev, nil)
@@ -384,6 +391,61 @@ func TestGeminiInBandErrorsFailBeforeAndAfterFinish(t *testing.T) {
 						t.Fatalf("in-band error accepted or misclassified: live=%v afterFinish=%v done=%v failure=%+v complete=%v", live, afterFinish, done, f, wire.completeOnEOF())
 					}
 				}
+			}
+		})
+	}
+}
+
+// ProtoJSON emitters that print defaults put "error": null on ordinary data
+// chunks. Only a populated error value, or a named error event, is a failure.
+func TestGeminiNullErrorFieldIsNotAnErrorFrame(t *testing.T) {
+	stream := strings.ReplaceAll(goodGeminiStream, "}\n\n", ",\"error\":null}\n\n")
+	if strings.Count(stream, `"error":null`) != 3 {
+		t.Fatalf("test stream was not rewritten: %q", stream)
+	}
+	for _, early := range []bool{false, true} {
+		t.Run("capture/early="+strconv.FormatBool(early), func(t *testing.T) {
+			var st captureStats
+			rec, wrote, f := captureGemini(t, nil, iotest1byte(stream), &st, early)
+			if !wrote || f != nil || rec.Body.String() != stream || st.stop != "STOP" || st.outTok != 11 {
+				t.Fatalf("null error field failed a complete response: wrote=%v failure=%+v stats=%+v body=%q", wrote, f, st, rec.Body.String())
+			}
+		})
+	}
+	for _, live := range []bool{false, true} {
+		t.Run("wire/live="+strconv.FormatBool(live), func(t *testing.T) {
+			wire := newGeminiWire(nil)
+			for _, data := range []string{
+				`{"candidates":[{"index":0,"content":{"parts":[{"text":"hi"}]}}],"error":null}`,
+				`{"candidates":[{"index":0,"finishReason":"STOP"}],"error":null}`,
+				`{"error":null}`,
+			} {
+				ev := geminiTestEvent(data)
+				var f *failure
+				if live {
+					var out [][]byte
+					out, _, f = wire.live(ev, ev.raw, nil)
+					if f == nil && (len(out) != 1 || string(out[0]) != string(ev.raw)) {
+						t.Fatalf("data chunk was not forwarded verbatim: %q", out)
+					}
+				} else {
+					_, f = wire.buffered(ev, nil)
+				}
+				if f != nil {
+					t.Fatalf("%s treated as an error frame: %+v", data, f)
+				}
+			}
+			if !wire.completeOnEOF() || !wire.forwardable() {
+				t.Fatalf("null error field lost completion or content: complete=%v forwardable=%v", wire.completeOnEOF(), wire.forwardable())
+			}
+		})
+	}
+	// Any other populated value, even an empty one, is still a broken error.
+	for _, data := range []string{`{"error":{}}`, `{"error":false}`, `{"error":""}`, `{"error":[]}`, `{"error":0}`} {
+		t.Run("populated/"+data, func(t *testing.T) {
+			wire := newGeminiWire(nil)
+			if _, f := wire.buffered(geminiTestEvent(data), nil); f == nil || !f.transient {
+				t.Fatalf("populated error value accepted as data: %+v", f)
 			}
 		})
 	}
@@ -458,5 +520,79 @@ func TestGeminiLongRetryInfoCannotFitRequestDeadline(t *testing.T) {
 	f := classifyGeminiSSEError(`{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"315576000000s"}]}}`)
 	if f == nil || canWaitForLocalRetry(ctx, localRetryDelay(f.retryAfter, 0)) {
 		t.Fatalf("native cooldown exceeded the request deadline but was accepted: %+v", f)
+	}
+}
+
+func TestGeminiTargetModelMethods(t *testing.T) {
+	for _, tc := range []struct{ path, model, method string }{
+		{"/v1beta/models/gemini-test:generateContent", "gemini-test", "generateContent"},
+		{"/v1beta/models/gemini-test:streamGenerateContent", "gemini-test", "streamGenerateContent"},
+		{"/v1/models/gemini-test:countTokens", "gemini-test", "countTokens"},
+		{"/v1beta/models/text-embedding-004:embedContent", "text-embedding-004", "embedContent"},
+		{"/v1beta/models/text-embedding-004:batchEmbedContents", "text-embedding-004", "batchEmbedContents"},
+		{"/v1alpha/models/gemini-test:batchGenerateContent", "gemini-test", "batchGenerateContent"},
+		{"/v1beta/models/veo-test:predictLongRunning", "veo-test", "predictLongRunning"},
+		{"/v1beta1/projects/p/locations/global/publishers/google/models/gemini-test:streamGenerateContent", "gemini-test", "streamGenerateContent"},
+		{"/v1beta1/projects/p/locations/us-central1/publishers/google/models/text-embedding-004:embedContent", "text-embedding-004", "embedContent"},
+		// Vertex AI express mode names the publisher without a project.
+		{"/v1/publishers/google/models/gemini-test:generateContent", "gemini-test", "generateContent"},
+		{"/v1beta1/publishers/google/models/gemini-test:streamGenerateContent", "gemini-test", "streamGenerateContent"},
+		{"/v1/publishers/google/models/text-embedding-004:embedContent", "text-embedding-004", "embedContent"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			model, method := geminiTarget(tc.path)
+			if model != tc.model || method != tc.method || !isGeminiPath(tc.path) {
+				t.Fatalf("geminiTarget = (%q, %q), want (%q, %q)", model, method, tc.model, tc.method)
+			}
+		})
+	}
+	for _, path := range []string{
+		"", "/", "/v1beta/models", "/v1beta/models/", "/v1beta/models/gemini-test",
+		"/v1beta/models/gemini-test:", "/v1beta/models/:generateContent",
+		// A method is a bare camelCase word.
+		"/v1beta/models/gemini-test:embed2", "/v1beta/models/gemini-test:embed-content",
+		"/v1beta/models/gemini-test:generate_content", "/v1beta/models/gemini-test:génération",
+		"/v1beta/models/gemini-test:generateContent:extra", "/v1beta/models/gemini-test:generateContent/",
+		"/v1beta/models/a/b:generateContent", "/v2/models/gemini-test:generateContent",
+		"/models/gemini-test:generateContent", "/v1beta/tunedModels/t:generateContent",
+		"/v1/publishers/other/models/m:generateContent", "/v1/publishers/google/models/a/b:generateContent",
+		"/v1/publishers/google/models/:generateContent", "/v1/publishers/google/models/m",
+		"/v1/projects/p/publishers/google/models/m:generateContent",
+		"/v1/projects//locations/l/publishers/google/models/m:generateContent",
+		"/v1/projects/p/locations//publishers/google/models/m:generateContent",
+		"/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/v1/chat/completions",
+	} {
+		t.Run("not/"+path, func(t *testing.T) {
+			if model, method := geminiTarget(path); model != "" || method != "" || isGeminiPath(path) {
+				t.Fatalf("look-alike path became a Gemini route: (%q, %q)", model, method)
+			}
+		})
+	}
+}
+
+// Every model method now resolves as Gemini, so the helpers keyed on the path
+// must stay correct for bodies that are not generation requests.
+func TestGeminiModelMethodsRouteHelpers(t *testing.T) {
+	body := []byte(`{"model":"models/body-model","content":{"parts":[{"text":"x"}]},"taskType":"RETRIEVAL_QUERY"}`)
+	for _, path := range []string{
+		"/v1beta/models/text-embedding-004:embedContent",
+		"/v1beta/models/text-embedding-004:batchEmbedContents",
+		"/v1/publishers/google/models/text-embedding-004:embedContent",
+		"/v1beta1/projects/p/locations/global/publishers/google/models/text-embedding-004:embedContent",
+	} {
+		t.Run(path, func(t *testing.T) {
+			if got := requestModelOf(path, body); got != "text-embedding-004" {
+				t.Fatalf("model must come from the URL, got %q", got)
+			}
+			if got := reasoningEffortOf(path, body); got != "" {
+				t.Fatalf("a method without generationConfig has no reasoning effort, got %q", got)
+			}
+			if _, ok := wireFor(path, body, false).(*geminiWire); !ok {
+				t.Fatalf("wireFor must keep Gemini routes on the Gemini wire")
+			}
+		})
+	}
+	if got := reasoningEffortOf("/v1/publishers/google/models/gemini-test:generateContent", []byte(`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}`)); got != "high" {
+		t.Fatalf("express generateContent must report its thinking level, got %q", got)
 	}
 }

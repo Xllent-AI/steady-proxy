@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -24,12 +24,23 @@ func classifyBufferError(err error) *failure {
 type failure struct {
 	transient  bool   // true => eligible to convert into an SDK retry
 	fastRetry  bool   // true => one cheap proxy-local re-issue is OK
+	delivered  bool   // true => the failure's own terminal frame already reached the client in-stream
 	status     int    // HTTP status to surface downstream
 	origStatus int    // raw upstream HTTP status; 0 when no HTTP response (transport/SSE fault)
 	atype      string // Anthropic error type
 	code       string // short internal code (for logs / episode keying)
 	message    string
-	retryAfter int // seconds; 0 = none
+	retryAfter int            // seconds; 0 = none
+	upstream   *upstreamReply // complete upstream HTTP error; a terminal failure is replayed from it verbatim
+}
+
+// upstreamReply is a fully read upstream HTTP error response. Terminal errors are
+// the upstream's own answer, so the client receives these bytes rather than a
+// proxy-synthesized envelope.
+type upstreamReply struct {
+	status int
+	header http.Header
+	body   []byte
 }
 
 func statusFor(f failure) int {
@@ -60,7 +71,7 @@ func statusField(orig, surfaced int) string {
 // origStatusOf is the true upstream status for display: the raw HTTP status when
 // the upstream actually responded, else the classified status. A transient 4xx is
 // normalized to 502 in failure.status (so the SDK honors the retry), so reading
-// origStatus here is what keeps e.g. a retryable 401 logged as 401, not 502.
+// origStatus here is what keeps e.g. a retryable 408 logged as 408, not 502.
 func origStatusOf(f failure) int {
 	if f.origStatus != 0 {
 		return f.origStatus
@@ -69,21 +80,15 @@ func origStatusOf(f failure) int {
 }
 
 // Substrings that mark an error as REQUEST-SHAPE: the request itself can never
-// succeed as written, so retrying it would loop forever. These are the ONLY
-// errors we surface immediately — everything else is retried (see the design
-// principle in main.go). Derived from real Claude Code transcripts; see
-// docs/TROUBLESHOOTING.md.
+// succeed as written. HTTP 4xx statuses are already terminal on their own (see
+// classifyHTTPErrorBytesShaped); these phrases matter where no such status
+// exists or the status alone says "retry": in-band SSE errors of an unknown
+// type, and an HTTP 429 whose body names a request-shape problem. Derived from
+// real Claude Code transcripts; see docs/TROUBLESHOOTING.md.
 //
-// Deliberately excluded (so they ARE retried): auth, billing, policy, rate
-// limits, capacity, and unknown errors — a temporary block or outage should be
-// ridden out, not surfaced. The upstream gateway owns retry intelligence; this
-// proxy only keeps the client alive.
-//
-// Each entry must be specific enough that it cannot match a transient/auth/policy
-// message — there is no transient fallback anymore, so a false positive here
-// surfaces something that should have been retried. (E.g. a bare "is required"
-// would match "authentication is required"; "too long" would match "took too
-// long".) Prefer anchored phrases over generic fragments.
+// Each entry must be specific enough that it cannot match a transient message
+// (e.g. a bare "too long" would match "took too long"). Prefer anchored phrases
+// over generic fragments.
 var requestShapeSigs = []string{
 	// request too large / context
 	"context_length", "context length", "maximum context", "prompt is too long",
@@ -92,11 +97,8 @@ var requestShapeSigs = []string{
 	"missing tool result", "duplicate tool_use", "unexpected tool_use_id",
 	"thinking blocks", "thinking.budget_tokens", "max_tokens must be",
 	// schema / header mismatches (often gateway translation bugs — deterministic).
-	// Note: no bare "must be"/"unsupported"/"is required" — those match transient
-	// or auth messages ("token must be provided", "unsupported region") that the
-	// policy wants to retry. model_not_found stays a code match only: a plain
-	// "model not found" on a routing gateway often means "no provider has it now"
-	// (transient), so we don't surface that.
+	// Note: no bare "must be"/"unsupported"/"is required" — those also appear in
+	// transient messages ("token must be provided", "unsupported region right now").
 	"extra inputs are not permitted", "unexpected value",
 	"anthropic-beta", "context_management", "input_examples", "image dimensions",
 	"model_not_found",
@@ -126,33 +128,39 @@ func classifyTransport(err error, ctx context.Context) failure {
 	}
 }
 
-// classifyHTTPError inspects a non-2xx upstream response, tagging it with the raw
-// upstream status so logs keep the true status even when classifyHTTPErrorBytes
-// normalizes failure.status (e.g. a retryable 4xx surfaced as 502).
-func classifyHTTPError(resp *http.Response) failure {
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	f := classifyHTTPErrorBytes(resp, b)
-	f.origStatus = resp.StatusCode
-	return f
+// errorVerdict is a wire's reading of an upstream error body. HTTP status owns
+// the retry decision; the body can only refine it where the wire names an
+// explicit identity (see classifyHTTPErrorBytesShaped).
+type errorVerdict int
+
+const (
+	verdictUnknown   errorVerdict = iota // the body names no retry-relevant identity
+	verdictTransient                     // the body names a transient fault (rate limit, overload, timeout)
+	verdictPermanent                     // the body names a fault an identical retry cannot fix
+)
+
+// errorBodyRule reads the parsed error type/code/message plus the whole
+// lowercased body for one wire.
+type errorBodyRule func(atype, code, msg, bodyLower string) errorVerdict
+
+// anthropicErrorVerdict: a known request-shape phrase is permanent; the
+// documented transient Anthropic error types are transient. api_error is too
+// generic to override a 4xx status, so it is not listed here.
+func anthropicErrorVerdict(atype, _, _, bodyLower string) errorVerdict {
+	if anyContains(bodyLower, requestShapeSigs) {
+		return verdictPermanent
+	}
+	switch atype {
+	case "rate_limit_error", "overloaded_error", "timeout_error":
+		return verdictTransient
+	}
+	return verdictUnknown
 }
 
-// requestShaped decides whether a non-2xx body names a deterministic
-// request-shape error (surface, don't retry). It differs per wire: Anthropic
-// matches message substrings; OpenAI Responses keys on the error type/code (see
-// responsesRequestShaped). It receives the parsed error type/code/message plus
-// the whole lowercased body.
-type requestShaped func(atype, code, msg, bodyLower string) bool
-
-// anthropicRequestShaped is the historical Anthropic rule: match a known
-// request-shape phrase anywhere in the body.
-func anthropicRequestShaped(_, _, _, bodyLower string) bool {
-	return anyContains(bodyLower, requestShapeSigs)
-}
-
-// classifyHTTPErrorBytes is the body/header inspection. The caller supplies the
-// already-read body bytes when it also needs to archive the exact payload.
+// classifyHTTPErrorBytes is the body/header inspection for Anthropic-shaped and
+// other non-Responses, non-Gemini routes.
 func classifyHTTPErrorBytes(resp *http.Response, b []byte) failure {
-	return classifyHTTPErrorBytesShaped(resp, b, anthropicRequestShaped)
+	return classifyHTTPErrorBytesShaped(resp, b, anthropicErrorVerdict)
 }
 
 // httpRetryHint returns the first recognized authoritative retry verdict.
@@ -168,12 +176,23 @@ func httpRetryHint(h http.Header) (source string, retry bool) {
 	return "", false
 }
 
-// classifyHTTPErrorBytesShaped is classifyHTTPErrorBytes with a pluggable
-// request-shape decision so each wire keeps its own "can never succeed" rule
-// while sharing the status/header handling.
-func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, reqShaped requestShaped) failure {
-	body := strings.ToLower(string(b))
+// classifyHTTPErrorBytesShaped classifies a non-2xx upstream response with the
+// retry rule the Stainless SDKs (Anthropic, OpenAI) apply themselves: retry 408,
+// 409, 429 and 5xx; every other status is the upstream's final answer, so
+// re-sending the identical request only repeats it. Authoritative headers beat
+// every heuristic, and a wire's body verdict refines the status where it names an
+// explicit identity: a 4xx naming a transient fault is retried, and a 429 naming
+// a permanent one (exhausted quota, request too large) is not.
+func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, rule errorBodyRule) failure {
 	st := resp.StatusCode
+	if st >= 300 && st < 400 {
+		// Redirects are deliberately not followed, so credentials never reach a
+		// host the operator did not configure. Relaying the Location would make
+		// the client follow it instead; report it as a configuration error.
+		return failure{status: http.StatusBadGateway, atype: "api_error", code: "upstream_redirect_" + itoa(st),
+			message: "upstream redirected to " + redirectTarget(resp.Header.Get("Location")) + "; fix PROXY_UPSTREAM_URL (redirects are not followed)"}
+	}
+	body := strings.ToLower(string(b))
 	ra := retryAfterSeconds(resp.Header.Get("Retry-After"))
 
 	var ae struct {
@@ -203,33 +222,72 @@ func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, reqShaped reque
 		return failure{transient: false, status: st, atype: atype, code: "upstream_no_retry", message: ae.Error.Message}
 	}
 
+	verdict := rule(ae.Error.Type, ae.Error.Code, ae.Error.Message, body)
 	switch {
 	case st == 408 || st == 409:
-		return failure{transient: true, fastRetry: true, status: st, atype: atype, code: "http_" + itoa(st), message: ae.Error.Message}
+		return failure{transient: true, fastRetry: true, status: st, atype: atype, code: "http_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
+	case st == 429 && verdict == verdictPermanent:
+		return failure{status: st, atype: atype, code: "http_429", message: ae.Error.Message}
 	case st == 429:
 		return failure{transient: true, status: 429, atype: "rate_limit_error", code: "rate_limit", message: ae.Error.Message, retryAfter: ra}
 	case st >= 500:
 		return failure{transient: true, fastRetry: st == 502 || st == 503, status: st, atype: typeFor5xx(st), code: "http_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
-	default: // 4xx other than 408/409/429
-		// Surface ONLY a deterministic request-shape error (it can never succeed,
-		// so retrying would loop). Everything else — auth, billing, policy,
-		// unknown — is treated as a transient hiccup and retried: a temporary
-		// block should be ridden out, not surfaced. Normalize to 502 so the SDK
-		// always honors the retry (it may refuse to retry some 4xx by status).
-		if reqShaped(ae.Error.Type, ae.Error.Code, ae.Error.Message, body) {
-			return failure{transient: false, status: st, atype: atype, code: "request_shape", message: ae.Error.Message}
-		}
+	case verdict == verdictTransient:
+		// A 4xx whose body explicitly names a transient fault. Normalize to 502
+		// so the SDK honors the retry (it refuses to retry most 4xx by status).
 		return failure{transient: true, status: 502, atype: "api_error", code: "retryable_4xx_" + itoa(st), message: ae.Error.Message, retryAfter: ra}
+	default:
+		// Auth, billing, permission, not-found, validation, unknown 4xx: the
+		// upstream's final answer. Surface it instead of repeating the request.
+		code := "http_" + itoa(st)
+		if verdict == verdictPermanent {
+			code = "request_shape"
+		}
+		return failure{status: st, atype: atype, code: code, message: ae.Error.Message}
 	}
 }
 
+// redirectTarget renders a Location for diagnostics without its query, which may
+// carry credentials.
+func redirectTarget(location string) string {
+	u, err := url.Parse(location)
+	if err != nil || location == "" {
+		return "an unparseable location"
+	}
+	u.RawQuery, u.Fragment, u.User = "", "", nil
+	return u.String()
+}
+
+// anthropicPermanentStatus maps the documented Anthropic error types that an
+// identical retry cannot fix to their HTTP status.
+func anthropicPermanentStatus(atype string) int {
+	switch atype {
+	case "invalid_request_error":
+		return http.StatusBadRequest
+	case "authentication_error":
+		return http.StatusUnauthorized
+	case "billing_error":
+		return http.StatusPaymentRequired
+	case "permission_error":
+		return http.StatusForbidden
+	case "not_found_error":
+		return http.StatusNotFound
+	case "request_too_large":
+		return http.StatusRequestEntityTooLarge
+	}
+	return 0
+}
+
 // classifySSEError handles an `event: error` that arrives mid-stream (after 200).
+// The type is the only status-like signal, so the same identities that are final
+// over HTTP (auth, billing, permission, not found, too large, invalid request)
+// are final here.
 func classifySSEError(data string) *failure {
 	var e struct {
 		Error struct{ Type, Message string } `json:"error"`
 	}
 	_ = json.Unmarshal([]byte(data), &e)
-	switch e.Error.Type {
+	switch t := e.Error.Type; t {
 	case "overloaded_error":
 		return &failure{transient: true, status: 529, atype: "overloaded_error", code: "sse_overloaded", message: e.Error.Message}
 	case "rate_limit_error":
@@ -241,8 +299,15 @@ func classifySSEError(data string) *failure {
 		if e.Error.Message == "stream error: stream disconnected before completion: stream closed before response.completed" {
 			return &failure{transient: true, status: 502, atype: "api_error", code: "sse_stream_disconnect", message: e.Error.Message}
 		}
-		return &failure{transient: false, status: 400, atype: e.Error.Type, code: "sse_request_shape", message: e.Error.Message}
-	default: // authentication_error, permission_error, not_found_error, unknown -> retry
+		return &failure{transient: false, status: 400, atype: t, code: "sse_request_shape", message: e.Error.Message}
+	default:
+		if st := anthropicPermanentStatus(t); st != 0 {
+			return &failure{status: st, atype: t, code: "sse_" + t, message: e.Error.Message}
+		}
+		if anyContains(strings.ToLower(t+" "+e.Error.Message), requestShapeSigs) {
+			return &failure{status: 400, atype: t, code: "sse_request_shape", message: e.Error.Message}
+		}
+		// An unknown type carries no evidence either way; ride it out.
 		return &failure{transient: true, status: 502, atype: "api_error", code: "sse_retryable", message: e.Error.Message}
 	}
 }
@@ -315,8 +380,8 @@ func typeFor5xx(st int) string {
 // (raise it with API_MAX_RETRIES). The diagnostic cause is never lost — it stays in
 // failure.code (e.g. "sse_overloaded", "rate_limit") for the access log.
 //
-// Request-shape and other non-transient failures keep their real status + type, so
-// they surface accurately with x-should-retry:false instead of looping forever.
+// Non-transient failures keep their real status + type (and an upstream HTTP
+// error is replayed verbatim), so they surface accurately with x-should-retry:false.
 const retryableSurfaceStatus = http.StatusServiceUnavailable // 503
 
 func surface(f failure) (status int, atype string) {
@@ -328,18 +393,17 @@ func surface(f failure) (status int, atype string) {
 
 // surfaceFor is surface() with the one wire-specific adjustment Codex needs. Codex
 // ignores x-should-retry and decides retryability from the STATUS alone: it treats
-// only 400 (InvalidRequest) and 429 (RetryLimit) as terminal, and RETRIES every
-// other surfaced non-2xx (5xx -> InternalServerError, anything else ->
-// UnexpectedStatus, both retryable in codex-rs error.rs). A transient failure still
-// masks to 503, which Codex retries — the intended outcome. But a NON-transient,
-// can-never-succeed failure surfaced with its real non-400 status (a 404/413/422
-// request-shape, a gateway "permanent", or the proxy's own response_too_large 502)
-// would make Codex loop it to its stream-retry cap; force 400 so Codex stops. This
-// is the single choke point for every non-retryable Responses outcome, wherever it
-// was classified.
+// only 400 (InvalidRequest) and 429 (RetryLimit / usage limit) as terminal, and
+// RETRIES every other surfaced non-2xx (5xx -> InternalServerError, anything else
+// -> UnexpectedStatus, both retryable in codex-rs error.rs). A transient failure
+// still masks to 503, which Codex retries — the intended outcome. A NON-transient
+// failure keeps 400 or 429; any other status (401/403/404/413/422, a gateway
+// "permanent" 5xx, the proxy's own response_too_large 502) would make Codex loop
+// it to its stream-retry cap, so it is forced to 400. This is the single choke
+// point for every non-retryable Responses outcome, wherever it was classified.
 func surfaceFor(path string, f failure) (status int, atype string) {
 	status, atype = surface(f)
-	if !f.transient && isResponsesPath(path) {
+	if !f.transient && isResponsesPath(path) && status != http.StatusBadRequest && status != http.StatusTooManyRequests {
 		return http.StatusBadRequest, atype
 	}
 	return status, atype

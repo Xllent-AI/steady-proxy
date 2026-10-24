@@ -38,9 +38,12 @@ type wireModel interface {
 
 	// live ingests one event on the post-commit LIVE path: it returns the exact
 	// downstream bytes to forward (empty -> engine emits keepalive()), whether the
-	// stream terminated, and fail != nil for an in-band error (the engine ends the
-	// stream as a DROP so the client's native stream-retry takes over) or malformed
-	// content.
+	// stream terminated, and fail != nil for an in-band error or malformed
+	// content. The engine writes out even when fail != nil, then ends the stream:
+	//   fail.delivered == true  -> out carried the upstream's own terminal error
+	//                              frame; the handler ends the response cleanly.
+	//   fail.delivered == false -> the handler aborts the HTTP response (DROP) so
+	//                              the client's native stream-retry takes over.
 	live(ev event, raw []byte, st *captureStats) (out [][]byte, done bool, fail *failure)
 
 	// keepalive is the byte frame the engine writes downstream during a silent gap
@@ -89,7 +92,11 @@ func isResponsesPath(path string) bool {
 	return pathIs(path, "/v1/responses")
 }
 
-// geminiTarget recognizes native Developer API and Vertex AI model methods.
+// geminiTarget recognizes native Developer API and Vertex AI model methods
+// (project-scoped and express-mode publisher paths). Any method name is a
+// Gemini route (generateContent, embedContent, batchEmbedContents, ...) so its
+// errors are classified and rendered in Google's envelope; only
+// streamGenerateContent?alt=sse is buffered, which main.go gates on the method.
 // Exact resource boundaries keep look-alike and unrelated routes single-shot.
 func geminiTarget(path string) (model, method string) {
 	version, resource, ok := strings.Cut(strings.TrimPrefix(path, "/"), "/")
@@ -112,6 +119,8 @@ func geminiTarget(path string) (model, method string) {
 			return "", ""
 		}
 		name = rest
+	} else if rest, express := strings.CutPrefix(resource, "publishers/google/models/"); express {
+		name = rest
 	} else {
 		name, ok = strings.CutPrefix(resource, "models/")
 		if !ok {
@@ -122,15 +131,24 @@ func geminiTarget(path string) (model, method string) {
 		return "", ""
 	}
 	model, method, ok = strings.Cut(name, ":")
-	if !ok || model == "" {
+	if !ok || model == "" || !isASCIILetters(method) {
 		return "", ""
 	}
-	switch method {
-	case "generateContent", "streamGenerateContent", "countTokens":
-		return model, method
-	default:
-		return "", ""
+	return model, method
+}
+
+// isASCIILetters reports a non-empty run of A-Z/a-z: Google RPC verbs are
+// camelCase words, so digits, punctuation, and non-ASCII are never a method.
+func isASCIILetters(s string) bool {
+	if s == "" {
+		return false
 	}
+	for i := range len(s) {
+		if c := s[i]; (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 func isGeminiPath(path string) bool {
@@ -140,11 +158,10 @@ func isGeminiPath(path string) bool {
 
 // ─────────────────────────────────────────────────────── anthropic wire model ──
 //
-// anthropicWire is a thin adapter over the existing, unchanged Anthropic stream
-// machinery (streamValidator, toolJSONValidator, toolJSONReplayNormalizer,
+// anthropicWire is a thin adapter over the Anthropic stream machinery
+// (streamValidator, toolJSONValidator, toolJSONReplayNormalizer,
 // progressTracker, scrapeUsage, classifySSEError, spool.replayWithUsage /
-// replayWithNormalizer). It preserves the historical behavior exactly — the
-// existing test suite is the safety net.
+// replayWithNormalizer). Its behavior is pinned by the sse/situations tests.
 type anthropicWire struct {
 	val              *streamValidator
 	toolVal          *toolJSONValidator
@@ -207,14 +224,31 @@ func (a *anthropicWire) live(ev event, raw []byte, st *captureStats) ([][]byte, 
 		}
 	}
 	if ev.name == "error" {
-		return nil, false, classifySSEError(ev.data)
+		fail := classifySSEError(ev.data)
+		if !fail.transient {
+			// An auth/billing/request-shape error is the upstream's final answer:
+			// a DROP would send the client into a retry that cannot succeed, so
+			// deliver the frame verbatim and end the stream cleanly. A transient
+			// error is never forwarded (see process): the client's native
+			// stream-retry must take over instead.
+			fail.delivered = true
+			return [][]byte{raw}, false, fail
+		}
+		return nil, false, fail
 	}
 	out, err := a.toolNorm.accept(ev, raw)
 	if err != nil {
-		return nil, false, malformedSSE("invalid tool input JSON in stream event")
+		return nil, false, malformedSSE(invalidToolInputMessage)
+	}
+	if ev.name == "message_stop" && a.toolNorm.withholding() {
+		return nil, false, malformedSSE(invalidToolInputMessage)
 	}
 	a.val.accept(ev)
-	return out, a.val.terminal(), nil
+	// message_stop ends the stream even if the validator flagged an ordering
+	// fault earlier (terminal() is then never true). The client has the whole
+	// response by now; waiting for more would hold it until the idle/deadline
+	// timer and log a complete response as truncated_stream.
+	return out, ev.name == "message_stop" || a.val.terminal(), nil
 }
 
 func (a *anthropicWire) replayBuffered(sp *spool, w io.Writer, st *captureStats) error {

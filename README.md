@@ -9,9 +9,9 @@ Agents / SDKs / applications → steady-proxy (127.0.0.1:8789) → your gateway
 ### Key features
 
 - **Transactional buffering:** Holds SSE responses until completion (or a configurable time window) so broken streams can be discarded and retried cleanly.
-- **Retry normalization:** Converts recoverable HTTP and pre-commit stream failures into standard `503` responses with `Retry-After` (plus optional in-proxy retries).
+- **Retry normalization:** Converts recoverable HTTP and pre-commit stream failures into standard `503` responses with `Retry-After` (plus optional in-proxy retries). Final upstream answers (auth, billing, validation, and other `4xx`) are relayed unchanged.
 - **Stream validation and repair:** Validates Anthropic event order and tool JSON, coalesces fragmented `input_json_delta` chunks, and merges bursty Responses text deltas on replay.
-- **Refusal fallback:** Optionally re-issues Anthropic refusals against a fallback model before committing the response.
+- **Refusal fallback:** Re-issues Claude refusals against a fallback model (default `claude-opus-5`, can be disabled) before committing the response, delivering the original refusal if the fallback cannot answer.
 - **Workflow watchdog support:** Uses a short buffering window for Claude Code Workflow agents so their content-stall timer does not trip.
 - **Diagnostics:** Logs one-line request outcomes and optionally archives full request/response payloads for debugging.
 
@@ -21,8 +21,8 @@ Agents / SDKs / applications → steady-proxy (127.0.0.1:8789) → your gateway
 | --- | --- | --- |
 | **Anthropic Messages** | `POST /v1/messages` (`stream: true`) | Buffers up to 10 minutes (`600000` ms) until `message_stop`, then replays. Workflow agents switch to live streaming after 10 seconds once content is ready. |
 | **OpenAI Responses** | `POST /v1/responses` (`stream: true`) | Catches start-of-stream failures before commit, then streams live on first output. Set `PROXY_RESPONSES_EARLY_COMMIT=0` for 10-minute full buffering. |
-| **Gemini GenerateContent** | `POST /{version}/models/{model}:streamGenerateContent?alt=sse` (including Vertex AI publisher paths) | Buffers up to 10 minutes through clean EOF after all requested candidates finish. |
-| **Other routes** | `/v1/chat/completions`, `generateContent`, `countTokens`, non-SSE `streamGenerateContent`, `/v1/models`, non-streaming calls | Forwarded single-shot; HTTP and connection errors still normalize for client retry. |
+| **Gemini GenerateContent** | `POST /{version}/models/{model}:streamGenerateContent?alt=sse` (including Vertex AI publisher and express paths) | Buffers up to 10 minutes through clean EOF after all requested candidates finish. |
+| **Other routes** | `/v1/chat/completions`, `generateContent`, `countTokens`, `embedContent`, non-SSE `streamGenerateContent`, `/v1/models`, non-streaming calls | Forwarded single-shot; recoverable HTTP and connection errors still normalize for client retry. |
 
 See [Architecture](docs/ARCHITECTURE.md#client-compatibility) for client compatibility details.
 

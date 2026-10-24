@@ -60,7 +60,7 @@ Client response-header, stream-idle, and per-attempt timeouts must be strictly g
 | `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | Extra in-proxy upstream attempts before commit on recoverable streaming failures. `0` keeps only a single fast retry (<3s failure, 250ms delay). |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` (10s) | Max exponential delay added to upstream `Retry-After` between local retries. `0` adds no extra delay. |
 | `PROXY_SDK_RETRY_CAP` | `100` | Stops converting errors into `503` retries once `X-Stainless-Retry-Count` reaches this value. `0` disables retry conversion and local retries. |
-| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | Fallback model for pre-commit Anthropic refusals and recognized Fable safeguard errors. Set to `off`, `none`, `disabled`, or `""` to disable. |
+| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | Fallback model for pre-commit refusals and recognized Fable safeguard errors from Claude models (model name containing `claude`). If the fallback fails terminally, the original answer is delivered. Set to `off`, `none`, `disabled`, or `""` to disable. |
 
 See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#model-fallback) for behavior details.
 
@@ -71,7 +71,7 @@ See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#mode
 | `PROXY_RESPONSES_EARLY_COMMIT` | `1` | Commit and stream `/v1/responses` as soon as the first output event arrives. Set `0` for full buffering under `PROXY_RESPONSES_BUFFER_MS`. |
 | `PROXY_RESPONSES_REPLAY_DELTA_BYTES` | `65536` (64 KiB) | Max source JSON bytes when merging adjacent compatible `response.output_text.delta` events on replay. `0` replays raw frames. |
 | `PROXY_VALIDATE_JSON` | `1` | Validate Anthropic SSE event JSON and accumulated tool-input JSON. `0` disables Anthropic JSON validation and tool-JSON normalization (terminal/error detection on Responses, Gemini, and Anthropic refusals stays active). |
-| `PROXY_NORMALIZE_TOOL_JSON` | `1` | Coalesce fragmented Anthropic `input_json_delta` chunks into a single valid JSON delta on buffered replay (requires `PROXY_VALIDATE_JSON=1`). |
+| `PROXY_NORMALIZE_TOOL_JSON` | `1` | Coalesce fragmented Anthropic `input_json_delta` chunks into a single valid JSON delta on buffered replay (requires `PROXY_VALIDATE_JSON=1`). Tool input cut off by `stop_reason: "max_tokens"` is replayed as the upstream sent it. |
 
 ## Storage and diagnostics
 
@@ -86,7 +86,7 @@ See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#mode
 
 ## Optional upstream headers
 
-Your gateway can attach these headers to non-2xx HTTP responses to override the proxy's error heuristics:
+Your gateway can attach these headers to non-2xx HTTP responses to override the proxy's status-based retry rule:
 
 | Upstream header | Effect |
 | --- | --- |
@@ -94,6 +94,6 @@ Your gateway can attach these headers to non-2xx HTTP responses to override the 
 | `x-should-retry: true` / `false` | Same effect when `x-gateway-retryable` is not set. |
 | `Retry-After` | Delay in seconds or HTTP-date format for local and client retries. |
 
-Non-retryable Responses errors normalize to HTTP `400`. Non-retryable Gemini `408`, `429`, and `5xx` errors also normalize to `400` so Gemini SDKs do not auto-retry them by status code.
+Terminal errors are relayed with the upstream's body and headers. Their status is kept, except that terminal Responses errors other than `400`/`429` become `400`, and terminal Gemini `408`, `429`, and `5xx` errors become `400`, so those SDKs do not auto-retry them by status code.
 
 The proxy strips `x-gateway-retryable`, `x-gateway-error-stage`, and `x-gateway-error-code` from incoming client requests so clients cannot spoof gateway hints.

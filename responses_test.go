@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -525,12 +526,13 @@ func TestResponsesStringTooLongSurfacedNotNative(t *testing.T) {
 func TestResponsesCompletedWithoutIDRetryable(t *testing.T) {
 	// Codex's ResponseCompleted requires a string `id`; a completed lacking one is a
 	// stream error on Codex's side, not a completion. The proxy must not record
-	// success — it leaves the stream un-terminated so EOF converts to a retry (which
-	// may fetch a clean terminal), mirroring Codex's fail-and-retry.
+	// success — it fails at that event under its own code (not a later
+	// truncated_stream), converting to a retry that may fetch a clean terminal,
+	// mirroring Codex's fail-and-retry.
 	stream := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
 	_, wrote, f := captureResp(t, strings.NewReader(stream), nil, time.Hour, false)
-	if wrote || f == nil || f.code != "truncated_stream" {
+	if wrote || f == nil || !f.transient || f.code != "responses_invalid_completed" {
 		t.Fatalf("id-less completed must convert to a retry; wrote=%v f=%v", wrote, f)
 	}
 }
@@ -542,7 +544,7 @@ func TestResponsesCompletedUsageMustBeComplete(t *testing.T) {
 	partial := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"
 	_, wrote, f := captureResp(t, strings.NewReader(partial), nil, time.Hour, false)
-	if wrote || f == nil || f.code != "truncated_stream" {
+	if wrote || f == nil || !f.transient || f.code != "responses_invalid_completed" {
 		t.Fatalf("completed with incomplete usage must convert to a retry; wrote=%v f=%v", wrote, f)
 	}
 	// usage ABSENT is valid (Codex's field is Option/default): a completed with just an
@@ -556,7 +558,7 @@ func TestResponsesCompletedUsageMustBeComplete(t *testing.T) {
 	// (input_tokens_details requires cached_tokens); the proxy must not record success.
 	emptyDetails := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15,\"input_tokens_details\":{}}}}\n\n"
 	_, wrote3, f3 := captureResp(t, strings.NewReader(emptyDetails), nil, time.Hour, false)
-	if wrote3 || f3 == nil || f3.code != "truncated_stream" {
+	if wrote3 || f3 == nil || !f3.transient || f3.code != "responses_invalid_completed" {
 		t.Fatalf("empty input_tokens_details must convert to a retry; wrote=%v f=%v", wrote3, f3)
 	}
 	// The same completed WITH the detail fields present succeeds.
@@ -567,51 +569,198 @@ func TestResponsesCompletedUsageMustBeComplete(t *testing.T) {
 	}
 }
 
-func TestResponsesIncompleteConvertsToRetry(t *testing.T) {
-	// response.incomplete is a RETRYABLE stream error for Codex (explicit arm ->
-	// ApiError::Stream), NOT a completion. The proxy converts it pre-commit rather than
-	// recording success, and captures the reason for the log.
-	stream := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
-		"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
-	_, wrote, f := captureResp(t, strings.NewReader(stream), nil, time.Hour, false)
-	if wrote || f == nil {
-		t.Fatalf("response.incomplete must convert, not succeed; wrote=%v f=%v", wrote, f)
-	}
-	if !f.transient || f.code != "responses_incomplete" {
-		t.Fatalf("want transient responses_incomplete, got %+v", *f)
-	}
-	if !strings.Contains(f.message, "max_output_tokens") {
-		t.Fatalf("incomplete reason should be captured, got %q", f.message)
+const responsesIncompleteFrame = "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
+
+// responsesCommitPrefix is the start of a turn that has produced output, so an
+// early-commit stream goes live before whatever follows it.
+const responsesCommitPrefix = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n" +
+	"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
+	"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\n"
+
+func responsesFailedFrame(errJSON string) string {
+	return "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":" + errJSON + "}}\n\n"
+}
+
+func responsesErrorEventFrame(errJSON string) string {
+	return "event: error\ndata: {\"type\":\"error\",\"error\":" + errJSON + "}\n\n"
+}
+
+func TestResponsesIncompleteDeliveredBeforeCommit(t *testing.T) {
+	// response.incomplete is a legitimate terminal (the OpenAI API defines it, and
+	// Codex >= 0.163 treats it as terminal): the buffered stream completes and is
+	// replayed verbatim — no failure, so no proxy retry.
+	stream := responsesCommitPrefix + responsesIncompleteFrame
+	for _, tc := range []struct {
+		name  string
+		r     io.Reader
+		early bool
+	}{
+		{"full-buffer", iotest1byte(stream), false},
+		{"early-commit-one-chunk", strings.NewReader(stream), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var st captureStats
+			rec, wrote, f := captureResp(t, tc.r, &st, time.Hour, tc.early)
+			if !wrote || f != nil {
+				t.Fatalf("incomplete must be delivered, not converted; wrote=%v f=%v", wrote, f)
+			}
+			if m := rec.Header().Get("X-Steady-Proxy-Mode"); m != "buffered" {
+				t.Fatalf("want buffered delivery, got mode %q", m)
+			}
+			if rec.Body.String() != stream {
+				t.Fatalf("incomplete terminal must be replayed verbatim, got %q", rec.Body.String())
+			}
+			if st.stop != "incomplete:max_output_tokens" {
+				t.Fatalf("stop reason must carry the incomplete reason, got %q", st.stop)
+			}
+		})
 	}
 }
 
-func TestResponsesPostCommitIncompleteDrops(t *testing.T) {
-	// created + output (commit) + response.incomplete. Post-commit, Codex raises a
-	// retryable stream error on the incomplete terminal, so the proxy must DROP
-	// (truncate) rather than forward it as a clean completion; the committed prefix is
-	// already delivered and Codex's native stream-retry re-issues. Complements the
-	// pre-commit TestResponsesIncompleteConvertsToRetry.
-	stream := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n" +
-		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
-		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\n" +
-		"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
-	rec, wrote, f := captureResp(t, iotest1byte(stream), nil, time.Hour, true)
-	if !wrote {
-		t.Fatalf("expected commit before the incomplete terminal (wrote=true)")
+func TestResponsesIncompleteDeliveredAfterCommit(t *testing.T) {
+	// Post-commit the incomplete terminal is forwarded as the stream's clean end:
+	// no DROP, so the client is not sent into a retry of a turn that finished.
+	stream := responsesCommitPrefix + responsesIncompleteFrame
+	var st captureStats
+	rec, wrote, f := captureResp(t, iotest1byte(stream), &st, time.Hour, true)
+	if !wrote || f != nil {
+		t.Fatalf("post-commit incomplete must complete, not DROP; wrote=%v f=%v", wrote, f)
 	}
-	if f == nil || !f.transient || f.code != "responses_incomplete" {
-		t.Fatalf("post-commit incomplete must DROP as a retryable failure, got wrote=%v f=%v", wrote, f)
+	if m := rec.Header().Get("X-Steady-Proxy-Mode"); m != "live" {
+		t.Fatalf("want live delivery, got mode %q", m)
 	}
-	if rec.Code != 200 {
-		t.Fatalf("committed stream must have sent 200 before dropping, got %d", rec.Code)
+	if rec.Body.String() != stream {
+		t.Fatalf("live stream must carry the incomplete terminal verbatim, got %q", rec.Body.String())
 	}
-	// The incomplete terminal must never reach the client as a clean completion.
-	if strings.Contains(rec.Body.String(), "response.incomplete") || strings.Contains(rec.Body.String(), "max_output_tokens") {
-		t.Fatalf("post-commit incomplete frame was forwarded to the client: %q", rec.Body.String())
+	if st.stop != "incomplete:max_output_tokens" {
+		t.Fatalf("stop reason must carry the incomplete reason, got %q", st.stop)
 	}
-	// The committed prefix was still delivered.
-	if !strings.Contains(rec.Body.String(), "response.output_text.delta") {
-		t.Fatalf("committed prefix should have been streamed, got %q", rec.Body.String())
+}
+
+// Codex parses an incomplete with reason "interrupted" as a completion, so that
+// snapshot must meet the response.completed bar; other reasons need none.
+func TestResponsesInterruptedIncompleteValidatedLikeCompleted(t *testing.T) {
+	frame := func(resp string) string {
+		return "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":" + resp + "}\n\n"
+	}
+	for _, tc := range []struct {
+		name, resp string
+		ok         bool
+	}{
+		{"interrupted-valid", `{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"interrupted"}}`, true},
+		{"interrupted-no-id", `{"status":"incomplete","incomplete_details":{"reason":"interrupted"}}`, false},
+		{"interrupted-partial-usage", `{"id":"resp_1","incomplete_details":{"reason":"interrupted"},"usage":{"input_tokens":1}}`, false},
+		{"max-output-no-id", `{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := responsesCommitPrefix + frame(tc.resp)
+			_, wrote, f := captureResp(t, strings.NewReader(stream), nil, time.Hour, false)
+			if tc.ok && (!wrote || f != nil) {
+				t.Fatalf("want delivered, got wrote=%v failure=%+v", wrote, f)
+			}
+			if !tc.ok && (wrote || f == nil || f.code != "responses_invalid_completed") {
+				t.Fatalf("want a pre-commit responses_invalid_completed, got wrote=%v failure=%+v", wrote, f)
+			}
+		})
+	}
+}
+
+func TestResponsesScrapeIncompleteStop(t *testing.T) {
+	for _, tc := range []struct{ data, want string }{
+		{`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}`, "incomplete:content_filter"},
+		{`{"type":"response.incomplete","response":{"status":"incomplete"}}`, "incomplete"},
+		{`{"type":"response.incomplete","response":{}}`, "incomplete"},
+		{`{"type":"response.completed","response":{"id":"r","status":"completed"}}`, "completed"},
+	} {
+		var st captureStats
+		newOpenAIWire().scrape(event{data: tc.data}, &st)
+		if st.stop != tc.want {
+			t.Errorf("scrape(%s) stop=%q, want %q", tc.data, st.stop, tc.want)
+		}
+	}
+}
+
+func TestResponsesInvalidCompletedFailsAtThatEvent(t *testing.T) {
+	// The malformed terminal fails the attempt at its own frame under its own code;
+	// a later (valid) terminal cannot rescue it, and EOF is never reached.
+	stream := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n"
+	rec, wrote, f := captureResp(t, strings.NewReader(stream), nil, time.Hour, false)
+	if wrote || f == nil || !f.transient || f.code != "responses_invalid_completed" {
+		t.Fatalf("want pre-commit transient responses_invalid_completed, got wrote=%v f=%v", wrote, f)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("nothing may be committed for a malformed terminal, got %q", rec.Body.String())
+	}
+}
+
+func TestResponsesLiveInvalidCompletedForwardedThenFails(t *testing.T) {
+	// Live, the frame is what the upstream sent and is forwarded, but it is not a
+	// completion: the attempt fails at that event, undelivered, so the handler DROPs.
+	bad := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	rec, wrote, f := captureResp(t, iotest1byte(responsesCommitPrefix+bad), nil, time.Hour, true)
+	if !wrote || f == nil {
+		t.Fatalf("want a committed stream that fails, got wrote=%v f=%v", wrote, f)
+	}
+	if !f.transient || f.delivered || f.code != "responses_invalid_completed" {
+		t.Fatalf("want transient undelivered responses_invalid_completed, got %+v", *f)
+	}
+	if !strings.HasSuffix(rec.Body.String(), bad) {
+		t.Fatalf("the upstream's frame must still be forwarded, got %q", rec.Body.String())
+	}
+}
+
+func TestResponsesLiveTerminalErrorIsDelivered(t *testing.T) {
+	// Past the commit boundary a terminal error is the upstream's final answer: its
+	// own frame is forwarded and the failure is marked delivered (the handler logs
+	// FAIL in-stream and ends cleanly) instead of DROPping into a pointless retry.
+	for _, tc := range []struct{ name, frame, code string }{
+		{"failed/cyber_policy", responsesFailedFrame(`{"code":"cyber_policy","message":"blocked"}`), "responses_request_shape"},
+		{"failed/invalid_prompt", responsesFailedFrame(`{"code":"invalid_prompt","message":"flagged"}`), "responses_request_shape"},
+		{"failed/insufficient_quota", responsesFailedFrame(`{"type":"insufficient_quota","code":"insufficient_quota","message":"quota"}`), "responses_quota"},
+		{"failed/usage_limit_reached", responsesFailedFrame(`{"type":"usage_limit_reached","message":"limit"}`), "responses_quota"},
+		{"failed/authentication_error", responsesFailedFrame(`{"type":"authentication_error","message":"bad key"}`), "responses_authentication_error"},
+		{"failed/context_length_exceeded", responsesFailedFrame(`{"code":"context_length_exceeded","message":"too long"}`), "responses_request_shape"},
+		{"error/nested", responsesErrorEventFrame(`{"type":"invalid_request_error","code":"cyber_policy","message":"blocked"}`), "responses_request_shape"},
+		{"error/top-level", "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"flagged\"}\n\n", "responses_request_shape"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, wrote, f := captureResp(t, iotest1byte(responsesCommitPrefix+tc.frame), nil, time.Hour, true)
+			if !wrote || f == nil || f.transient || !f.delivered || f.code != tc.code {
+				t.Fatalf("want a delivered terminal %s, got wrote=%v f=%+v", tc.code, wrote, f)
+			}
+			if !strings.HasSuffix(rec.Body.String(), tc.frame) {
+				t.Fatalf("the upstream's error frame must be forwarded verbatim, got %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestResponsesTransientErrorStillConvertsOrDrops(t *testing.T) {
+	// A transient in-band fault keeps its handling on both sides of the commit
+	// boundary: a pre-commit retry, a post-commit DROP — never forwarded.
+	for _, tc := range []struct{ name, frame, code string }{
+		{"failed/overloaded", responsesFailedFrame(`{"code":"server_is_overloaded","message":"overloaded"}`), "responses_overloaded"},
+		{"failed/server_error-unexpected-value", responsesFailedFrame(`{"type":"server_error","message":"unexpected value returned by backend provider"}`), "responses_error"},
+		{"error/rate-limit", responsesErrorEventFrame(`{"type":"rate_limit_error","message":"slow down"}`), "responses_rate_limit"},
+		{"error/api_error", responsesErrorEventFrame(`{"type":"api_error","message":"boom"}`), "responses_error"},
+	} {
+		t.Run(tc.name+"/pre-commit", func(t *testing.T) {
+			_, wrote, f := captureResp(t, strings.NewReader(tc.frame), nil, time.Hour, true)
+			if wrote || f == nil || !f.transient || f.code != tc.code {
+				t.Fatalf("want a pre-commit transient %s, got wrote=%v f=%+v", tc.code, wrote, f)
+			}
+		})
+		t.Run(tc.name+"/post-commit", func(t *testing.T) {
+			rec, wrote, f := captureResp(t, iotest1byte(responsesCommitPrefix+tc.frame), nil, time.Hour, true)
+			if !wrote || f == nil || !f.transient || f.delivered || f.code != tc.code {
+				t.Fatalf("want an undelivered transient %s (DROP), got wrote=%v f=%+v", tc.code, wrote, f)
+			}
+			if strings.Contains(rec.Body.String(), tc.frame) {
+				t.Fatalf("a transient error frame must not reach the client, got %q", rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -658,6 +807,37 @@ func TestParseRetryAfterFromMessage(t *testing.T) {
 		{"try again in 500ms.", 1},
 		{"try again in 2m", 120},
 		{"no delay advertised here", 0},
+		{"Rate limit reached for gpt-4o on tokens per min (TPM): Limit 30000, Used 29000, Requested 2000. Please try again in 2.004s. Visit https://platform.openai.com/account/rate-limits to learn more.", 3},
+		// "milliseconds" starts with "m" but is never minutes.
+		{"Please try again in 2 milliseconds.", 1},
+		{"try again in 1 millisecond", 1},
+		{"try again in 1500 milliseconds", 2},
+		{"try again in 2000ms", 2},
+		// Compact Go durations, including multi-term ones.
+		{"try again in 1m30s", 90},
+		{"Please try again in 1m30.5s.", 91},
+		{"try again in 1h2m", 3720},
+		{"try again in 1h", 3600},
+		{"try again in 0.1s", 1},
+		{"TRY AGAIN IN 3S", 3},
+		// Number + unit words.
+		{"try again in 6 seconds", 6},
+		{"try again in 1 second", 1},
+		{"try again in 5 secs", 5},
+		{"try again in 3 sec", 3},
+		{"try again in 2 minutes", 120},
+		{"try again in 1 minute", 60},
+		{"try again in 3 mins", 180},
+		{"try again in 1 min", 60},
+		{"try again in 2 hours", 7200},
+		{"try again in 1 hour", 3600},
+		{"try again in 1 minute 30 seconds", 90},
+		// Anything that is not a recognized duration advertises no delay.
+		{"try again in 0s", 0},
+		{"try again in 20 requests", 0},
+		{"try again in a while", 0},
+		{"try again in 5s 3 requests", 5},
+		{"try again in 99999999999h", 1<<31 - 1},
 	}
 	for _, c := range cases {
 		if got := parseRetryAfterFromMessage(c.msg); got != c.want {
@@ -695,24 +875,94 @@ func TestResponsesLiveMalformedFrameForwarded(t *testing.T) {
 }
 
 func TestClassifyResponsesHTTPError(t *testing.T) {
+	const tpm = `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"Request too large for gpt-4o in organization org-x on tokens per min (TPM): Limit 30000, Requested 35000. The input or output tokens must be reduced in order to run successfully."}}`
 	cases := []struct {
 		name          string
 		status        int
 		body          string
 		wantTransient bool
+		wantCode      string
 	}{
-		{"400-unknown-parameter", 400, `{"error":{"type":"invalid_request_error","code":"unknown_parameter","message":"Unknown parameter: foo"}}`, false},
-		{"400-model-not-found-code", 400, `{"error":{"code":"model_not_found","message":"the model does not exist"}}`, false},
-		{"400-context-length-code", 400, `{"error":{"code":"context_length_exceeded","message":"input exceeds the context window"}}`, false},
-		{"400-generic-rides-out", 400, `{"error":{"type":"api_error","message":"transient hiccup"}}`, true},
-		{"429-rate-limited", 429, `{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`, true},
-		{"503-overloaded", 503, `{"error":{"message":"overloaded"}}`, true},
+		{"400-unknown-parameter", 400, `{"error":{"type":"invalid_request_error","code":"unknown_parameter","message":"Unknown parameter: foo"}}`, false, "request_shape"},
+		{"400-model-not-found-code", 400, `{"error":{"code":"model_not_found","message":"the model does not exist"}}`, false, "request_shape"},
+		{"400-context-length-code", 400, `{"error":{"code":"context_length_exceeded","message":"input exceeds the context window"}}`, false, "request_shape"},
+		{"400-invalid-request-type-only", 400, `{"error":{"type":"invalid_request_error","message":"bad request"}}`, false, "request_shape"},
+		// 4xx is terminal by status: an unnamed or generic type is not evidence of a transient fault.
+		{"400-api-error-is-terminal", 400, `{"error":{"type":"api_error","message":"transient hiccup"}}`, false, "http_400"},
+		{"400-flat-vllm-body", 400, `{"object":"error","message":"unexpected value","type":"BadRequestError","param":null,"code":400}`, false, "http_400"},
+		{"401-authentication-error", 401, `{"error":{"type":"authentication_error","message":"Incorrect API key provided"}}`, false, "http_401"},
+		{"403-permission-error", 403, `{"error":{"type":"permission_error","message":"not allowed"}}`, false, "http_403"},
+		{"404-not-found-error", 404, `{"error":{"type":"not_found_error","message":"no such resource"}}`, false, "http_404"},
+		{"401-server-error-type", 401, `{"error":{"type":"server_error","message":"auth backend down"}}`, false, "http_401"},
+		{"422-unknown-type", 422, `{"error":{"type":"mystery_error","message":"x"}}`, false, "http_422"},
+		// An explicit transient identity retries even a 4xx.
+		{"400-overloaded-code-retried", 400, `{"error":{"type":"invalid_request_error","code":"server_is_overloaded","message":"overloaded"}}`, true, "retryable_4xx_400"},
+		{"400-timeout-type-retried", 400, `{"error":{"type":"timeout_error","message":"slow"}}`, true, "retryable_4xx_400"},
+		{"429-rate-limited", 429, `{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`, true, "rate_limit"},
+		{"429-empty-body", 429, ``, true, "rate_limit"},
+		{"429-tpm-rate-limit", 429, `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"Rate limit reached for gpt-4o on tokens per min (TPM): Limit 30000, Used 29000, Requested 2000. Please try again in 2s."}}`, true, "rate_limit"},
+		// Permanent 429s are the upstream's final answer.
+		{"429-insufficient-quota", 429, `{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}`, false, "http_429"},
+		{"429-quota-code-beats-rate-limit-type", 429, `{"error":{"type":"rate_limit_error","code":"insufficient_quota","message":"quota"}}`, false, "http_429"},
+		{"429-usage-limit-reached", 429, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":3600}}`, false, "http_429"},
+		{"429-usage-not-included", 429, `{"error":{"type":"usage_not_included","message":"not included in your plan"}}`, false, "http_429"},
+		{"429-request-too-large", 429, tpm, false, "http_429"},
+		{"429-untyped-shape-phrase", 429, `{"error":{"message":"prompt is too long"}}`, false, "http_429"},
+		{"429-explicit-type-ignores-phrase", 429, `{"error":{"type":"server_error","message":"unexpected value returned by backend provider"}}`, true, "rate_limit"},
+		{"500-server-error-unexpected-value", 500, `{"error":{"type":"server_error","message":"unexpected value returned by backend provider"}}`, true, "http_500"},
+		{"503-overloaded", 503, `{"error":{"message":"overloaded"}}`, true, "http_503"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := classifyResponsesHTTPErrorBytes(mkResp(c.status, c.body), []byte(c.body))
-			if f.transient != c.wantTransient {
-				t.Errorf("transient=%v want %v (%+v)", f.transient, c.wantTransient, f)
+			if f.transient != c.wantTransient || f.code != c.wantCode {
+				t.Errorf("transient=%v code=%q, want transient=%v code=%q (%+v)", f.transient, f.code, c.wantTransient, c.wantCode, f)
+			}
+		})
+	}
+}
+
+func TestResponsesErrorVerdict(t *testing.T) {
+	const tpm = "Request too large for gpt-4o on tokens per min (TPM): Limit 30000, Requested 35000. The input or output tokens must be reduced in order to run successfully."
+	for _, tc := range []struct {
+		name, atype, code, msg string
+		want                   errorVerdict
+	}{
+		// Explicit transient identities.
+		{"timeout-type", "timeout_error", "", "", verdictTransient},
+		{"rate-limit-type", "rate_limit_error", "", "", verdictTransient},
+		{"overloaded-type", "overloaded_error", "", "", verdictTransient},
+		{"service-unavailable-type", "service_unavailable_error", "", "", verdictTransient},
+		{"request-timeout-code", "invalid_request_error", "request_timeout", "", verdictTransient},
+		{"rate-limit-exceeded-code", "", "rate_limit_exceeded", "", verdictTransient},
+		{"server-is-overloaded-code", "invalid_request_error", "server_is_overloaded", "", verdictTransient},
+		{"overloaded-code", "", "overloaded", "", verdictTransient},
+		{"normalized", " Timeout_Error ", " REQUEST_TIMEOUT ", "", verdictTransient},
+		{"tpm-rate-limit-without-overflow", "tokens", "rate_limit_exceeded", "Please try again in 2s.", verdictTransient},
+		// Permanent: request shape and exhausted quota.
+		{"invalid-request-type", "invalid_request_error", "", "bad", verdictPermanent},
+		{"request-shape-code", "", "unknown_parameter", "", verdictPermanent},
+		{"context-length-beats-transient-type", "overloaded_error", "context_length_exceeded", "", verdictPermanent},
+		{"quota-type", "insufficient_quota", "", "", verdictPermanent},
+		{"quota-code", "", "insufficient_quota", "", verdictPermanent},
+		{"quota-code-beats-rate-limit-type", "rate_limit_error", "insufficient_quota", "", verdictPermanent},
+		{"usage-limit-reached", "usage_limit_reached", "", "", verdictPermanent},
+		{"usage-not-included", "usage_not_included", "", "", verdictPermanent},
+		{"request-too-large-beats-rate-limit-code", "tokens", "rate_limit_exceeded", tpm, verdictPermanent},
+		{"untyped-shape-phrase", "", "", "prompt is too long", verdictPermanent},
+		// Everything else names no retry-relevant identity.
+		{"authentication", "authentication_error", "", "bad key", verdictUnknown},
+		{"permission", "permission_error", "", "denied", verdictUnknown},
+		{"not-found", "not_found_error", "", "missing", verdictUnknown},
+		{"server-error", "server_error", "", "boom", verdictUnknown},
+		{"server-error-ignores-shape-phrase", "server_error", "", "unexpected value returned by backend provider", verdictUnknown},
+		{"api-error", "api_error", "", "boom", verdictUnknown},
+		{"vllm-type", "BadRequestError", "", "", verdictUnknown},
+		{"flat-body", "", "", "", verdictUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responsesErrorVerdict(tc.atype, tc.code, tc.msg, strings.ToLower(tc.msg)); got != tc.want {
+				t.Fatalf("verdict=%d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -879,6 +1129,7 @@ func TestE2EResponsesHTTP503Retryable(t *testing.T) {
 // ─────────────────────────────────────────────── classification unit tests ──
 
 func TestClassifyResponsesError(t *testing.T) {
+	const tpm = "Request too large for gpt-4o in organization org-x on tokens per min (TPM): Limit 30000, Requested 35000. The input or output tokens must be reduced in order to run successfully."
 	cases := []struct {
 		name           string
 		typ, code, msg string
@@ -889,17 +1140,37 @@ func TestClassifyResponsesError(t *testing.T) {
 		{"overload-by-type", "overloaded_error", "", "", true, "responses_overloaded"},
 		{"rate-limit", "rate_limit_error", "", "slow down", true, "responses_rate_limit"},
 		{"rate-limit-code", "", "rate_limit_exceeded", "", true, "responses_rate_limit"},
+		{"tpm-rate-limit-stays-transient", "tokens", "rate_limit_exceeded", "Rate limit reached on tokens per min (TPM). Please try again in 6s.", true, "responses_rate_limit"},
 		{"timeout-mislabeled-as-invalid-request", "invalid_request_error", "request_timeout", "stream error: stream disconnected before completion: stream closed before response.completed", true, "responses_timeout"},
 		{"timeout-code-only", "", "request_timeout", "upstream timed out", true, "responses_timeout"},
 		{"timeout-code-normalized", "invalid_request_error", " REQUEST_TIMEOUT ", "upstream timed out", true, "responses_timeout"},
 		{"request-shape-type", "invalid_request_error", "", "bad tool schema", false, "responses_request_shape"},
-		{"request-shape-msg", "api_error", "", "prompt is too long for context", false, "responses_request_shape"},
 		{"request-shape-code-only", "", "context_length_exceeded", "input exceeds the context window", false, "responses_request_shape"},
 		{"invalid-prompt-code", "", "invalid_prompt", "flagged", false, "responses_request_shape"},
 		{"bio-policy-code", "", "bio_policy", "blocked", false, "responses_request_shape"},
 		{"cyber-policy-code", "", "cyber_policy", "blocked", false, "responses_request_shape"},
-		{"auth-rides-out", "authentication_error", "", "bad key", true, "responses_error"},
-		{"unknown-rides-out", "server_error", "", "boom", true, "responses_error"},
+		// The Anthropic-derived phrases apply only to an untyped error.
+		{"request-shape-phrase-untyped", "", "", "prompt is too long for context", false, "responses_request_shape"},
+		{"request-shape-phrase-ignored-for-api-error", "api_error", "", "prompt is too long for context", true, "responses_error"},
+		{"server-error-unexpected-value-stays-transient", "server_error", "", "unexpected value returned by backend provider", true, "responses_error"},
+		{"untyped-unexpected-value", "", "", "unexpected value returned by backend provider", false, "responses_request_shape"},
+		// A request too large for the TPM limit is permanent despite its transient code.
+		{"request-too-large-tpm", "tokens", "rate_limit_exceeded", tpm, false, "responses_request_shape"},
+		// Exhausted quota and plan limits are permanent.
+		{"quota-type-and-code", "insufficient_quota", "insufficient_quota", "You exceeded your current quota", false, "responses_quota"},
+		{"quota-code-only", "", "insufficient_quota", "quota", false, "responses_quota"},
+		{"quota-code-beats-rate-limit-type", "rate_limit_error", "insufficient_quota", "quota", false, "responses_quota"},
+		{"usage-limit-reached", "usage_limit_reached", "", "The usage limit has been reached", false, "responses_quota"},
+		{"usage-not-included", "usage_not_included", "", "not included in your plan", false, "responses_quota"},
+		// A refused caller is as final in-band as its HTTP status is over HTTP.
+		{"authentication-is-terminal", "authentication_error", "", "bad key", false, "responses_authentication_error"},
+		{"permission-is-terminal", "permission_error", "", "no access", false, "responses_permission_error"},
+		{"not-found-is-terminal", "not_found_error", "", "no such resource", false, "responses_not_found_error"},
+		// No identity either way: ride it out.
+		{"server-error-rides-out", "server_error", "", "boom", true, "responses_error"},
+		{"api-error-rides-out", "api_error", "", "boom", true, "responses_error"},
+		{"unknown-type-rides-out", "mystery_error", "", "boom", true, "responses_error"},
+		{"empty-rides-out", "", "", "", true, "responses_error"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -911,6 +1182,39 @@ func TestClassifyResponsesError(t *testing.T) {
 				t.Errorf("code=%q want %q", f.code, c.wantCode)
 			}
 		})
+	}
+}
+
+func TestClassifyResponsesTerminalSurface(t *testing.T) {
+	// Exhausted quota keeps its identity as the type and a 429 as the status:
+	// surfaceFor keeps 429, which Codex treats as terminal and words as a usage limit.
+	for _, tc := range []struct{ typ, code, wantType string }{
+		{"insufficient_quota", "insufficient_quota", "insufficient_quota"},
+		{"", "insufficient_quota", "insufficient_quota"},
+		{"rate_limit_error", "insufficient_quota", "insufficient_quota"},
+		{"usage_limit_reached", "", "usage_limit_reached"},
+		{"usage_not_included", "", "usage_not_included"},
+	} {
+		f := classifyResponsesError(tc.typ, tc.code, "limit")
+		if f.transient || f.status != 429 || f.atype != tc.wantType {
+			t.Errorf("%q/%q: want terminal 429 %s, got %+v", tc.typ, tc.code, tc.wantType, *f)
+		}
+		if s, _ := surfaceFor("/v1/responses", *f); s != 429 {
+			t.Errorf("%q/%q: surfaceFor status=%d, want 429", tc.typ, tc.code, s)
+		}
+	}
+	// A refused caller carries its HTTP status and type; Codex is still shown 400.
+	for _, tc := range []struct {
+		typ    string
+		status int
+	}{{"authentication_error", 401}, {"permission_error", 403}, {"not_found_error", 404}} {
+		f := classifyResponsesError(tc.typ, "", "refused")
+		if f.transient || f.status != tc.status || f.atype != tc.typ {
+			t.Errorf("%s: want terminal %d, got %+v", tc.typ, tc.status, *f)
+		}
+		if s, _ := surfaceFor("/v1/responses", *f); s != 400 {
+			t.Errorf("%s: surfaceFor status=%d, want 400", tc.typ, s)
+		}
 	}
 }
 
@@ -1196,5 +1500,231 @@ func TestE2EResponsesRequestTimeoutRetries(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestE2EResponsesIncompleteIsNotRetried(t *testing.T) {
+	// A pre-commit response.incomplete is a finished turn: delivered once, with no
+	// local retry (re-sending would re-bill the generation) and logged as a success.
+	var hits atomic.Int32
+	stream := responsesCommitPrefix + responsesIncompleteFrame
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, stream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.responsesEarlyCommit = false
+	cfg.txLocalRetries = 2
+	cfg.localBackoffCap = 0
+
+	var rec *httptest.ResponseRecorder
+	logs := captureLogs(t, func() { rec = doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`) })
+	if rec.Code != 200 || hits.Load() != 1 || rec.Body.String() != stream {
+		t.Fatalf("want one verbatim 200 delivery, got status=%d attempts=%d body=%q", rec.Code, hits.Load(), rec.Body.String())
+	}
+	if line := firstLogLineContaining(logs, "OK "); !strings.Contains(line, "incomplete:max_output_tokens") {
+		t.Fatalf("incomplete must be logged as a success with its reason:\n%s", logs)
+	}
+}
+
+func TestE2EResponsesTerminalHTTPErrorsReplayedVerbatim(t *testing.T) {
+	// The upstream's final answer is replayed byte-for-byte with X-Should-Retry:
+	// false after exactly one attempt — never retried, never rewritten to a 503.
+	// Responses clients are shown 400 or 429 only (surfaceFor).
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   int
+		reason string
+	}{
+		{"401-authentication_error", 401, `{"error":{"message":"Incorrect API key provided","type":"authentication_error","code":null}}`, 400, "http_401"},
+		{"403-permission_error", 403, `{"error":{"message":"not allowed","type":"permission_error"}}`, 400, "http_403"},
+		{"400-flat-vllm", 400, `{"object":"error","message":"unexpected value for field","type":"BadRequestError","param":null,"code":400}`, 400, "http_400"},
+		{"429-insufficient_quota", 429, `{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}`, 429, "http_429"},
+		{"429-usage_limit_reached", 429, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":3600}}`, 429, "http_429"},
+		{"429-request-too-large", 429, `{"error":{"type":"tokens","code":"rate_limit_exceeded","message":"Request too large for gpt-4o on tokens per min (TPM): Limit 30000, Requested 35000. The input or output tokens must be reduced in order to run successfully."}}`, 429, "http_429"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.txLocalRetries = 2
+			cfg.localBackoffCap = 0
+
+			rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("a terminal error must not be retried; upstream attempts=%d", got)
+			}
+			if rec.Code != tc.want || rec.Header().Get("X-Should-Retry") != "false" {
+				t.Fatalf("want status %d with X-Should-Retry false, got %d / %q", tc.want, rec.Code, rec.Header().Get("X-Should-Retry"))
+			}
+			if rec.Body.String() != tc.body {
+				t.Fatalf("the upstream's body must be replayed verbatim, got %q", rec.Body.String())
+			}
+			if reason := rec.Header().Get("X-Steady-Proxy-Reason"); reason != tc.reason {
+				t.Fatalf("reason=%q, want %q", reason, tc.reason)
+			}
+		})
+	}
+}
+
+func TestE2EResponsesHTTP400OverloadedCodeStillRetried(t *testing.T) {
+	// A gateway that answers a capacity fault with 400 still names it: the explicit
+	// transient code outranks the 4xx-is-terminal status rule.
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"server_is_overloaded","message":"Our servers are currently overloaded."}}`)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = time.Millisecond
+
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("want the initial attempt plus one local retry, got %d", got)
+	}
+	if rec.Code != 503 || rec.Header().Get("X-Should-Retry") != "true" || rec.Header().Get("X-Steady-Proxy-Reason") != "retryable_4xx_400" {
+		t.Fatalf("want a retryable 503 (retryable_4xx_400), got %d headers=%v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+}
+
+func TestE2EResponsesInBandQuotaSurfacesTerminal429(t *testing.T) {
+	// An exhausted quota reported in-band before any output is final: no retry, and
+	// Codex is shown a 429 carrying the quota identity.
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, responsesFailedFrame(`{"code":"insufficient_quota","message":"You exceeded your current quota"}`))
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.txLocalRetries = 2
+	cfg.localBackoffCap = 0
+
+	rec := doStreamResponses(`{"stream":true,"model":"gpt-5.6"}`)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("a terminal in-band error must not be retried; attempts=%d", got)
+	}
+	if rec.Code != 429 || rec.Header().Get("X-Should-Retry") != "false" || !strings.Contains(rec.Body.String(), `"type":"insufficient_quota"`) {
+		t.Fatalf("want a terminal 429 insufficient_quota, got %d headers=%v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+}
+
+// streamResponsesLive serves prefix upstream, waits until the client has read it
+// back through the proxy (so the stream is committed live), then serves tail. It
+// returns the whole body the client saw, the read error (non-nil when the proxy
+// aborted the response instead of ending it), and the proxy's log.
+func streamResponsesLive(t *testing.T, prefix, tail string) (body string, readErr error, logs string) {
+	t.Helper()
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, prefix)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+			io.WriteString(w, tail)
+		case <-r.Context().Done():
+		}
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	handled := make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handled) // runs on the abort panic too
+		handle(w, r)
+	}))
+	defer proxy.Close()
+
+	logs = captureLogs(t, func() {
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Post(proxy.URL+"/v1/responses", "application/json", strings.NewReader(`{"stream":true,"model":"gpt-5.6"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 || resp.Header.Get("X-Steady-Proxy-Mode") != "live" {
+			t.Fatalf("want a committed live response, got status=%d headers=%v", resp.StatusCode, resp.Header)
+		}
+		reader := bufio.NewReader(resp.Body)
+		var received strings.Builder
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("reading committed content: %v", err)
+			}
+			received.WriteString(line)
+			if strings.Contains(line, `"delta"`) {
+				break
+			}
+		}
+		// Release the tail only after the client has observed actual output.
+		close(release)
+		rest, err := io.ReadAll(reader)
+		received.Write(rest)
+		body, readErr = received.String(), err
+		// The handler logs its outcome after the client sees the end of the body.
+		<-handled
+	})
+	return body, readErr, logs
+}
+
+func TestE2EResponsesLiveTerminalErrorDelivered(t *testing.T) {
+	// After the response is committed, a terminal error is forwarded and the stream
+	// ends cleanly (FAIL in-stream); a transient one still aborts it (DROP).
+	for _, tc := range []struct {
+		name      string
+		tail      string
+		delivered bool
+		logHas    string
+	}{
+		{"cyber_policy", responsesFailedFrame(`{"code":"cyber_policy","message":"blocked"}`), true, "responses_request_shape -> delivered in-stream"},
+		{"insufficient_quota", responsesFailedFrame(`{"type":"insufficient_quota","code":"insufficient_quota","message":"quota"}`), true, "responses_quota -> delivered in-stream"},
+		{"top-level-error", "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"flagged\"}\n\n", true, "responses_request_shape -> delivered in-stream"},
+		{"context_length_exceeded", responsesFailedFrame(`{"code":"context_length_exceeded","message":"too long"}`), true, "responses_request_shape -> delivered in-stream"},
+		{"transient-overload", responsesFailedFrame(`{"code":"server_is_overloaded","message":"overloaded"}`), false, "DROP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, readErr, logs := streamResponsesLive(t, responsesCommitPrefix, tc.tail)
+			if !strings.Contains(logs, tc.logHas) {
+				t.Fatalf("log missing %q:\n%s", tc.logHas, logs)
+			}
+			if !tc.delivered {
+				if readErr == nil || strings.Contains(body, tc.tail) {
+					t.Fatalf("a transient failure must abort the response without its frame; readErr=%v body=%q", readErr, body)
+				}
+				return
+			}
+			if readErr != nil || !strings.HasSuffix(body, tc.tail) || strings.Contains(logs, "DROP") {
+				t.Fatalf("a terminal error must be forwarded and the stream ended cleanly; readErr=%v body=%q logs=%s", readErr, body, logs)
+			}
+		})
+	}
+}
+
+func TestE2EResponsesLiveIncompleteDelivered(t *testing.T) {
+	body, readErr, logs := streamResponsesLive(t, responsesCommitPrefix, responsesIncompleteFrame)
+	if readErr != nil || !strings.HasSuffix(body, responsesIncompleteFrame) {
+		t.Fatalf("incomplete must end the live stream cleanly with its frame; readErr=%v body=%q", readErr, body)
+	}
+	if strings.Contains(logs, "DROP") || !strings.Contains(firstLogLineContaining(logs, "OK "), "incomplete:max_output_tokens") {
+		t.Fatalf("incomplete must be logged as a success with its reason:\n%s", logs)
 	}
 }

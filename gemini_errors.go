@@ -16,8 +16,8 @@ type geminiAPIError struct {
 	Message string `json:"message"`
 	Details []struct {
 		Type       string          `json:"@type"`
-		Reason     string          `json:"reason"`
 		RetryDelay json.RawMessage `json:"retryDelay"`
+		Violations json.RawMessage `json:"violations"`
 	} `json:"details,omitempty"`
 }
 
@@ -34,38 +34,25 @@ func classifyGeminiHTTPErrorBytes(resp *http.Response, b []byte) failure {
 		decodeErr = json.Unmarshal(data, &envelopes[0])
 	}
 	if decodeErr != nil {
-		// A malformed or classification-size-limited body cannot establish a
-		// deterministic validation error. Header retry verdicts still win.
-		return classifyHTTPErrorBytesShaped(resp, b, func(_, _, _, _ string) bool { return false })
+		// Not a Google envelope (a gateway page, a proxy's own JSON, another
+		// vendor's shape), so error.status gives no verdict. Judge the raw body
+		// the way every non-Gemini route does. Header retry verdicts still win.
+		return classifyHTTPErrorBytes(resp, b)
 	}
 	return classifyGeminiErrorBytes(resp, b, envelopes[0].Error)
 }
 
 func classifyGeminiErrorBytes(resp *http.Response, b []byte, e geminiAPIError) failure {
 	nativeStatus := strings.ToUpper(strings.TrimSpace(e.Status))
-	f := classifyHTTPErrorBytesShaped(resp, b, func(_, _, _, _ string) bool {
-		// Google's documented invalid-key response is also INVALID_ARGUMENT.
-		// Its machine-readable ErrorInfo keeps authentication on the retry path.
-		for _, detail := range e.Details {
-			if detail.Type == "type.googleapis.com/google.rpc.ErrorInfo" && detail.Reason == "API_KEY_INVALID" {
-				return false
-			}
-		}
-		if nativeStatus == "INVALID_ARGUMENT" || nativeStatus == "NOT_FOUND" {
-			return true
-		}
-		// FAILED_PRECONDITION can mean disabled billing or an unsupported region.
-		// A named status owns the decision; bare 400/404 is only a fallback.
+	f := classifyHTTPErrorBytesShaped(resp, b, func(atype, code, msg, _ string) errorVerdict {
 		if nativeStatus == "" {
-			status := e.Code
-			if status == 0 {
-				status = resp.StatusCode
-			}
-			if status == http.StatusBadRequest || status == http.StatusNotFound {
-				return true
-			}
+			// Decodes as {"error":{...}} but carries no Google identity (e.g. a
+			// gateway's own {"error":{"type":"overloaded_error"}}): judge it the
+			// way every other route does. Request-shape phrases are matched in
+			// the message only, never in details metadata.
+			return anthropicErrorVerdict(atype, code, msg, strings.ToLower(e.Message))
 		}
-		return anyContains(strings.ToLower(e.Message), requestShapeSigs)
+		return geminiErrorVerdict(nativeStatus, e)
 	})
 	// The shared classifier expects a string error.code. Read Google's fields
 	// ourselves without translating or re-encoding the archived upstream body.
@@ -90,6 +77,57 @@ func classifyGeminiErrorBytes(resp *http.Response, b []byte, e geminiAPIError) f
 		}
 	}
 	return f
+}
+
+// geminiErrorVerdict reads google.rpc.Code in error.status, the field Google
+// defines for retry semantics. HTTP status alone cannot: the same 400 carries
+// FAILED_PRECONDITION or UNAUTHENTICATED (no retry fixes either) and a
+// gateway's mislabeled UNAVAILABLE. Statuses outside the table (CANCELLED,
+// DATA_LOSS, vendor extensions) leave the HTTP status to decide.
+func geminiErrorVerdict(status string, e geminiAPIError) errorVerdict {
+	switch status {
+	case "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "UNKNOWN", "ABORTED":
+		return verdictTransient
+	case "RESOURCE_EXHAUSTED":
+		// A per-minute limit clears on its own; a per-day quota stays exhausted
+		// for hours, so replaying the request would only spend attempts.
+		if geminiDailyQuotaExhausted(e) {
+			return verdictPermanent
+		}
+		return verdictTransient
+	case "INVALID_ARGUMENT", "FAILED_PRECONDITION", "OUT_OF_RANGE", "UNAUTHENTICATED",
+		"PERMISSION_DENIED", "NOT_FOUND", "ALREADY_EXISTS", "UNIMPLEMENTED":
+		return verdictPermanent
+	}
+	// A status outside the table: the message is the only evidence.
+	if anyContains(strings.ToLower(e.Message), requestShapeSigs) {
+		return verdictPermanent
+	}
+	return verdictUnknown
+}
+
+// geminiDailyQuotaExhausted reports a google.rpc.QuotaFailure naming a per-day
+// quota (e.g. GenerateRequestsPerDayPerProjectPerModel-FreeTier). Violations
+// stay raw until a QuotaFailure is found, so another detail type's differently
+// shaped "violations" can never invalidate the envelope.
+func geminiDailyQuotaExhausted(e geminiAPIError) bool {
+	for _, detail := range e.Details {
+		if detail.Type != "type.googleapis.com/google.rpc.QuotaFailure" {
+			continue
+		}
+		var violations []struct {
+			QuotaID string `json:"quotaId"`
+		}
+		if json.Unmarshal(detail.Violations, &violations) != nil {
+			continue
+		}
+		for _, v := range violations {
+			if strings.Contains(v.QuotaID, "PerDay") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ProtoJSON Duration uses seconds with up to nine fractional digits. Round up
@@ -138,11 +176,15 @@ func classifyGeminiSSEError(data string) *failure {
 	status := e.Code
 	if status < 400 || status > 599 {
 		status = geminiHTTPStatus(strings.ToUpper(strings.TrimSpace(e.Status)))
-		if status == 0 {
-			status = http.StatusBadGateway
-		}
+	}
+	// An in-band error has no HTTP response of its own; the code it carries is
+	// the upstream status the logs should show. 0 when it names neither.
+	upstreamStatus := status
+	if status == 0 {
+		status = http.StatusBadGateway
 	}
 	f := classifyGeminiErrorBytes(&http.Response{StatusCode: status}, b, e)
+	f.origStatus = upstreamStatus
 	f.code = "gemini_sse_" + f.code
 	return &f
 }
@@ -224,8 +266,12 @@ func writeGeminiError(w http.ResponseWriter, canRetry bool, status int, atype, m
 	if status <= 0 {
 		status = http.StatusBadGateway
 	}
+	// The canonical status is the upstream's own diagnosis and survives a forced
+	// HTTP status (a terminal 429 is surfaced as 400 so clients that retry on
+	// 429 stop). Only an atype that is not a Google status, such as the
+	// Anthropic-style types of proxy-originated errors, is derived from HTTP.
 	nativeStatus := strings.ToUpper(strings.TrimSpace(atype))
-	if geminiHTTPStatus(nativeStatus) != status {
+	if geminiHTTPStatus(nativeStatus) == 0 {
 		nativeStatus = geminiStatusForHTTP(status)
 	}
 	w.WriteHeader(status)
