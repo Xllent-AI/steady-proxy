@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -168,6 +169,64 @@ func TestGeminiCommittedTruncationAbortsHTTP(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	if err == nil || !strings.Contains(string(body), "partial") || calls.Load() != 1 {
 		t.Fatalf("committed truncation must fail transport without replay: body=%q err=%v calls=%d", body, err, calls.Load())
+	}
+}
+
+// After commit, a terminal in-band error (here a per-day quota) is the
+// upstream's final answer: forwarded verbatim and ended cleanly, never aborted
+// into a client retry that cannot succeed. A transient one still aborts.
+func TestGeminiCommittedTerminalErrorIsDelivered(t *testing.T) {
+	const partial = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n"
+	for _, tc := range []struct {
+		name, frame string
+		delivered   bool
+	}{
+		{"daily-quota", "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"quota\",\"details\":" + geminiDailyQuotaDetails + "}}\n\n", true},
+		{"unauthenticated", "data: {\"error\":{\"code\":401,\"status\":\"UNAUTHENTICATED\",\"message\":\"bad key\"}}\n\n", true},
+		{"unavailable", "data: {\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"busy\"}}\n\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			release := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, partial)
+				w.(http.Flusher).Flush()
+				select {
+				case <-release:
+					io.WriteString(w, tc.frame)
+				case <-r.Context().Done():
+				}
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.geminiBufferMs = 5 * time.Millisecond
+			cfg.txLocalRetries = 3
+			proxy := httptest.NewServer(http.HandlerFunc(handle))
+			defer proxy.Close()
+			resp, err := http.Post(proxy.URL+geminiStreamPath, "application/json", strings.NewReader(`{"contents":[]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			reader := bufio.NewReader(resp.Body)
+			if line, err := reader.ReadString('\n'); err != nil || !strings.Contains(line, "partial") {
+				t.Fatalf("want the committed prefix first: %q %v", line, err)
+			}
+			close(release)
+			rest, err := io.ReadAll(reader)
+			if calls.Load() != 1 {
+				t.Fatalf("a committed stream must not be replayed: calls=%d", calls.Load())
+			}
+			if tc.delivered && (err != nil || !strings.HasSuffix(string(rest), tc.frame)) {
+				t.Fatalf("terminal error must be forwarded and end cleanly: err=%v rest=%q", err, rest)
+			}
+			if !tc.delivered && (err == nil || strings.Contains(string(rest), "UNAVAILABLE")) {
+				t.Fatalf("transient error must abort without its frame: err=%v rest=%q", err, rest)
+			}
+		})
 	}
 }
 

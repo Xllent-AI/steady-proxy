@@ -374,8 +374,15 @@ func TestGeminiInBandErrorsFailBeforeAndAfterFinish(t *testing.T) {
 					if live {
 						var out [][]byte
 						out, done, f = wire.live(ev, ev.raw, nil)
-						if len(out) != 0 {
-							t.Fatalf("in-band error must not be forwarded: %q", out)
+						// A terminal error is the upstream's answer and is delivered
+						// verbatim; a transient one is never forwarded (the abort
+						// hands recovery to the client).
+						if f == nil || f.transient {
+							if len(out) != 0 || (f != nil && f.delivered) {
+								t.Fatalf("transient in-band error must not be forwarded: %q", out)
+							}
+						} else if !f.delivered || len(out) != 1 || string(out[0]) != string(ev.raw) {
+							t.Fatalf("terminal in-band error must be delivered verbatim: delivered=%v out=%q", f.delivered, out)
 						}
 					} else {
 						done, f = wire.buffered(ev, nil)
