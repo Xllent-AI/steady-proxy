@@ -332,6 +332,16 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	canWait := func(wait time.Duration) bool {
 		return canWaitForLocalRetry(ctx, wait) && (commitBy.IsZero() || time.Until(commitBy) > wait)
 	}
+	// waitToRetry sleeps out a local-retry delay. If the request ends during the
+	// wait (the client left), that becomes its outcome: the upstream failure the
+	// retry was answering is no longer what the client experienced.
+	waitToRetry := func(wait time.Duration) bool {
+		if sleepWithContext(ctx, wait) {
+			return true
+		}
+		last = classifyTransport(ctx.Err(), ctx)
+		return false
+	}
 	tryLocalRetry := func(f failure) bool {
 		if cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
 			return false
@@ -343,7 +353,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.noteAttemptRetry("local_retry", wait)
 		logLocalRetry(reqWho, reqEffort, f, wait, proxyRetries+1, cfg.txLocalRetries, retryCount, "")
-		if !sleepWithContext(ctx, wait) {
+		if !waitToRetry(wait) {
 			return false
 		}
 		proxyRetries++
@@ -416,7 +426,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
-				if !sleepWithContext(ctx, wait) {
+				if !waitToRetry(wait) {
 					break
 				}
 				legacyFastUsed = true
@@ -439,7 +449,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
-				if !sleepWithContext(ctx, wait) {
+				if !waitToRetry(wait) {
 					break
 				}
 				legacyFastUsed = true
@@ -562,8 +572,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 	// FAILED before committing. Retry only what can succeed on a re-send (or until
 	// the backstop); on retry, supply a Retry-After backoff so the client waits.
+	// A held fallback answer is delivered only to a client still waiting for it.
 	canRetry := last.transient && budgetLeft()
-	if !canRetry && (heldRefusal != nil || heldSafeguard != nil) {
+	if !canRetry && r.Context().Err() == nil && (heldRefusal != nil || heldSafeguard != nil) {
 		log.Printf("WARN  %s%s  fallback %s failed: %s -> delivering the original answer  %s%s",
 			reqWho, effortField(reqEffort), cfg.refusalFallback, last.code, since(reqStart), rec.idField())
 		if heldRefusal != nil {
