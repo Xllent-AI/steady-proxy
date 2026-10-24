@@ -46,11 +46,11 @@ A **buffering window** is how long the proxy holds a streaming request before sw
 
 ### Match the client to the window
 
-Client response-header, stream-idle, and per-attempt timeouts must be strictly greater than the active buffering window:
+Client response-header, stream-idle, and per-attempt timeouts must be strictly greater than the active buffering window. The window starts when the request arrives, so failed upstream attempts and local-retry waits (`Retry-After` plus backoff) are part of the silence the client must tolerate:
 
 - **Claude Code (`~/.claude/settings.json`):** Set `CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`, `API_TIMEOUT_MS=720000`, and `API_FORCE_IDLE_TIMEOUT=0` for the default 600,000 ms window (`CLAUDE_API_TIMEOUT` has no effect).
 - **Codex (`~/.codex/config.toml`):** Set `stream_idle_timeout_ms = 660000` to cover both the 30s early-commit window and the 600s full-buffer window.
-- **Gemini SDKs:** Set HTTP/stream timeouts to at least `660000` ms to cover `PROXY_GEMINI_BUFFER_MS`.
+- **Gemini SDKs:** Set HTTP/stream timeouts to at least `660000` ms to cover `PROXY_GEMINI_BUFFER_MS`. If a client's first-byte timeout cannot be raised, set `PROXY_GEMINI_BUFFER_MS` below it with margin (for example `240000` for a 300 s timeout); a local retry that no longer fits the window is returned as `503` with `Retry-After` instead. After the window the proxy streams live, and its keepalives are SSE comments: they reset byte-based timers, but SSE parsers discard them, so a timer that counts events is not reset.
 - **Workflow agents:** Keep `PROXY_WORKFLOW_KEEPALIVE_MS` below the workflow script's `stallMs`; see [Workflow agents](ARCHITECTURE.md#workflow-agents).
 
 ## Retries and fallback

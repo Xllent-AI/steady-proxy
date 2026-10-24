@@ -119,7 +119,7 @@ curl -N --max-time 720 \
   -d '{"contents":[{"parts":[{"text":"Say hello."}]}]}'
 ```
 
-Set client timeouts above `PROXY_GEMINI_BUFFER_MS` (default 600,000 ms) and configure bounded retries on HTTP `503` honoring `Retry-After`. If a Gemini stream fails after committing to live output, the proxy aborts the HTTP transport so the client does not mistake a truncated stream for clean EOF.
+Set client timeouts above `PROXY_GEMINI_BUFFER_MS` (default 600,000 ms) and configure bounded retries on HTTP `503` honoring `Retry-After`. Failed upstream attempts and local-retry waits count toward that silent window; for a client whose first-byte timeout is shorter, lower `PROXY_GEMINI_BUFFER_MS` below it (see [Match the client to the window](docs/CONFIGURATION.md#match-the-client-to-the-window)). If a Gemini stream fails after committing to live output, the proxy aborts the HTTP transport so the client does not mistake a truncated stream for clean EOF.
 
 ### Other API clients
 

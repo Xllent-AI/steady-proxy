@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -437,6 +438,79 @@ func TestE2ELocalRetryLogIncludesRequestIdentity(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("local retry log missing %q:\n%s", want, line)
 		}
+	}
+}
+
+// cancelAtLogLine is a log sink that runs cancel on the first line containing
+// marker, so a test can act at the exact point the proxy logs it.
+type cancelAtLogLine struct {
+	bytes.Buffer
+	marker string
+	cancel context.CancelFunc
+}
+
+func (c *cancelAtLogLine) Write(p []byte) (int, error) {
+	if c.cancel != nil && bytes.Contains(p, []byte(c.marker)) {
+		c.cancel()
+		c.cancel = nil
+	}
+	return c.Buffer.Write(p)
+}
+
+// A client that leaves while the proxy waits to retry must be reported as gone,
+// not as the upstream failure the retry was answering, on both retry paths, and
+// must not be handed a held fallback answer it can no longer receive.
+func TestE2EClientGoneDuringLocalRetryWait(t *testing.T) {
+	for _, tc := range []struct {
+		name, model string
+		retries     int
+		retryAfter  string
+		refuseFirst bool
+		wantHits    int32
+	}{
+		{name: "local retry", model: "m", retries: 1, retryAfter: "30", wantHits: 1},
+		{name: "legacy fast retry", model: "m", wantHits: 1}, // fixed 250ms pause; Retry-After must be absent
+		{name: "held refusal", model: "claude-fable-5", retries: 1, retryAfter: "30", refuseFirst: true, wantHits: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if hits.Add(1) == 1 && tc.refuseFirst {
+					w.Header().Set("Content-Type", "text/event-stream")
+					io.WriteString(w, refusalStream)
+					return
+				}
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(503)
+				io.WriteString(w, `{"error":{"type":"api_error","message":"upstream unavailable"}}`)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.txLocalRetries = tc.retries
+			cfg.localBackoffCap = 0
+			cfg.refusalFallback = "claude-opus-4-8"
+			cfg.verbose = true // the [local-retry] line is logged just before the wait starts
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sink := &cancelAtLogLine{marker: "[local-retry]", cancel: cancel}
+			prevOut := log.Writer()
+			log.SetOutput(sink)
+			defer log.SetOutput(prevOut)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"model":"`+tc.model+`"}`)).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			handle(rec, req)
+			if hits.Load() != tc.wantHits || rec.Code != 499 || rec.Header().Get("X-Steady-Proxy-Reason") != "client_gone" {
+				t.Fatalf("want the departed client reported, got hits=%d status=%d headers=%v body=%s", hits.Load(), rec.Code, rec.Header(), rec.Body.String())
+			}
+			if logs := sink.String(); !strings.Contains(logs, "client_gone 499") || strings.Contains(logs, "RETRY") {
+				t.Fatalf("access log blames the upstream instead of the client:\n%s", logs)
+			}
+		})
 	}
 }
 

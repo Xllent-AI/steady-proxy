@@ -99,6 +99,7 @@ While buffering, the proxy sends no HTTP headers to the client. If the client's 
 | --- | --- | --- |
 | Claude Code aborts around ~60s with `client_gone` | Default response-header timeout (~60s) fired while buffering. | Set `CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000`, `API_TIMEOUT_MS=720000`, and `API_FORCE_IDLE_TIMEOUT=0` in `~/.claude/settings.json`. |
 | Client aborts right at ~600s with `client_gone` | Client timeout equals `PROXY_KEEPALIVE_MS` with no margin. | Keep client timeouts strictly above the buffering window (e.g., `660000` ms+). |
+| `client_gone` after a `[local-retry]` line, before the window ends | The client's timeout is shorter than the buffering window; the failed attempt and the retry wait sent the client nothing. | Raise the client timeout above the window, or lower the window below it; see [Match the client to the window](CONFIGURATION.md#match-the-client-to-the-window). |
 | Codex disconnects in full-buffer mode | `stream_idle_timeout_ms` is shorter than `PROXY_RESPONSES_BUFFER_MS`. | Set `stream_idle_timeout_ms = 660000` in `~/.codex/config.toml`. |
 | `upstream_idle` in proxy log | No bytes received from gateway within `PROXY_UPSTREAM_BYTE_IDLE_MS`. | Check gateway health or increase `PROXY_UPSTREAM_BYTE_IDLE_MS`. |
 | `deadline` before streaming starts | Header timeout (`PROXY_RESP_HEADER_TIMEOUT_MS`), buffering window, or total request deadline expired. | Compare the logged duration against your [timeout settings](CONFIGURATION.md#timeouts). |
