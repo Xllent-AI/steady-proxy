@@ -53,7 +53,7 @@ The buffering timer starts when the client request arrives. Upstream header wait
 When the window expires:
 - A pending header or error-body read is cancelled and returned for client retry.
 - An active SSE stream flushes its buffered prefix and switches to live streaming (Workflow requests wait until forwardable content is present).
-- In live mode, silent gaps emit `: keepalive` comments on Messages/Gemini and `response.proxy_keepalive` events on Responses. Keepalives prevent client idle disconnects, but `PROXY_UPSTREAM_BYTE_IDLE_MS` and the total request deadline still apply.
+- In live mode, silent gaps emit `: keepalive` comments on Messages/Gemini and `response.proxy_keepalive` events on Responses. Keepalives prevent client idle disconnects, but client cancellation, `PROXY_UPSTREAM_BYTE_IDLE_MS`, and the configured `PROXY_MAX_REQUEST_DURATION_MS` still apply. The total request limit is not inferred from client timeout headers.
 
 ## Retries
 

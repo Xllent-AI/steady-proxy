@@ -103,7 +103,8 @@ While buffering, the proxy sends no HTTP headers to the client. If the client's 
 | Codex disconnects in full-buffer mode | `stream_idle_timeout_ms` is shorter than `PROXY_RESPONSES_BUFFER_MS`. | Set `stream_idle_timeout_ms = 660000` in `~/.codex/config.toml`. |
 | `upstream_idle` in proxy log | No bytes received from gateway within `PROXY_UPSTREAM_BYTE_IDLE_MS`. | Check gateway health or increase `PROXY_UPSTREAM_BYTE_IDLE_MS`. |
 | `deadline` before streaming starts | Header timeout (`PROXY_RESP_HEADER_TIMEOUT_MS`), buffering window, or total request deadline expired. | Compare the logged duration against your [timeout settings](CONFIGURATION.md#timeouts). |
-| `DROP` after a long live stream | Upstream failed after the proxy committed to live output. | Check the logged failure code; recovery depends on client stream retries. |
+| `DROP` after a long live stream | Upstream failed or a proxy limit expired after commitment. | Check the logged failure code; recovery depends on client stream retries. |
+| `DROP … deadline` while upstream data is still arriving | `PROXY_MAX_REQUEST_DURATION_MS` expired; progress does not reset this explicit ceiling. | Set the maximum to the intended whole-request limit. `X-Stainless-Timeout` is forwarded metadata, not a proxy deadline; changing the client fingerprint or buffering window does not change this ceiling. |
 
 ## Workflow stalls
 

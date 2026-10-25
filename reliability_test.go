@@ -40,27 +40,6 @@ func TestResponsesSpecificCodesOwnRetryability(t *testing.T) {
 	}
 }
 
-func TestStainlessTimeoutSecondsAndMargin(t *testing.T) {
-	useDefaultConfig(t)
-	for _, tc := range []struct {
-		header string
-		want   time.Duration
-	}{
-		{"720", 695 * time.Second},
-		{"720.5", 695*time.Second + 500*time.Millisecond},
-		{"10", 5 * time.Second},
-		{"", cfg.maxRequestDur},
-		{"invalid", cfg.maxRequestDur},
-		{"NaN", cfg.maxRequestDur},
-		{"+Inf", cfg.maxRequestDur},
-		{"1e30", cfg.maxRequestDur},
-	} {
-		if got := deriveDuration(tc.header); got != tc.want {
-			t.Errorf("timeout %q => %s, want %s", tc.header, got, tc.want)
-		}
-	}
-}
-
 func TestSpoolsClosedWithoutGarbageCollection(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("uses Linux fd inspection")
