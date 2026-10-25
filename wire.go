@@ -238,6 +238,9 @@ func (a *anthropicWire) live(ev event, raw []byte, st *captureStats) ([][]byte, 
 	}
 	out, err := a.toolNorm.accept(ev, raw)
 	if err != nil {
+		if err == errTooLarge {
+			return nil, false, classifyBufferError(err)
+		}
 		return nil, false, malformedSSE(invalidToolInputMessage)
 	}
 	if ev.name == "message_stop" && a.toolNorm.withholding() {

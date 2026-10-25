@@ -123,7 +123,7 @@ If the fallback fails terminally (for example your gateway does not serve that m
 ## Storage and payload capture
 
 - **`request_too_large`:** Client request body exceeded `PROXY_MAX_REQUEST_BYTES` (64 MiB default); rejected immediately without truncation.
-- **`response_too_large`:** Buffered response or single SSE event exceeded `PROXY_MAX_RESPONSE_BYTES` (128 MiB default); returned as a non-retryable error before commit.
+- **`response_too_large`:** Buffered response, single SSE event, or pending tool-input data exceeded `PROXY_MAX_RESPONSE_BYTES` (128 MiB default). Before commit, this is a non-retryable error; after commit, the stream is aborted without replay.
 - **`spool_error`:** Disk I/O failure in `PROXY_SPOOL_DIR` (check free space and permissions); treated as retryable.
 - **Missing or partial payload archives:** Run with `PROXY_VERBOSE=1` and check for `[request-log]` errors, or inspect `capture_error` inside the JSON archive.
 

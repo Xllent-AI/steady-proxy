@@ -369,6 +369,9 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 		committed = true
 		if err := model.replayPrefix(sp, w); err != nil {
 			sp.discard()
+			if errors.Is(err, errTooLarge) {
+				return classifyBufferError(err)
+			}
 			return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
 		}
 		sp.discard()
@@ -554,6 +557,9 @@ func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.
 func replayCaptured(sp *spool, model wireModel, w io.Writer, st *captureStats, writeHead func(string), flush func()) *failure {
 	writeHead("buffered")
 	if err := model.replayBuffered(sp, w, st); err != nil {
+		if errors.Is(err, errTooLarge) {
+			return classifyBufferError(err)
+		}
 		return &failure{transient: true, status: http.StatusBadGateway, atype: "api_error", code: "response_replay_failed", message: "failed replaying buffered response"}
 	}
 	flush()
@@ -604,8 +610,9 @@ func validateSSEEventShape(ev event) *failure {
 // message_delta after the block stop, so the verdict waits for the event that
 // follows an invalid block (see judgeTruncatedToolInput).
 type toolJSONValidator struct {
-	blocks    map[int]*toolJSONBlock
-	truncated bool // a tool block closed with invalid input; the next event decides
+	blocks     map[int]*toolJSONBlock
+	truncated  bool  // a tool block closed with invalid input; the next event decides
+	inputBytes int64 // decoded input retained across all open tool blocks
 }
 
 type toolJSONBlock struct {
@@ -641,11 +648,18 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 			if len(p.ContentBlock.Input) > 0 && !json.Valid(p.ContentBlock.Input) {
 				return malformedSSE(invalidToolInputMessage)
 			}
+			if previous := v.blocks[p.Index]; previous != nil {
+				v.inputBytes -= int64(previous.input.Len())
+			}
 			v.blocks[p.Index] = &toolJSONBlock{jsonInput: true}
 		}
 	case "content_block_delta":
 		if p.Delta.Type != "input_json_delta" {
 			return nil
+		}
+		inputBytes := int64(len(p.Delta.PartialJSON))
+		if inputBytes > cfg.maxResponseBytes-v.inputBytes {
+			return classifyBufferError(errTooLarge)
 		}
 		b := v.blocks[p.Index]
 		if b == nil {
@@ -659,12 +673,14 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 		}
 		b.sawInputDelta = true
 		b.input.WriteString(p.Delta.PartialJSON)
+		v.inputBytes += inputBytes
 	case "content_block_stop":
 		b := v.blocks[p.Index]
 		if b != nil {
 			if b.jsonInput && b.sawInputDelta && b.input.Len() > 0 && !validJSONObject(b.input.Bytes()) {
 				v.truncated = true
 			}
+			v.inputBytes -= int64(b.input.Len())
 			delete(v.blocks, p.Index)
 		}
 	}
@@ -860,12 +876,14 @@ func replayBufferedWithNormalizer(r io.Reader, w io.Writer, st *captureStats, to
 }
 
 type toolJSONReplayNormalizer struct {
-	blocks map[int]*toolReplayBlock
+	blocks        map[int]*toolReplayBlock
+	retainedBytes int64 // pending input's wire bytes bound its decoded data too
 	// held is the coalesced delta and content_block_stop of a tool block whose
 	// input is not valid JSON, plus any pings since, kept until the next event
 	// says whether max_tokens cut the input (see judgeTruncatedToolInput). Live
 	// streaming cannot look ahead, so the frames wait here instead of failing.
-	held [][]byte
+	held      [][]byte
+	heldBytes int64
 }
 
 type toolReplayBlock struct {
@@ -873,6 +891,7 @@ type toolReplayBlock struct {
 	sawInputDelta bool
 	input         bytes.Buffer
 	rawDeltas     [][]byte
+	rawBytes      int64
 }
 
 func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error) {
@@ -891,11 +910,18 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 	if n.held != nil {
 		switch judgeTruncatedToolInput(ev, &p) {
 		case truncWait:
+			if int64(len(raw)) > cfg.maxResponseBytes-n.retainedBytes {
+				return nil, errTooLarge
+			}
 			n.held = append(n.held, raw)
+			n.retainedBytes += int64(len(raw))
+			n.heldBytes += int64(len(raw))
 			return nil, nil
 		case truncExcused:
 			out := append(n.held, raw)
 			n.held = nil
+			n.retainedBytes -= n.heldBytes
+			n.heldBytes = 0
 			return out, nil
 		default:
 			return nil, errInvalidToolJSON
@@ -910,12 +936,16 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 			if n.blocks == nil {
 				n.blocks = map[int]*toolReplayBlock{}
 			}
+			n.takeBlock(p.Index)
 			n.blocks[p.Index] = &toolReplayBlock{jsonInput: true}
 		}
 		return [][]byte{raw}, nil
 	case "content_block_delta":
 		if p.Delta.Type != "input_json_delta" {
 			return [][]byte{raw}, nil
+		}
+		if int64(len(raw)) > cfg.maxResponseBytes-n.retainedBytes {
+			return nil, errTooLarge
 		}
 		b := n.blocks[p.Index]
 		if b == nil {
@@ -926,24 +956,35 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 			n.blocks[p.Index] = b
 		}
 		b.sawInputDelta = true
-		b.input.WriteString(p.Delta.PartialJSON)
-		b.rawDeltas = append(b.rawDeltas, raw)
+		if p.Delta.PartialJSON != "" {
+			// Only an entirely empty input needs its original fragments replayed.
+			b.rawDeltas = nil
+			b.input.WriteString(p.Delta.PartialJSON)
+		} else if b.input.Len() == 0 {
+			b.rawDeltas = append(b.rawDeltas, raw)
+		}
+		b.rawBytes += int64(len(raw))
+		n.retainedBytes += int64(len(raw))
 		return nil, nil
 	case "content_block_stop":
-		b := n.blocks[p.Index]
+		b := n.takeBlock(p.Index)
 		if b == nil || !b.jsonInput || !b.sawInputDelta {
-			delete(n.blocks, p.Index)
 			return [][]byte{raw}, nil
 		}
 		if b.input.Len() == 0 {
-			delete(n.blocks, p.Index)
 			return append(b.rawDeltas, raw), nil
 		}
-		delete(n.blocks, p.Index)
 		if !validJSONObject(b.input.Bytes()) {
 			// Cut off or garbled: the upstream's own max_tokens answer or a
 			// malformed stream, depending on the next event. Hold both frames.
-			n.held = [][]byte{toolInputDeltaEvent(p.Index, b.input.String()), raw}
+			coalesced := toolInputDeltaEvent(p.Index, b.input.String())
+			heldBytes := int64(len(coalesced)) + int64(len(raw))
+			if heldBytes > cfg.maxResponseBytes-n.retainedBytes {
+				return nil, errTooLarge
+			}
+			n.held = [][]byte{coalesced, raw}
+			n.heldBytes = heldBytes
+			n.retainedBytes += heldBytes
 			return nil, nil
 		}
 		return [][]byte{toolInputDeltaEvent(p.Index, b.input.String()), raw}, nil
@@ -952,11 +993,20 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 	}
 }
 
+func (n *toolJSONReplayNormalizer) takeBlock(index int) *toolReplayBlock {
+	b := n.blocks[index]
+	if b != nil {
+		n.retainedBytes -= b.rawBytes
+		delete(n.blocks, index)
+	}
+	return b
+}
+
 // withholding reports tool input still withheld for a block that has not
 // closed: ending the stream now would hand the client a tool call without it.
 func (n *toolJSONReplayNormalizer) withholding() bool {
 	for _, b := range n.blocks {
-		if len(b.rawDeltas) > 0 {
+		if b.sawInputDelta {
 			return true
 		}
 	}

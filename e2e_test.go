@@ -966,3 +966,64 @@ func TestE2ELiveStreamRetainsRequestBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestE2ELiveToolInputLimitAbortsWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, toolHead("tool_use", nil))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		var body strings.Builder
+		input := `{"value":"` + strings.Repeat("x", 8192) + `"}`
+		for _, fragment := range splitEvery(input, 128) {
+			writeInputJSONDelta(&body, fragment)
+		}
+		body.WriteString(contentBlockStopFrame(0))
+		body.WriteString(messageDeltaFrame("tool_use"))
+		body.WriteString(messageStopFrame)
+		io.WriteString(w, body.String())
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.keepaliveMs = 250 * time.Millisecond
+	cfg.maxRequestDur = 5 * time.Second
+	cfg.maxResponseBytes = 1024
+	cfg.txLocalRetries = 3
+	finished := make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(finished)
+		handle(w, r)
+	}))
+	defer proxy.Close()
+	downstream := &http.Client{Timeout: 6 * time.Second}
+	resp, err := downstream.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(`{"stream":true,"model":"test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want committed stream", resp.StatusCode)
+	}
+	close(release)
+	body, err := io.ReadAll(resp.Body)
+	if err == nil || strings.Contains(string(body), "message_stop") {
+		t.Fatalf("oversized tool input must abort the committed stream: err=%v body=%q", err, body)
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("oversized tool input left the handler active")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("committed stream was retried: calls=%d", calls.Load())
+	}
+}

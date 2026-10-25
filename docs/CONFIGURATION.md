@@ -40,10 +40,12 @@ A **buffering window** is how long the proxy holds a streaming request before sw
 | `PROXY_RESPONSES_BUFFER_MS` | `600000` (10m) | OpenAI Responses full-buffering window when `PROXY_RESPONSES_EARLY_COMMIT=0`. `0` disables the timed switch. |
 | `PROXY_GEMINI_BUFFER_MS` | `600000` (10m) | Gemini `streamGenerateContent?alt=sse` buffering window. `0` disables the timed switch. |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` (1m) | Max wait for upstream HTTP response headers (`660000` in Compose). `0` disables this timer. |
-| `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` (10m) | Max gap without upstream bytes during SSE streaming or error reads (minimum `1`). |
-| `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` (25m) | Hard ceiling for an entire client request, including local retries and live streaming (minimum `1`). Progress does not reset it. |
+| `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` (10m) | Upstream body idle limit for SSE, single-shot responses, and errors (minimum `1`). Single-shot downstream writes do not consume this idle budget. |
+| `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` (25m) | Total limit covering request-body upload, upstream work/retries, and downstream writes (minimum `1`). Progress does not reset it. |
 
 `X-Stainless-Timeout` is forwarded unchanged but does not set a proxy deadline: it may describe a response-header timeout or a static client fingerprint, not a whole-stream budget. Use `PROXY_MAX_REQUEST_DURATION_MS` for an explicit total limit. Client cancellation, upstream header/idle limits, and retry bounds remain independent.
+
+Client HTTP headers have a separate 10-second read timeout.
 
 `PROXY_DEADLINE_MARGIN_MS` has been removed and has no effect; remove it from existing environment settings. Client fingerprint headers do not need to change.
 
@@ -74,18 +76,20 @@ See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#mode
 | `PROXY_RESPONSES_EARLY_COMMIT` | `1` | Commit and stream `/v1/responses` as soon as the first output event arrives. Set `0` for full buffering under `PROXY_RESPONSES_BUFFER_MS`. |
 | `PROXY_RESPONSES_REPLAY_DELTA_BYTES` | `65536` (64 KiB) | Max source JSON bytes when merging adjacent compatible `response.output_text.delta` events on replay. `0` replays raw frames. |
 | `PROXY_VALIDATE_JSON` | `1` | Validate Anthropic SSE event JSON and accumulated tool-input JSON. `0` disables Anthropic JSON validation and tool-JSON normalization (terminal/error detection on Responses, Gemini, and Anthropic refusals stays active). |
-| `PROXY_NORMALIZE_TOOL_JSON` | `1` | Coalesce fragmented Anthropic `input_json_delta` chunks into a single valid JSON delta on buffered replay (requires `PROXY_VALIDATE_JSON=1`). Tool input cut off by `stop_reason: "max_tokens"` is replayed as the upstream sent it. |
+| `PROXY_NORMALIZE_TOOL_JSON` | `1` | Coalesce fragmented Anthropic `input_json_delta` chunks on buffered replay and live output (requires `PROXY_VALIDATE_JSON=1`). `stop_reason: "max_tokens"` allows truncated input instead of rejecting it. |
 
 ## Storage and diagnostics
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` (1 MiB) | In-memory buffer limit per request before spilling to disk in `PROXY_SPOOL_DIR`. `0` spills immediately. |
-| `PROXY_MAX_RESPONSE_BYTES` | `134217728` (128 MiB) | Max buffered response size and max single SSE event size (minimum `1`). |
+| `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` (1 MiB) | Response spool RAM threshold before spilling to `PROXY_SPOOL_DIR`; not a whole-request memory cap. `0` spills immediately. |
+| `PROXY_MAX_RESPONSE_BYTES` | `134217728` (128 MiB) | Max buffered response size, single SSE event size, and retained tool-input budget (minimum `1`). |
 | `PROXY_MAX_REQUEST_BYTES` | `67108864` (64 MiB) | Max client request body size (minimum `1`). Oversized bodies fail with `413` (`400` on Responses). |
 | `PROXY_SPOOL_DIR` | OS temp dir | Directory for temporary response spill files (unlinked immediately on release). |
 | `PROXY_REQUEST_LOG_DIR` | *Off* | Directory for full request/response JSON archives. Empty or unset disables archiving; see [Saving request and response data](OPERATIONS.md#saving-request-and-response-data). |
 | `PROXY_VERBOSE` | `0` | Set `1` to log internal `[local-retry]` and `[request-log]` diagnostics (`1` in Compose). |
+
+Pending tool input is charged by its cumulative input-frame bytes across open blocks; delayed stop/ping frames count too. Emitting a block releases its budget. The limit does not cap total live-stream traffic or whole-process RSS.
 
 ## Optional upstream headers
 

@@ -214,7 +214,7 @@ func main() {
 		Handler:           http.HandlerFunc(handle),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
-		// WriteTimeout intentionally 0: long-lived holds; ctx deadlines bound work.
+		// Per-request read/write deadlines are installed by handle.
 		MaxHeaderBytes: 1 << 20,
 	}
 	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: Messages + Responses + Gemini SSE, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, gemini-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
@@ -258,6 +258,20 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// native error envelope. Only supported SSE generation requests are buffered;
 	// other routes remain single-shot with HTTP retry normalization.
 	writeErr := errorWriterFor(r.URL.Path)
+	// One explicit ceiling covers upload, upstream work, and downstream writes.
+	// X-Stainless-Timeout remains forwarded metadata, not a request budget.
+	ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(cfg.maxRequestDur))
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	control := http.NewResponseController(w)
+	if err := control.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeErr(w, false, http.StatusInternalServerError, "api_error", "proxy: setting request read deadline", 0, "read_deadline")
+		return
+	}
+	if err := control.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeErr(w, false, http.StatusInternalServerError, "api_error", "proxy: setting response write deadline", 0, "write_deadline")
+		return
+	}
 	body, tooBig, err := readBody(r)
 	if tooBig {
 		// Deterministic: the same oversized request can never succeed. surfaceFor keeps
@@ -284,7 +298,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	transactional := r.Method == http.MethodPost && (geminiStream ||
 		(requestWantsStream(body) && (isMessagesPath(r.URL.Path) || isResponsesPath(r.URL.Path))))
 	if !transactional {
-		proxyOnce(w, r, body, rec)
+		proxyOnce(ctx, w, r, body, rec, reqStart)
 		return
 	}
 	// isResp selects the OpenAI Responses (Codex) wire: it disables the
@@ -300,11 +314,6 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 	budgetLeft := func() bool { return retryCount < cfg.sdkRetryCap }
-
-	// X-Stainless-Timeout can be a header timeout or static client fingerprint,
-	// not a whole-stream budget. Inherit cancellation and enforce our own ceiling.
-	ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(cfg.maxRequestDur))
-	defer cancel()
 
 	var last failure
 	proxyRetries := 0
@@ -765,10 +774,7 @@ func bufferNonSSE(ctx context.Context, resp *http.Response, rec *reqRecorder) (*
 }
 
 // proxyOnce is a plain single-shot reverse proxy for non-transactional routes.
-func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqRecorder) {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), cfg.maxRequestDur)
-	defer cancel()
+func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, rec *reqRecorder, start time.Time) {
 	reqWho := who(r, body)
 	reqEffort := reasoningEffortOf(r.URL.Path, body)
 	rec.beginAttempt(body, reqWho, 0)
@@ -822,11 +828,17 @@ func proxyOnce(w http.ResponseWriter, r *http.Request, body []byte, rec *reqReco
 	if sink := rec.respWriter(); sink != nil {
 		dst = io.MultiWriter(w, sink)
 	}
-	n, copyErr := io.Copy(dst, resp.Body)
+	upstreamBody := withByteIdle(resp.Body, cfg.upstreamByteIdle)
+	defer upstreamBody.stop()
+	n, copyErr := io.Copy(dst, upstreamBody)
 	if copyErr != nil {
 		f := failure{transient: true, status: 502, atype: "api_error", code: "response_read_error", message: copyErr.Error()}
 		if ctx.Err() != nil {
 			f = classifyTransport(copyErr, ctx)
+		} else if upstreamBody.timedOut.Load() {
+			f = failure{transient: true, status: 504, atype: "timeout_error", code: "upstream_idle", message: "upstream stalled with no bytes"}
+		} else if errors.Is(copyErr, os.ErrDeadlineExceeded) {
+			f = classifyTransport(context.DeadlineExceeded, ctx)
 		}
 		rec.noteResponseReadError(copyErr)
 		rec.noteAttemptFailure(f, "drop")
