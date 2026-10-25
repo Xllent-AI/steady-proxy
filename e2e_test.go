@@ -778,7 +778,7 @@ func TestLocalRetryDelayAddsRetryAfterAndCappedExtraBackoff(t *testing.T) {
 }
 
 func TestE2EStainlessTimeoutDoesNotLimitStreams(t *testing.T) {
-	const advertisedTimeout = "0.2"
+	const advertisedTimeout = "1.0"
 	for _, tc := range []struct {
 		name, path, stream, terminal string
 		buffered                     bool
@@ -799,7 +799,7 @@ func TestE2EStainlessTimeoutDoesNotLimitStreams(t *testing.T) {
 				for i, event := range eventsOf(tc.stream) {
 					if i > 0 {
 						select {
-						case <-time.After(60 * time.Millisecond):
+						case <-time.After(300 * time.Millisecond):
 						case <-r.Context().Done():
 							return
 						}
@@ -813,11 +813,12 @@ func TestE2EStainlessTimeoutDoesNotLimitStreams(t *testing.T) {
 			defer up.Close()
 			setupForTest(up.URL)
 			t.Cleanup(func() { cfg = testConfig() })
-			cfg.maxRequestDur = 4 * time.Second
-			cfg.keepaliveMs = 10 * time.Millisecond
-			cfg.geminiBufferMs = 10 * time.Millisecond
+			cfg.maxRequestDur = 6 * time.Second
+			// The buffer window also bounds upstream connection/header setup.
+			cfg.keepaliveMs = 250 * time.Millisecond
+			cfg.geminiBufferMs = 250 * time.Millisecond
 			if tc.buffered {
-				cfg.keepaliveMs = time.Second
+				cfg.keepaliveMs = 3 * time.Second
 			}
 			proxy := httptest.NewServer(http.HandlerFunc(handle))
 			defer proxy.Close()
@@ -826,7 +827,7 @@ func TestE2EStainlessTimeoutDoesNotLimitStreams(t *testing.T) {
 				t.Fatal(err)
 			}
 			req.Header.Set("X-Stainless-Timeout", advertisedTimeout)
-			downstream := &http.Client{Timeout: 3 * time.Second}
+			downstream := &http.Client{Timeout: 5 * time.Second}
 			started := time.Now()
 			resp, err := downstream.Do(req)
 			if err != nil {
@@ -837,7 +838,7 @@ func TestE2EStainlessTimeoutDoesNotLimitStreams(t *testing.T) {
 			if err != nil || resp.StatusCode != http.StatusOK || !strings.Contains(string(body), tc.terminal) || !strings.Contains(string(body), "Hi") {
 				t.Fatalf("progressing stream did not complete: status=%d err=%v body=%s", resp.StatusCode, err, body)
 			}
-			if elapsed := time.Since(started); elapsed <= 200*time.Millisecond {
+			if elapsed := time.Since(started); elapsed <= time.Second {
 				t.Fatalf("stream did not cross the advertised timeout: %s", elapsed)
 			}
 			mode := "live"
@@ -886,15 +887,15 @@ func TestE2ELiveStreamRetainsRequestBounds(t *testing.T) {
 			defer up.Close()
 			setupForTest(up.URL)
 			t.Cleanup(func() { cfg = testConfig() })
-			cfg.keepaliveMs = 10 * time.Millisecond
-			cfg.maxRequestDur = 4 * time.Second
-			cfg.upstreamByteIdle = 2 * time.Second
+			cfg.keepaliveMs = 250 * time.Millisecond
+			cfg.maxRequestDur = 6 * time.Second
+			cfg.upstreamByteIdle = 5 * time.Second
 			cfg.txLocalRetries = 3
 			if mode == "request-limit" {
-				cfg.maxRequestDur = 250 * time.Millisecond
+				cfg.maxRequestDur = time.Second
 			}
 			if mode == "upstream-idle" {
-				cfg.upstreamByteIdle = 250 * time.Millisecond
+				cfg.upstreamByteIdle = time.Second
 			}
 			proxyDone := make(chan struct{})
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -902,9 +903,9 @@ func TestE2ELiveStreamRetainsRequestBounds(t *testing.T) {
 				handle(w, r)
 			}))
 			defer proxy.Close()
-			clientTimeout := 4 * time.Second
+			clientTimeout := 6 * time.Second
 			if mode == "client-deadline" {
-				clientTimeout = 250 * time.Millisecond
+				clientTimeout = time.Second
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
 			defer cancel()
@@ -939,7 +940,7 @@ func TestE2ELiveStreamRetainsRequestBounds(t *testing.T) {
 			if err == nil || strings.Contains(string(body), "message_stop") {
 				t.Fatalf("bounded stream ended as a complete response: err=%v body=%s", err, body)
 			}
-			if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+			if elapsed := time.Since(started); elapsed > 3*time.Second {
 				t.Fatalf("stream limit did not interrupt promptly: %s", elapsed)
 			}
 			var wantContextErr error
