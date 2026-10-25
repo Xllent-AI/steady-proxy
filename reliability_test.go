@@ -393,3 +393,219 @@ func TestHTTP2ErrorBodyDeadlineRemainsRetryable(t *testing.T) {
 		})
 	}
 }
+
+func TestRequestLimitCoversUpload(t *testing.T) {
+	for _, proto := range []int{1, 2} {
+		for _, completeUpload := range []bool{false, true} {
+			name := "incomplete"
+			if completeUpload {
+				name = "completed"
+			}
+			t.Run("http"+itoa(proto)+"/"+name, func(t *testing.T) {
+				var calls atomic.Int32
+				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					io.Copy(io.Discard, r.Body)
+					<-r.Context().Done()
+				}))
+				defer up.Close()
+				setupForTest(up.URL)
+				t.Cleanup(func() { cfg = testConfig() })
+				cfg.maxRequestDur = 2 * time.Second
+				cfg.txLocalRetries = 0
+				started := make(chan time.Time, 1)
+				finished := make(chan struct{})
+				proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.ProtoMajor != proto {
+						t.Errorf("downstream HTTP version = %d, want %d", r.ProtoMajor, proto)
+					}
+					started <- time.Now()
+					defer close(finished)
+					handle(w, r)
+				}))
+				proxy.EnableHTTP2 = proto == 2
+				proxy.StartTLS()
+				defer proxy.Close()
+				downstream := proxy.Client()
+				downstream.Timeout = 6 * time.Second
+				reader, writer := io.Pipe()
+				defer writer.Close()
+				const body = `{"stream":false,"model":"upload"}`
+				req, err := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages", reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.ContentLength = int64(len(body))
+				clientDone := make(chan struct{})
+				go func() {
+					defer close(clientDone)
+					resp, err := downstream.Do(req)
+					if err == nil {
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+					}
+				}()
+				if _, err := io.WriteString(writer, body[:1]); err != nil {
+					t.Fatal(err)
+				}
+				var began time.Time
+				select {
+				case began = <-started:
+				case <-time.After(time.Second):
+					t.Fatal("request did not reach the proxy")
+				}
+				if completeUpload {
+					// Most of the shared budget is spent uploading. Starting a fresh
+					// upstream budget afterward would keep the handler alive too long.
+					time.Sleep(1500 * time.Millisecond)
+					if _, err := io.WriteString(writer, body[1:]); err != nil {
+						t.Fatal(err)
+					}
+					writer.Close()
+				}
+				select {
+				case <-finished:
+				case <-time.After(time.Until(began.Add(3 * time.Second))):
+					t.Fatal("request outlived the shared upload/upstream deadline")
+				}
+				wantCalls := int32(0)
+				if completeUpload {
+					wantCalls = 1
+				}
+				if calls.Load() != wantCalls {
+					t.Fatalf("upstream attempts = %d, want %d", calls.Load(), wantCalls)
+				}
+				writer.Close()
+				select {
+				case <-clientDone:
+				case <-time.After(time.Second):
+					t.Fatal("downstream request remained blocked after its deadline")
+				}
+			})
+		}
+	}
+}
+
+func TestRequestLimitInterruptsBlockedResponse(t *testing.T) {
+	const responseBytes = 32 << 20
+	for _, proto := range []int{1, 2} {
+		t.Run("http"+itoa(proto), func(t *testing.T) {
+			var calls atomic.Int32
+			block := strings.Repeat("x", 64<<10)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/octet-stream")
+				for sent := 0; sent < responseBytes; sent += len(block) {
+					if _, err := io.WriteString(w, block); err != nil {
+						return
+					}
+				}
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.maxRequestDur = 500 * time.Millisecond
+			cfg.upstreamByteIdle = 3 * time.Second
+			finished := make(chan struct{})
+			proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != proto {
+					t.Errorf("downstream HTTP version = %d, want %d", r.ProtoMajor, proto)
+				}
+				defer close(finished)
+				handle(w, r)
+			}))
+			proxy.EnableHTTP2 = proto == 2
+			proxy.StartTLS()
+			defer proxy.Close()
+			downstream := proxy.Client()
+			downstream.Timeout = 5 * time.Second
+			resp, err := downstream.Get(proxy.URL + "/v1/models")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want committed response", resp.StatusCode)
+			}
+			// Leave the body unread so socket/HTTP2 flow control blocks the proxy.
+			select {
+			case <-finished:
+			case <-time.After(2 * time.Second):
+				t.Fatal("downstream write remained blocked beyond the maximum duration")
+			}
+			n, err := io.Copy(io.Discard, resp.Body)
+			if err == nil || n >= responseBytes || calls.Load() != 1 {
+				t.Fatalf("expired response must abort without replay: bytes=%d err=%v calls=%d", n, err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestSingleShotByteIdleOnlyWhileReading(t *testing.T) {
+	const responseBytes = 32 << 20
+	for _, stalled := range []bool{true, false} {
+		name := "paused-downstream"
+		if stalled {
+			name = "stalled-upstream"
+		}
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			block := strings.Repeat("x", 64<<10)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/octet-stream")
+				for sent := 0; sent < responseBytes; sent += len(block) {
+					if _, err := io.WriteString(w, block); err != nil {
+						return
+					}
+					if stalled {
+						w.(http.Flusher).Flush()
+						<-r.Context().Done()
+						return
+					}
+				}
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.maxRequestDur = 5 * time.Second
+			cfg.upstreamByteIdle = 300 * time.Millisecond
+			cfg.txLocalRetries = 3
+			finished := make(chan struct{})
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(finished)
+				handle(w, r)
+			}))
+			defer proxy.Close()
+			downstream := &http.Client{Timeout: 6 * time.Second}
+			started := time.Now()
+			resp, err := downstream.Get(proxy.URL + "/v1/models")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want committed response", resp.StatusCode)
+			}
+			if !stalled {
+				time.Sleep(900 * time.Millisecond)
+				select {
+				case <-finished:
+					t.Fatal("fixture did not backpressure the downstream writer")
+				default:
+				}
+			}
+			n, err := io.Copy(io.Discard, resp.Body)
+			if stalled {
+				if err == nil || n >= responseBytes || time.Since(started) > 2*time.Second {
+					t.Fatalf("upstream idle did not abort promptly: bytes=%d err=%v elapsed=%s", n, err, time.Since(started))
+				}
+			} else if err != nil || n != responseBytes {
+				t.Fatalf("downstream backpressure was mistaken for upstream idle: bytes=%d err=%v", n, err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("single-shot response was retried: calls=%d", calls.Load())
+			}
+		})
+	}
+}

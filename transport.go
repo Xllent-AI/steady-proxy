@@ -71,8 +71,8 @@ func (b *cancelBody) Close() error {
 	return b.ReadCloser.Close()
 }
 
-// Error-body archiving must obey the same byte-idle bound as SSE capture.
-// Closing the response body interrupts a blocked transport Read.
+// Bound time spent waiting for upstream bytes, not time spent writing them to
+// a slow downstream or archive. Closing the body interrupts a blocked Read.
 type byteIdleReader struct {
 	body     io.ReadCloser
 	timer    *time.Timer
@@ -81,23 +81,31 @@ type byteIdleReader struct {
 }
 
 func withByteIdle(body io.ReadCloser, idle time.Duration) *byteIdleReader {
-	r := &byteIdleReader{body: body, idle: idle}
-	r.timer = time.AfterFunc(idle, func() {
-		r.timedOut.Store(true)
-		body.Close()
-	})
-	return r
+	return &byteIdleReader{body: body, idle: idle}
 }
 
 func (r *byteIdleReader) Read(p []byte) (int, error) {
+	if r.timedOut.Load() {
+		return 0, context.DeadlineExceeded
+	}
+	if r.timer == nil {
+		r.timer = time.AfterFunc(r.idle, func() {
+			r.timedOut.Store(true)
+			r.body.Close()
+		})
+	} else {
+		r.timer.Reset(r.idle)
+	}
 	n, err := r.body.Read(p)
+	r.timer.Stop()
 	if r.timedOut.Load() {
 		return n, context.DeadlineExceeded
-	}
-	if n > 0 {
-		r.timer.Reset(r.idle)
 	}
 	return n, err
 }
 
-func (r *byteIdleReader) stop() { r.timer.Stop() }
+func (r *byteIdleReader) stop() {
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+}

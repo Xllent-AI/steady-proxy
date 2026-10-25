@@ -1415,3 +1415,114 @@ func TestLiveInBandErrorDelivery(t *testing.T) {
 		t.Fatalf("a transient error must not be forwarded: %q", rec.Body.String())
 	}
 }
+
+func TestToolInputRetentionBudget(t *testing.T) {
+	start := func(index int) string {
+		return sseJSON("content_block_start", map[string]any{
+			"type": "content_block_start", "index": index,
+			"content_block": map[string]any{"type": "tool_use", "id": "toolu_2", "name": "Tool", "input": map[string]any{}},
+		})
+	}
+	delta := func(index int, input string) string {
+		return sseJSON("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": index,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": input},
+		})
+	}
+	input := `{"value":"` + strings.Repeat("x", 256) + `"}`
+	first, second := delta(0, input), delta(1, input)
+	interleaved := toolHead("tool_use", nil) + first + start(1) + second
+	sequential := toolHead("tool_use", nil) + first + contentBlockStopFrame(0) +
+		start(1) + second + contentBlockStopFrame(1) + messageDeltaFrame("tool_use") + messageStopFrame
+	for _, tc := range []struct {
+		name   string
+		stream string
+		limit  int64
+	}{
+		{"interleaved-blocks", interleaved, int64(len(first) + len(second) - 1)},
+		{"empty-fragments", toolHead("tool_use", nil) + strings.Repeat(delta(0, ""), 3), int64(2 * len(delta(0, "")))},
+		{"held-pings", toolStreamThenTail("tool_use", truncatedToolChunks, strings.Repeat(pingFrame, 32)), 512},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useDefaultConfig(t)
+			cfg.maxResponseBytes = tc.limit
+			var f *failure
+			for _, step := range feedLive(newAnthropicWire(false), tc.stream) {
+				if step.fail != nil {
+					f = step.fail
+					break
+				}
+			}
+			if f == nil || f.code != "response_too_large" || f.transient {
+				t.Fatalf("retained input must fail without retry at its cap: %+v", f)
+			}
+		})
+	}
+	t.Run("exact-cap-and-release", func(t *testing.T) {
+		useDefaultConfig(t)
+		cfg.maxResponseBytes = int64(len(first))
+		var output strings.Builder
+		steps := feedLive(newAnthropicWire(false), sequential)
+		for _, step := range steps {
+			if step.fail != nil {
+				t.Fatalf("completed tool block did not release its budget: %+v", step.fail)
+			}
+			for _, raw := range step.out {
+				output.Write(raw)
+			}
+		}
+		inputs := inputJSONDeltas(t, output.String())
+		if !steps[len(steps)-1].done || len(inputs) != 2 || inputs[0] != input || inputs[1] != input {
+			t.Fatalf("sequential tool inputs were not delivered completely: %q", output.String())
+		}
+	})
+	t.Run("normalization-disabled", func(t *testing.T) {
+		useDefaultConfig(t)
+		cfg.maxResponseBytes = 512
+		cfg.normalizeToolJSON = false
+		largeInput := `{"value":"` + strings.Repeat("x", 8192) + `"}`
+		stream := toolStreamThenTail("tool_use", splitEvery(largeInput, 128), messageDeltaFrame("tool_use"), messageStopFrame)
+		var output strings.Builder
+		steps := feedLive(newAnthropicWire(false), stream)
+		for _, step := range steps {
+			if step.fail != nil {
+				t.Fatalf("unbuffered tool fragments must not consume the retention budget: %+v", step.fail)
+			}
+			for _, raw := range step.out {
+				output.Write(raw)
+			}
+		}
+		if !steps[len(steps)-1].done || strings.Join(inputJSONDeltas(t, output.String()), "") != largeInput {
+			t.Fatal("unbuffered tool fragments were not delivered completely")
+		}
+	})
+	for _, tc := range []struct {
+		name     string
+		stream   string
+		limit    int64
+		wantFail bool
+	}{
+		{"validator-interleaved", interleaved, int64(2*len(input) - 1), true},
+		{"validator-release", sequential, int64(len(input)), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useDefaultConfig(t)
+			cfg.maxResponseBytes = tc.limit
+			var validator toolJSONValidator
+			var parser sseParser
+			var f *failure
+			for _, ev := range parser.feed([]byte(tc.stream)) {
+				if f = validator.accept(ev); f != nil {
+					break
+				}
+			}
+			if tc.wantFail {
+				if f == nil || f.code != "response_too_large" || f.transient {
+					t.Fatalf("decoded input must fail without retry at its cap: %+v", f)
+				}
+			} else if f != nil {
+				t.Fatalf("completed validation block did not release its budget: %+v", f)
+			}
+		})
+	}
+}
