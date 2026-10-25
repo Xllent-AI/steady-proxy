@@ -97,7 +97,6 @@ type config struct {
 	geminiBufferMs       time.Duration
 	responsesEarlyCommit bool // Responses (Codex): commit on first output (default); false = buffer to terminal under responsesBufferMs, like /v1/messages
 	responsesReplayBytes int  // Responses buffered/prefix replay: coalesce adjacent output_text.delta events up to this many source JSON bytes; 0 = raw replay
-	deadlineMargin       time.Duration
 	maxRequestDur        time.Duration
 	sdkRetryCap          int
 	txLocalRetries       int
@@ -139,8 +138,7 @@ func parseConfig(lookup func(string) (string, bool)) (config, error) {
 		geminiBufferMs:       e.ms("PROXY_GEMINI_BUFFER_MS", 600000, 0),                     // Gemini buffers through clean EOF; 0 disables the timed switch to live output.
 		responsesEarlyCommit: e.str("PROXY_RESPONSES_EARLY_COMMIT", "1") != "0",             // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
 		responsesReplayBytes: int(e.int64("PROXY_RESPONSES_REPLAY_DELTA_BYTES", 64<<10, 0)), // collapse tiny adjacent Codex text deltas during buffered/prefix replay so a completed turn cannot burst thousands of app-server notifications into the TUI; 0 preserves byte-for-byte replay. Live events remain untouched.
-		deadlineMargin:       e.ms("PROXY_DEADLINE_MARGIN_MS", 25000, 0),                    // finish before the client's own timeout
-		maxRequestDur:        e.ms("PROXY_MAX_REQUEST_DURATION_MS", 1500000, 1),             // absolute ceiling per attempt (25m)
+		maxRequestDur:        e.ms("PROXY_MAX_REQUEST_DURATION_MS", 1500000, 1),             // whole-request ceiling, including local retries (25m)
 		sdkRetryCap:          int(e.int64("PROXY_SDK_RETRY_CAP", 100, 0)),                   // backstop only; Claude Code's own retry cap still applies
 		txLocalRetries:       int(e.int64("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0, 0)),
 		localBackoffCap:      e.ms("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000, 0),
@@ -303,7 +301,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	retryCount := atoiSafe(r.Header.Get("X-Stainless-Retry-Count"))
 	budgetLeft := func() bool { return retryCount < cfg.sdkRetryCap }
 
-	ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(deriveDuration(r.Header.Get("X-Stainless-Timeout"))))
+	// X-Stainless-Timeout can be a header timeout or static client fingerprint,
+	// not a whole-stream budget. Inherit cancellation and enforce our own ceiling.
+	ctx, cancel := context.WithDeadline(r.Context(), reqStart.Add(cfg.maxRequestDur))
 	defer cancel()
 
 	var last failure
@@ -922,18 +922,6 @@ func requestWantsStream(body []byte) bool {
 	}
 	_ = json.Unmarshal(body, &b)
 	return b.Stream
-}
-
-// deriveDuration picks an attempt deadline below the client's own timeout.
-func deriveDuration(stainlessTimeout string) time.Duration {
-	d := cfg.maxRequestDur
-	seconds, err := strconv.ParseFloat(strings.TrimSpace(stainlessTimeout), 64)
-	if err == nil && seconds > 0 && !math.IsInf(seconds, 0) && seconds < float64(math.MaxInt64)/float64(time.Second) {
-		clientDur := time.Duration(seconds * float64(time.Second))
-		margin := min(cfg.deadlineMargin, clientDur/2)
-		d = min(d, clientDur-margin)
-	}
-	return d
 }
 
 func isEventStream(ct string) bool { return strings.Contains(strings.ToLower(ct), "text/event-stream") }

@@ -17,7 +17,7 @@ The tables below list **binary defaults**. `docker-compose.yml.example` override
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` | `660000` | Accommodates gateways that withhold HTTP headers until generation starts. |
 | `PROXY_VERBOSE` | `0` | `1` | Enables local-retry and archive diagnostic logs by default in Docker. |
 
-Storage limits (`PROXY_MAX_*_BYTES`), `PROXY_SPOOL_DIR`, `PROXY_MAX_REQUEST_DURATION_MS`, and `PROXY_DEADLINE_MARGIN_MS` are not listed in `docker-compose.yml.example`—add them under `environment:` in `docker-compose.yml` if you need to override them in Docker.
+Storage limits (`PROXY_MAX_*_BYTES`), `PROXY_SPOOL_DIR`, and `PROXY_MAX_REQUEST_DURATION_MS` are not listed in `docker-compose.yml.example`—add them under `environment:` in `docker-compose.yml` if you need to override them in Docker.
 
 All `_MS` variables take integer milliseconds; `_BYTES` variables take integer bytes; boolean switches use `1` and `0`. Startup fails immediately if `PROXY_UPSTREAM_URL` is missing/invalid or if any numeric variable is malformed or below its minimum.
 
@@ -41,8 +41,11 @@ A **buffering window** is how long the proxy holds a streaming request before sw
 | `PROXY_GEMINI_BUFFER_MS` | `600000` (10m) | Gemini `streamGenerateContent?alt=sse` buffering window. `0` disables the timed switch. |
 | `PROXY_RESP_HEADER_TIMEOUT_MS` | `60000` (1m) | Max wait for upstream HTTP response headers (`660000` in Compose). `0` disables this timer. |
 | `PROXY_UPSTREAM_BYTE_IDLE_MS` | `600000` (10m) | Max gap without upstream bytes during SSE streaming or error reads (minimum `1`). |
-| `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` (25m) | Hard ceiling for an entire client request, including local retries (minimum `1`). |
-| `PROXY_DEADLINE_MARGIN_MS` | `25000` (25s) | Margin subtracted from the client's `X-Stainless-Timeout` (in seconds) so the proxy can return a clean retry before the client aborts. Capped at half the client timeout for short requests; `0` disables the margin. |
+| `PROXY_MAX_REQUEST_DURATION_MS` | `1500000` (25m) | Hard ceiling for an entire client request, including local retries and live streaming (minimum `1`). Progress does not reset it. |
+
+`X-Stainless-Timeout` is forwarded unchanged but does not set a proxy deadline: it may describe a response-header timeout or a static client fingerprint, not a whole-stream budget. Use `PROXY_MAX_REQUEST_DURATION_MS` for an explicit total limit. Client cancellation, upstream header/idle limits, and retry bounds remain independent.
+
+`PROXY_DEADLINE_MARGIN_MS` has been removed and has no effect; remove it from existing environment settings. Client fingerprint headers do not need to change.
 
 ### Match the client to the window
 

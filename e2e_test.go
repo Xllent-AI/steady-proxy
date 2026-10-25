@@ -776,3 +776,192 @@ func TestLocalRetryDelayAddsRetryAfterAndCappedExtraBackoff(t *testing.T) {
 		t.Fatalf("capped local retry delay = %s, want 17s", got)
 	}
 }
+
+func TestE2EStainlessTimeoutDoesNotLimitStreams(t *testing.T) {
+	const advertisedTimeout = "0.2"
+	for _, tc := range []struct {
+		name, path, stream, terminal string
+		buffered                     bool
+	}{
+		{"messages-live", "/v1/messages", goodStream, "message_stop", false},
+		{"messages-buffered", "/v1/messages", goodStream, "message_stop", true},
+		{"responses-live", "/v1/responses", goodResponsesStream, "response.completed", false},
+		{"gemini-live", geminiStreamPath,
+			strings.Repeat("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n", 5) +
+				"data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n", "\"finishReason\":\"STOP\"", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("X-Stainless-Timeout"); got != advertisedTimeout {
+					t.Errorf("client timeout fingerprint changed: got %q, want %q", got, advertisedTimeout)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				for i, event := range eventsOf(tc.stream) {
+					if i > 0 {
+						select {
+						case <-time.After(60 * time.Millisecond):
+						case <-r.Context().Done():
+							return
+						}
+					}
+					if _, err := io.WriteString(w, event); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.maxRequestDur = 4 * time.Second
+			cfg.keepaliveMs = 10 * time.Millisecond
+			cfg.geminiBufferMs = 10 * time.Millisecond
+			if tc.buffered {
+				cfg.keepaliveMs = time.Second
+			}
+			proxy := httptest.NewServer(http.HandlerFunc(handle))
+			defer proxy.Close()
+			req, err := http.NewRequest(http.MethodPost, proxy.URL+tc.path, strings.NewReader(`{"stream":true,"model":"test","contents":[]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Stainless-Timeout", advertisedTimeout)
+			downstream := &http.Client{Timeout: 3 * time.Second}
+			started := time.Now()
+			resp, err := downstream.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusOK || !strings.Contains(string(body), tc.terminal) || !strings.Contains(string(body), "Hi") {
+				t.Fatalf("progressing stream did not complete: status=%d err=%v body=%s", resp.StatusCode, err, body)
+			}
+			if elapsed := time.Since(started); elapsed <= 200*time.Millisecond {
+				t.Fatalf("stream did not cross the advertised timeout: %s", elapsed)
+			}
+			mode := "live"
+			if tc.buffered {
+				mode = "buffered"
+			}
+			if got := resp.Header.Get("X-Steady-Proxy-Mode"); got != mode {
+				t.Fatalf("stream used %q mode, want %q", got, mode)
+			}
+		})
+	}
+}
+
+func TestE2ELiveStreamRetainsRequestBounds(t *testing.T) {
+	for _, mode := range []string{"client-cancel", "client-deadline", "upstream-idle", "request-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			var calls atomic.Int32
+			upstreamDone := make(chan struct{})
+			prefix := goodStream[:strings.Index(goodStream, "event: content_block_stop")]
+			delta := eventsOf(goodStream)[2]
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					defer close(upstreamDone)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, prefix)
+				w.(http.Flusher).Flush()
+				if mode == "upstream-idle" {
+					<-r.Context().Done()
+					return
+				}
+				ticker := time.NewTicker(20 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-ticker.C:
+						if _, err := io.WriteString(w, delta); err != nil {
+							return
+						}
+						w.(http.Flusher).Flush()
+					}
+				}
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.keepaliveMs = 10 * time.Millisecond
+			cfg.maxRequestDur = 4 * time.Second
+			cfg.upstreamByteIdle = 2 * time.Second
+			cfg.txLocalRetries = 3
+			if mode == "request-limit" {
+				cfg.maxRequestDur = 250 * time.Millisecond
+			}
+			if mode == "upstream-idle" {
+				cfg.upstreamByteIdle = 250 * time.Millisecond
+			}
+			proxyDone := make(chan struct{})
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(proxyDone)
+				handle(w, r)
+			}))
+			defer proxy.Close()
+			clientTimeout := 4 * time.Second
+			if mode == "client-deadline" {
+				clientTimeout = 250 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxy.URL+"/v1/messages", strings.NewReader(`{"stream":true,"model":"test"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Stainless-Timeout", "600")
+			started := time.Now()
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Steady-Proxy-Mode") != "live" {
+				t.Fatalf("stream did not commit live: status=%d headers=%v", resp.StatusCode, resp.Header)
+			}
+			reader := bufio.NewReader(resp.Body)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatalf("stream ended before content arrived: %v", err)
+				}
+				if strings.Contains(line, `"text":"Hi"`) {
+					break
+				}
+			}
+			if mode == "client-cancel" {
+				cancel()
+			}
+			body, err := io.ReadAll(reader)
+			if err == nil || strings.Contains(string(body), "message_stop") {
+				t.Fatalf("bounded stream ended as a complete response: err=%v body=%s", err, body)
+			}
+			if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+				t.Fatalf("stream limit did not interrupt promptly: %s", elapsed)
+			}
+			var wantContextErr error
+			switch mode {
+			case "client-cancel":
+				wantContextErr = context.Canceled
+			case "client-deadline":
+				wantContextErr = context.DeadlineExceeded
+			}
+			if ctx.Err() != wantContextErr {
+				t.Fatalf("wrong cancellation owner: client context=%v, want %v", ctx.Err(), wantContextErr)
+			}
+			for _, done := range []<-chan struct{}{upstreamDone, proxyDone} {
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("stream work continued after termination")
+				}
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("committed stream was retried: calls=%d", calls.Load())
+			}
+		})
+	}
+}
