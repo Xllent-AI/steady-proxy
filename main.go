@@ -165,13 +165,13 @@ func parseUpstream(raw string) (upstream, host string, err error) {
 	}
 	u, perr := url.Parse(raw)
 	if perr != nil {
-		return "", "", fmt.Errorf("PROXY_UPSTREAM_URL=%q: %v", raw, perr)
+		return "", "", errors.New("PROXY_UPSTREAM_URL: invalid URL")
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", "", fmt.Errorf("PROXY_UPSTREAM_URL=%q: must be http(s)://host[:port][/prefix]", raw)
+		return "", "", errors.New("PROXY_UPSTREAM_URL: must be http(s)://host[:port][/prefix]")
 	}
 	if strings.ContainsAny(raw, "?#") { // covers a bare "?"/"#", which url.Parse reports as empty
-		return "", "", fmt.Errorf("PROXY_UPSTREAM_URL=%q: must not carry a query or fragment", raw)
+		return "", "", errors.New("PROXY_UPSTREAM_URL: must not carry a query or fragment")
 	}
 	return strings.TrimRight(raw, "/"), u.Host, nil
 }
@@ -218,7 +218,7 @@ func main() {
 		MaxHeaderBytes: 1 << 20,
 	}
 	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: Messages + Responses + Gemini SSE, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, gemini-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
-		currentVersion().token(), cfg.listenAddr, cfg.upstream, cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.geminiBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
+		currentVersion().token(), cfg.listenAddr, redactedUpstreamURL("", ""), cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.geminiBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -272,8 +272,14 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, false, http.StatusInternalServerError, "api_error", "proxy: setting response write deadline", 0, "write_deadline")
 		return
 	}
-	body, tooBig, err := readBody(r)
+	body, tooBig, err := readBody(w, r)
 	if tooBig {
+		if r.ProtoMajor == 1 {
+			w.Header().Set("Connection", "close")
+			// Do not drain an upload we have already rejected, including when
+			// net/http closes the body after writing the response.
+			_ = control.SetReadDeadline(time.Now())
+		}
 		// Deterministic: the same oversized request can never succeed. surfaceFor keeps
 		// 413 for the Anthropic wire but normalizes to 400 for Responses, since Codex
 		// ignores x-should-retry and would re-send a 413 to its retry cap.
@@ -484,7 +490,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 				}
 				break
 			}
-			for k, v := range safeResponseHeaders(resp.Header) {
+			for k, v := range safeResponseHeaders(resp.Header, false) {
 				w.Header()[k] = v
 			}
 			w.WriteHeader(resp.StatusCode)
@@ -613,7 +619,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		tag, reqWho, effortField(reqEffort), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
 	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
-	writeFailure(w, r.URL.Path, last, canRetry, sStatus, sType, retryAfter)
+	writeFailure(w, r, last, canRetry, sStatus, sType, retryAfter)
 }
 
 // bufferedStream is a complete, validated upstream stream held in its spool.
@@ -646,10 +652,10 @@ func deliverHeldRefusal(w http.ResponseWriter, b *bufferedStream, reqWho, reqEff
 // the upstream's own answer and is replayed verbatim (status adjusted only where
 // the route's client would otherwise auto-retry it); everything else is
 // synthesized in the route's native error envelope.
-func writeFailure(w http.ResponseWriter, path string, f failure, canRetry bool, status int, atype string, retryAfter int) {
+func writeFailure(w http.ResponseWriter, r *http.Request, f failure, canRetry bool, status int, atype string, retryAfter int) {
 	if !f.transient && f.upstream != nil {
 		h := w.Header()
-		for k, v := range safeResponseHeaders(f.upstream.header) {
+		for k, v := range safeResponseHeaders(f.upstream.header, r.Method == http.MethodHead) {
 			h[k] = v
 		}
 		h.Set("X-Should-Retry", "false")
@@ -663,7 +669,7 @@ func writeFailure(w http.ResponseWriter, path string, f failure, canRetry bool, 
 		_, _ = w.Write(f.upstream.body)
 		return
 	}
-	errorWriterFor(path)(w, canRetry, status, atype, msgFor(f), retryAfter, f.code)
+	errorWriterFor(r.URL.Path)(w, canRetry, status, atype, msgFor(f), retryAfter, f.code)
 }
 
 // classifyUpstreamHTTPError reads and classifies one non-2xx upstream response,
@@ -682,12 +688,16 @@ func classifyUpstreamHTTPError(ctx context.Context, path string, resp *http.Resp
 
 // readBody reads the request body with a hard cap, reporting overflow rather
 // than silently truncating an oversized request.
-func readBody(r *http.Request) (body []byte, tooBig bool, err error) {
-	body, err = io.ReadAll(io.LimitReader(r.Body, cfg.maxRequestBytes+1))
-	r.Body.Close()
-	if int64(len(body)) > cfg.maxRequestBytes {
+func readBody(w http.ResponseWriter, r *http.Request) (body []byte, tooBig bool, err error) {
+	if r.ContentLength > cfg.maxRequestBytes {
 		return nil, true, nil
 	}
+	body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, cfg.maxRequestBytes))
+	var sizeErr *http.MaxBytesError
+	if errors.As(err, &sizeErr) {
+		return nil, true, nil
+	}
+	// net/http owns closing the request body after the handler returns.
 	return body, false, err
 }
 
@@ -791,6 +801,8 @@ func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body
 	case err != nil:
 		f = classifyTransport(err, ctx)
 		rec.noteAttemptFailure(f, "transport_error")
+	case resp.StatusCode == http.StatusNotModified && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		failed = false
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		f = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec)
 	default:
@@ -814,23 +826,31 @@ func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body
 		sStatus, sType := retrySurfaceFor(r.URL.Path, f, canRetry)
 		log.Printf("%-5s %s%s  %s %s%s  %s%s%s", tag, reqWho, effortField(reqEffort), f.code, statusField(origStatusOf(f), sStatus), retryField(retryAfter), since(start), att(retryCount), rec.idField())
 		rec.note(tag, origStatusOf(f), sStatus, f.code)
-		writeFailure(w, r.URL.Path, f, canRetry, sStatus, sType, retryAfter)
+		writeFailure(w, r, f, canRetry, sStatus, sType, retryAfter)
 		return
 	}
 	defer resp.Body.Close()
 	rec.noteAttemptResponseHeaders(resp.StatusCode, resp.Header)
-	for k, v := range safeResponseHeaders(resp.Header) {
+	for k, v := range safeResponseHeaders(resp.Header, r.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	// Tee the body into the recorder when request-log is on.
 	var dst io.Writer = w
+	var copyErr error
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		control := http.NewResponseController(w)
+		copyErr = control.Flush()
+		dst = flushingWriter{w: w, control: control}
+	}
 	if sink := rec.respWriter(); sink != nil {
-		dst = io.MultiWriter(w, sink)
+		dst = io.MultiWriter(dst, sink)
 	}
 	upstreamBody := withByteIdle(resp.Body, cfg.upstreamByteIdle)
 	defer upstreamBody.stop()
-	n, copyErr := io.Copy(dst, upstreamBody)
+	var n int64
+	if copyErr == nil {
+		n, copyErr = io.Copy(dst, upstreamBody)
+	}
 	if copyErr != nil {
 		f := failure{transient: true, status: 502, atype: "api_error", code: "response_read_error", message: copyErr.Error()}
 		if ctx.Err() != nil {
@@ -856,8 +876,8 @@ func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body
 // roundTrip issues one upstream request from the exact buffered body.
 func roundTrip(ctx context.Context, r *http.Request, body []byte) (*http.Response, time.Time, error) {
 	started := time.Now()
-	u := cfg.upstream + r.URL.Path
-	if r.URL.RawQuery != "" {
+	u := cfg.upstream + r.URL.EscapedPath()
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
 		u += "?" + r.URL.RawQuery
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, u, bytes.NewReader(body))
@@ -877,7 +897,7 @@ func roundTrip(ctx context.Context, r *http.Request, body []byte) (*http.Respons
 var hopByHop = map[string]bool{
 	"connection": true, "proxy-connection": true, "keep-alive": true,
 	"transfer-encoding": true, "te": true, "trailer": true, "upgrade": true,
-	"content-length": true, "proxy-authorization": true, "proxy-authenticate": true,
+	"proxy-authorization": true, "proxy-authenticate": true,
 }
 var stripFromClient = map[string]bool{
 	// Reserved for gateway->proxy hints on responses (x-gateway-retryable is
@@ -904,21 +924,21 @@ func copyForwardHeaders(dst, src http.Header) {
 	drop := connectionTokens(src)
 	for k, vv := range src {
 		lk := strings.ToLower(k)
-		if hopByHop[lk] || stripFromClient[lk] || drop[lk] || lk == "host" {
+		if hopByHop[lk] || stripFromClient[lk] || drop[lk] || lk == "host" || lk == "content-length" {
 			continue
 		}
 		dst[k] = append([]string(nil), vv...)
 	}
 }
 
-// safeResponseHeaders keeps the upstream's end-to-end headers, including
-// Content-Encoding: raw relays forward the body bytes unchanged.
-func safeResponseHeaders(src http.Header) http.Header {
+// safeResponseHeaders keeps end-to-end headers, including Content-Encoding.
+// Length is retained only as HEAD/304 metadata, never across body rewriting.
+func safeResponseHeaders(src http.Header, preserveLength bool) http.Header {
 	drop := connectionTokens(src)
 	out := http.Header{}
 	for k, vv := range src {
 		lk := strings.ToLower(k)
-		if hopByHop[lk] || drop[lk] {
+		if hopByHop[lk] || drop[lk] || (lk == "content-length" && !preserveLength) {
 			continue
 		}
 		out[k] = append([]string(nil), vv...)
@@ -1076,6 +1096,9 @@ func localRetryExtraBackoff(retryIndex int) time.Duration {
 	}
 	d := time.Second
 	for i := 0; i < retryIndex && d < capDur; i++ {
+		if d >= capDur-d {
+			return capDur
+		}
 		d *= 2
 	}
 	if d > capDur {
@@ -1331,7 +1354,13 @@ func (e *envReader) int64(k string, d, minAllowed int64) int64 {
 }
 
 func (e *envReader) ms(k string, d, minAllowed int64) time.Duration {
-	return time.Duration(e.int64(k, d, minAllowed)) * time.Millisecond
+	n := e.int64(k, d, minAllowed)
+	const maxMS = math.MaxInt64 / int64(time.Millisecond)
+	if n > maxMS {
+		e.errs = append(e.errs, fmt.Sprintf("%s=%d: must be <= %d", k, n, maxMS))
+		n = d
+	}
+	return time.Duration(n) * time.Millisecond
 }
 func atoiSafe(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))

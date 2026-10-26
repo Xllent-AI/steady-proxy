@@ -28,7 +28,7 @@ go build ./...
 make test
 ```
 
-`make test` runs `go test -race ./...` across all unit and integration suites. CI also enforces `gofmt`, runs `make release-test`, and verifies the Docker build.
+`make test` runs the Go race suite and offline regressions for the live harness (no Docker, Claude, or billed calls needed for those regressions). CI also enforces `gofmt`, runs `make release-test`, and verifies the Docker build.
 
 ### Live client harness
 
@@ -40,6 +40,10 @@ DO_LONG=0 ./test/live.sh    # skip the 300s+ long-turn case
 ```
 
 The harness runs in an isolated Compose project on random loopback ports, makes no real upstream API calls by default, and cleans up containers on exit (retaining logs in a temporary directory on failure).
+
+The permanent-error probe uses a `401 authentication_error` and requires a client error after exactly one upstream attempt. Some Claude versions repair `400` requests and resubmit different payloads even with `X-Should-Retry: false`; that client behavior is distinct from proxy or SDK transport retries. The Go suite separately covers terminal `400` responses.
+
+The long case explicitly recreates the test proxy with a 600-second buffering window, then requires one successful buffered outcome in that fresh container's logs. This preserves the >300-second Claude timeout check independently of the production buffer default. To run only the offline harness regressions: `python3 -B -m unittest discover -s test -p 'test_live.py' -v`.
 
 To include one live (billed) gateway test, export `ANTHROPIC_AUTH_TOKEN` and run:
 

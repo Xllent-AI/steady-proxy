@@ -19,13 +19,13 @@ The tables below list **binary defaults**. `docker-compose.yml.example` override
 
 Storage limits (`PROXY_MAX_*_BYTES`), `PROXY_SPOOL_DIR`, and `PROXY_MAX_REQUEST_DURATION_MS` are not listed in `docker-compose.yml.example`—add them under `environment:` in `docker-compose.yml` if you need to override them in Docker.
 
-All `_MS` variables take integer milliseconds; `_BYTES` variables take integer bytes; boolean switches use `1` and `0`. Startup fails immediately if `PROXY_UPSTREAM_URL` is missing/invalid or if any numeric variable is malformed or below its minimum.
+All `_MS` variables take integer milliseconds; `_BYTES` variables take integer bytes; boolean switches use `1` and `0`. Startup rejects missing/invalid upstream URLs, malformed numbers, and values below their minimum. Durations must not exceed `9223372036854` milliseconds (Go's duration range).
 
 ## Connection
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PROXY_UPSTREAM_URL` | *Required* | Upstream gateway root (`http(s)://host[:port][/prefix]`). Query strings and fragments are rejected. Incoming request paths are appended verbatim. |
+| `PROXY_UPSTREAM_URL` | *Required* | Upstream gateway root (`http(s)://host[:port][/prefix]`). Query strings and fragments are rejected. Incoming escaped request paths and query parameters are preserved when appended to the prefix. |
 | `PROXY_LISTEN_ADDR` | `127.0.0.1:8789` | Bind address. Keep restricted to loopback (`127.0.0.1`). |
 
 ## Timeouts
@@ -88,7 +88,7 @@ See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#mode
 | --- | --- | --- |
 | `PROXY_MAX_BUFFER_MEM_BYTES` | `1048576` (1 MiB) | Response spool RAM threshold before spilling to `PROXY_SPOOL_DIR`; not a whole-request memory cap. `0` spills immediately. |
 | `PROXY_MAX_RESPONSE_BYTES` | `134217728` (128 MiB) | Max buffered response size, single SSE event size, and retained tool-input budget (minimum `1`). |
-| `PROXY_MAX_REQUEST_BYTES` | `67108864` (64 MiB) | Max client request body size (minimum `1`). Oversized bodies fail with `413` (`400` on Responses). |
+| `PROXY_MAX_REQUEST_BYTES` | `67108864` (64 MiB) | Max client request body size (minimum `1`). Oversized bodies fail promptly with `413` (`400` on Responses), without waiting for the rest of the upload. |
 | `PROXY_SPOOL_DIR` | OS temp dir | Directory for temporary response spill files (unlinked immediately on release). |
 | `PROXY_REQUEST_LOG_DIR` | *Off* | Directory for full request/response JSON archives. Empty or unset disables archiving; see [Saving request and response data](OPERATIONS.md#saving-request-and-response-data). |
 | `PROXY_VERBOSE` | `0` | Set `1` to log internal `[local-retry]` and `[request-log]` diagnostics (`1` in Compose). |

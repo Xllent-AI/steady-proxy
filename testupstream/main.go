@@ -13,7 +13,7 @@
 //	malformed         200 with a fully-framed event whose data is broken JSON
 //	http500           500 Internal server error
 //	overloaded        529 overloaded_error
-//	permanent         400 invalid_request ("Missing Tool Result Block")
+//	permanent         401 authentication_error ("Invalid API key")
 //	eof-then-ok[:N]    truncate the first N attempts (default 2), then succeed
 //	overload-then-ok[:N] 529 the first N attempts (default 2), then succeed
 //	slow:S             stream a valid response slowly over S seconds
@@ -101,7 +101,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	case "overloaded":
 		httpErr(w, 529, "overloaded_error", "Overloaded")
 	case "permanent":
-		httpErr(w, 400, "invalid_request_error", "Missing Tool Result Block")
+		httpErr(w, 401, "authentication_error", "Invalid API key")
 	case "eof-then-ok":
 		if n <= argOr(arg, 2) {
 			truncated(w)

@@ -7,7 +7,7 @@
 # proxy. Credentials for the real smoke come from the host's $ANTHROPIC_AUTH_TOKEN.
 #
 # Requires: docker (compose v2), curl, claude, and GNU timeout on PATH.
-# Runs ~10 minutes with the default long-generation case.
+# Runs ~5.5 minutes with the default long-generation case.
 #
 # Usage:  ./test/live.sh            # mock faults + long-gen (no real requests)
 #         DO_LONG=0 ./test/live.sh  # skip the >300s long-generation case
@@ -17,7 +17,7 @@
 #                                   # $ANTHROPIC_AUTH_TOKEN
 set -uo pipefail
 
-for tool in docker curl claude; do
+for tool in docker curl claude timeout; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool"; exit 2; }
 done
 
@@ -96,19 +96,29 @@ mock_ok "malformed-then-ok" "malformed-then-ok:2" 3 90
 # permanent: claude must FAIL fast (exactly 1 attempt, no retry storm)
 nonce="N${RANDOM}${RANDOM}"; curl -s "$MOCK/__reset" >/dev/null
 run_claude "Reply briefly. $nonce [[FAULT=permanent]]" 60 "$PROXY" "test-token"; ec=$?
-att=$(curl -s "$MOCK/__count?q=$nonce")
-if [ $ec -ne 0 ] && [ "${att:-9}" -le 1 ]; then c_pass "permanent-no-storm" "claude failed after ${att} attempt"
-else c_fail "permanent-no-storm" "exit=$ec attempts=${att:-?} (want exit!=0, attempts<=1)"; fi
+if att=$(curl -fsS "$MOCK/__count?q=$nonce") && [ "$att" = 1 ] && [ "$ec" -gt 0 ] && [ "$ec" -lt 124 ]; then
+  c_pass "permanent-no-storm" "claude failed after exactly one attempt"
+else
+  c_fail "permanent-no-storm" "exit=$ec attempts=${att:-?} (want client error 1..123, attempts=1)"
+fi
 
-# long generation > 300s: with PROXY_KEEPALIVE_MS=600000 the proxy stays FULLY
-# transactional for the whole turn (no commit), so the client must wait >310s for
-# the first byte — exercised via CLAUDE_CODE_CONNECT_TIMEOUT_MS=660000 in run_claude.
+# Keep the >310s Claude wait fully transactional with an explicit longer hold.
+# A fresh container's outcome log proves buffering; claude -p stdout alone cannot.
 if [ "$DO_LONG" = 1 ]; then
-  echo "==> Long-generation (>300s, transactional window) — this takes ~5.5 min"
-  nonce="N${RANDOM}${RANDOM}"; curl -s "$MOCK/__reset" >/dev/null
+  echo "==> Long-generation (>300s, fully transactional) — this takes ~5.5 min"
+  PROXY_KEEPALIVE_MS=600000 compose up -d --no-deps --force-recreate proxy >>"$COMPOSE_LOG" 2>&1 || { echo "long-generation proxy failed to start"; exit 2; }
+  refresh_endpoints && wait_ready || { echo "long-generation proxy not ready"; exit 2; }
+  nonce="N${RANDOM}${RANDOM}"; curl -fsS "$MOCK/__reset" >/dev/null
   run_claude "Reply briefly. $nonce [[FAULT=slow:310]]" 420 "$PROXY" "test-token"; ec=$?
-  if [ $ec -eq 0 ] && grep -q MOCK_OK "$OUT"; then c_pass "long-gen-310s" "completed a >300s stream"
-  else c_fail "long-gen-310s" "exit=$ec out=$(head -c70 "$OUT" | tr -d '\n')"; fi
+  LONG_LOG="$TEST_DIR/long-proxy.log"
+  if compose logs --no-color --no-log-prefix proxy >"$LONG_LOG" 2>>"$COMPOSE_LOG" && \
+    att=$(curl -fsS "$MOCK/__count?q=$nonce") && [ "$att" = 1 ] && [ "$ec" -eq 0 ] && grep -q MOCK_OK "$OUT" && \
+    [ "$(grep -Ec '[[:space:]](OK|DROP|FAIL|RETRY)[[:space:]]' "$LONG_LOG")" = 1 ] && \
+    grep -Eq '[[:space:]]OK[[:space:]].*[[:space:]]buffered[[:space:]]' "$LONG_LOG"; then
+    c_pass "long-gen-310s" "Claude completed one >300s stream in buffered mode"
+  else
+    c_fail "long-gen-310s" "exit=$ec attempts=${att:-?} (want one successful buffered outcome; see $LONG_LOG)"
+  fi
 fi
 
 # --- real-gateway smoke (one real sonnet call) -------------------------------

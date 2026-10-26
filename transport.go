@@ -109,3 +109,17 @@ func (r *byteIdleReader) stop() {
 		r.timer.Stop()
 	}
 }
+
+// flushingWriter preserves incremental delivery for single-shot SSE responses.
+type flushingWriter struct {
+	w       io.Writer
+	control *http.ResponseController
+}
+
+func (w flushingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err == nil {
+		err = w.control.Flush()
+	}
+	return n, err
+}

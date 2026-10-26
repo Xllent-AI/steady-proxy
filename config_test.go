@@ -1,8 +1,11 @@
 package main
 
 import (
+	"math"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func envOf(kv map[string]string) func(string) (string, bool) {
@@ -47,13 +50,10 @@ func TestParseConfigRejectsBadValues(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 	for _, want := range []string{
-		`PROXY_KEEPALIVE_MS="60s": not an integer`,
-		`PROXY_GEMINI_BUFFER_MS=-1: must be >= 0`,
-		`PROXY_UPSTREAM_BYTE_IDLE_MS=0: must be >= 1`,
-		`PROXY_SDK_RETRY_CAP=-1: must be >= 0`,
-		`PROXY_MAX_REQUEST_BYTES=0: must be >= 1`,
-		`PROXY_MAX_RESPONSE_BYTES=0: must be >= 1`,
-		`PROXY_MAX_REQUEST_DURATION_MS=0: must be >= 1`,
+		"PROXY_KEEPALIVE_MS", "PROXY_GEMINI_BUFFER_MS",
+		"PROXY_UPSTREAM_BYTE_IDLE_MS", "PROXY_SDK_RETRY_CAP",
+		"PROXY_MAX_REQUEST_BYTES", "PROXY_MAX_RESPONSE_BYTES",
+		"PROXY_MAX_REQUEST_DURATION_MS",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should name %q; got:\n%v", want, err)
@@ -71,5 +71,50 @@ func TestParseUpstreamRejectsUnusableURLs(t *testing.T) {
 	}
 	if _, err := parseConfig(envOf(nil)); err == nil || !strings.Contains(err.Error(), "required") {
 		t.Fatalf("missing upstream must fail startup, got %v", err)
+	}
+}
+
+func TestDurationConfigurationBounds(t *testing.T) {
+	const maxMS = math.MaxInt64 / int64(time.Millisecond)
+	for _, key := range []string{
+		"PROXY_MAX_REQUEST_DURATION_MS", "PROXY_KEEPALIVE_MS",
+		"PROXY_RESP_HEADER_TIMEOUT_MS", "PROXY_UPSTREAM_BYTE_IDLE_MS",
+		"PROXY_WORKFLOW_KEEPALIVE_MS", "PROXY_RESPONSES_KEEPALIVE_MS",
+		"PROXY_RESPONSES_BUFFER_MS", "PROXY_GEMINI_BUFFER_MS",
+		"PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS",
+	} {
+		t.Run(key, func(t *testing.T) {
+			values := map[string]string{"PROXY_UPSTREAM_URL": "https://example.com", key: strconv.FormatInt(maxMS+1, 10)}
+			if _, err := parseConfig(envOf(values)); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("overflowing duration must name the rejected setting: %v", err)
+			}
+			values[key] = strconv.FormatInt(maxMS, 10)
+			if _, err := parseConfig(envOf(values)); err != nil {
+				t.Fatalf("largest representable millisecond duration rejected: %v", err)
+			}
+		})
+	}
+	useDefaultConfig(t)
+	cfg.localBackoffCap = time.Duration(maxMS) * time.Millisecond
+	if got := localRetryExtraBackoff(100); got != cfg.localBackoffCap {
+		t.Fatalf("large retry delay overflowed: got %v, want cap %v", got, cfg.localBackoffCap)
+	}
+}
+
+func TestInvalidUpstreamErrorsDoNotExposeCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"http://audit-user:audit-password@example.com/%zz",
+		"ftp://audit-user:audit-password@example.com",
+		"http://audit-user:audit-password@example.com?key=query-secret",
+	} {
+		_, _, err := parseUpstream(raw)
+		if err == nil {
+			t.Fatalf("invalid upstream accepted: %q", raw)
+		}
+		for _, secret := range []string{"audit-user", "audit-password", "query-secret"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("configuration error leaked credential: %v", err)
+			}
+		}
 	}
 }
