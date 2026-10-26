@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -514,8 +515,14 @@ func TestRequestLimitInterruptsBlockedResponse(t *testing.T) {
 				defer close(finished)
 				handle(w, r)
 			}))
-			proxy.EnableHTTP2 = proto == 2
-			proxy.StartTLS()
+			if proto == 2 {
+				proxy.EnableHTTP2 = true
+				proxy.StartTLS()
+			} else {
+				// Match the proxy's plain HTTP listener. Go 1.23 TLS shutdown
+				// can spend another 5s sending close_notify after a write expires.
+				proxy.Start()
+			}
 			defer proxy.Close()
 			downstream := proxy.Client()
 			downstream.Timeout = 5 * time.Second
@@ -541,8 +548,27 @@ func TestRequestLimitInterruptsBlockedResponse(t *testing.T) {
 	}
 }
 
+type pausedResponseWriter struct {
+	http.ResponseWriter
+	paused chan struct{}
+	resume <-chan struct{}
+}
+
+func (w *pausedResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *pausedResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if err == nil && w.paused != nil {
+		w.ResponseWriter.(http.Flusher).Flush()
+		close(w.paused)
+		w.paused = nil
+		<-w.resume
+	}
+	return n, err
+}
+
 func TestSingleShotByteIdleOnlyWhileReading(t *testing.T) {
-	const responseBytes = 32 << 20
+	const responseBytes = 128 << 10
 	for _, stalled := range []bool{true, false} {
 		name := "paused-downstream"
 		if stalled {
@@ -572,11 +598,20 @@ func TestSingleShotByteIdleOnlyWhileReading(t *testing.T) {
 			cfg.upstreamByteIdle = 300 * time.Millisecond
 			cfg.txLocalRetries = 3
 			finished := make(chan struct{})
+			paused := make(chan struct{})
+			resume := make(chan struct{})
+			release := sync.OnceFunc(func() { close(resume) })
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer close(finished)
+				if !stalled {
+					// Pause a write explicitly instead of filling TCP buffers: window
+					// reopening can itself stall upstream reads after the client resumes.
+					w = &pausedResponseWriter{ResponseWriter: w, paused: paused, resume: resume}
+				}
 				handle(w, r)
 			}))
 			defer proxy.Close()
+			defer release()
 			downstream := &http.Client{Timeout: 6 * time.Second}
 			started := time.Now()
 			resp, err := downstream.Get(proxy.URL + "/v1/models")
@@ -588,12 +623,18 @@ func TestSingleShotByteIdleOnlyWhileReading(t *testing.T) {
 				t.Fatalf("status = %d, want committed response", resp.StatusCode)
 			}
 			if !stalled {
+				select {
+				case <-paused:
+				case <-time.After(time.Second):
+					t.Fatal("fixture did not pause the downstream writer")
+				}
 				time.Sleep(900 * time.Millisecond)
 				select {
 				case <-finished:
 					t.Fatal("fixture did not backpressure the downstream writer")
 				default:
 				}
+				release()
 			}
 			n, err := io.Copy(io.Discard, resp.Body)
 			if stalled {

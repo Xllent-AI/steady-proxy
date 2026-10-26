@@ -34,11 +34,11 @@ Writing `200 OK` response headers is the **commit point**. Once headers are sent
 
 | Request type | Default commit policy | Completion criterion |
 | --- | --- | --- |
-| **Anthropic Messages** | Buffer up to 600s (`PROXY_KEEPALIVE_MS`), then switch to live streaming. | Valid SSE stream ending in `message_stop`. |
+| **Anthropic Messages** | Buffer up to 240s (`PROXY_KEEPALIVE_MS`), then switch to live streaming. | Valid SSE stream ending in `message_stop`. |
 | **Claude Code Workflow agent** | Buffer up to 10s (`PROXY_WORKFLOW_KEEPALIVE_MS`), then switch to live streaming once forwardable content arrives. | Valid SSE stream ending in `message_stop`. |
 | **OpenAI Responses (default)** | Commit and stream live as soon as the first output event arrives; 30s (`PROXY_RESPONSES_KEEPALIVE_MS`) bounds a silent reasoning start. | Valid `response.completed` or `response.incomplete` event. |
-| **OpenAI Responses (`PROXY_RESPONSES_EARLY_COMMIT=0`)** | Buffer up to 600s (`PROXY_RESPONSES_BUFFER_MS`), then switch to live streaming. | Valid `response.completed` or `response.incomplete` event. |
-| **Gemini `streamGenerateContent?alt=sse`** | Buffer up to 600s (`PROXY_GEMINI_BUFFER_MS`), then switch to live streaming. | Clean transport EOF after every requested candidate has a `finishReason` (or a prompt block without candidates). |
+| **OpenAI Responses (`PROXY_RESPONSES_EARLY_COMMIT=0`)** | Buffer up to 240s (`PROXY_RESPONSES_BUFFER_MS`), then switch to live streaming. | Valid `response.completed` or `response.incomplete` event. |
+| **Gemini `streamGenerateContent?alt=sse`** | Buffer up to 240s (`PROXY_GEMINI_BUFFER_MS`), then switch to live streaming. | Clean transport EOF after every requested candidate has a `finishReason` (or a prompt block without candidates). |
 
 ### Gemini completion details
 
@@ -94,7 +94,7 @@ On streaming `POST /v1/messages` requests for a Claude model (model name contain
 
 Claude Code's Workflow `agent()` runtime enforces a per-agent content-stall watchdog (180s by default; `CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` controls a different path) that only resets when actual assistant content is delivered—SSE pings and comments do not count.
 
-When the proxy detects the Workflow system-prompt marker (`workflow orchestration script` inside `system`), it labels the request `/wf` in the logs and uses `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10s) instead of the 10-minute window. Once 10s have elapsed and forwardable content is buffered, the proxy commits and streams live. If the upstream model itself goes silent for longer than the script's `stallMs`, raise `stallMs` in the workflow script (e.g., `agent(prompt, {stallMs: 300000})`).
+When the proxy detects the Workflow system-prompt marker (`workflow orchestration script` inside `system`), it labels the request `/wf` in the logs and uses `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10s) instead of the 4-minute window. Once 10s have elapsed and forwardable content is buffered, the proxy commits and streams live. If the upstream model itself goes silent for longer than the script's `stallMs`, raise `stallMs` in the workflow script (e.g., `agent(prompt, {stallMs: 300000})`).
 
 ## Stream validation and replay
 

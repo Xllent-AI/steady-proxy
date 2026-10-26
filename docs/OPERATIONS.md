@@ -110,7 +110,7 @@ After=network-online.target
 ExecStart=/opt/steady-proxy/steady-proxy
 Environment=PROXY_UPSTREAM_URL=https://your-gateway.example.com
 Environment=PROXY_LISTEN_ADDR=127.0.0.1:8789
-Environment=PROXY_KEEPALIVE_MS=600000
+Environment=PROXY_KEEPALIVE_MS=240000
 Restart=always
 RestartSec=2
 
