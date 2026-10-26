@@ -22,6 +22,7 @@ docker-build:
 
 test:
 	go test -race ./...
+	python3 -B -m unittest discover -s test -p 'test_live.py' -v
 
 release:
 	python3 scripts/package_release.py "$(TAG)"

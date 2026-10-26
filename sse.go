@@ -569,7 +569,7 @@ func replayCaptured(sp *spool, model wireModel, w io.Writer, st *captureStats, w
 
 // writeStreamHead commits a 200 SSE response carrying the upstream's safe headers.
 func writeStreamHead(w http.ResponseWriter, upstreamHdr http.Header, mode string, st *captureStats) {
-	for k, v := range safeResponseHeaders(upstreamHdr) {
+	for k, v := range safeResponseHeaders(upstreamHdr, false) {
 		w.Header()[k] = v
 	}
 	// The stream is parsed and re-framed as plain SSE text, never relayed as an

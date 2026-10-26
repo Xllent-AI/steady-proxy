@@ -7,9 +7,12 @@ import (
 	"context"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1025,5 +1028,246 @@ func TestE2ELiveToolInputLimitAbortsWithoutRetry(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("committed stream was retried: calls=%d", calls.Load())
+	}
+}
+
+func TestE2EPreservesEscapedRequestTargets(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.RequestURI)
+	}))
+	defer up.Close()
+	setupForTest(up.URL + "/api%2Fprefix")
+	t.Cleanup(func() { cfg = testConfig() })
+	proxy := httptest.NewServer(http.HandlerFunc(handle))
+	defer proxy.Close()
+	for _, target := range []string{
+		"/v1/files/a%2Fb/content?download=1", "/v1/files/a%23b/content?download=1",
+		"/v1/files/a%3Fb/content?download=1", "/v1/files/a%25b/content?download=1",
+		"/v1/models?", "/v1/files/%E2%98%83/content",
+	} {
+		t.Run(target, func(t *testing.T) {
+			resp, err := proxy.Client().Get(proxy.URL + target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusOK || string(got) != "/api%2Fprefix"+target {
+				t.Fatalf("target changed: status=%d body=%q err=%v", resp.StatusCode, got, err)
+			}
+		})
+	}
+}
+
+func TestE2EPassthroughSSEFlushesBeforeCompletion(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(release) }) }
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	defer finish()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	proxy := httptest.NewServer(http.HandlerFunc(handle))
+	defer proxy.Close()
+	downstream := &http.Client{Timeout: 2 * time.Second}
+	resp, err := downstream.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil || line != "data: first\n" {
+		t.Fatalf("first event unavailable: %q %v", line, err)
+	}
+	finish()
+	rest, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(rest), "data: [DONE]") {
+		t.Fatalf("terminal lost: %q %v", rest, err)
+	}
+}
+
+func TestE2EPreservesConditionalAndHeadMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		status int
+	}{
+		{http.MethodGet, http.StatusNotModified}, {http.MethodHead, http.StatusOK},
+		{http.MethodHead, http.StatusNotModified}, {http.MethodHead, http.StatusUnauthorized},
+	} {
+		t.Run(tc.method+itoa(tc.status), func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "12345")
+				w.Header().Set("ETag", `"v1"`)
+				w.Header().Set("Cache-Control", "max-age=60")
+				w.WriteHeader(tc.status)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			proxy := httptest.NewServer(http.HandlerFunc(handle))
+			defer proxy.Close()
+			req, _ := http.NewRequest(tc.method, proxy.URL+"/v1/models", nil)
+			req.Header.Set("If-None-Match", `"v1"`)
+			resp, err := proxy.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || len(body) != 0 || resp.StatusCode != tc.status || resp.Header.Get("ETag") != `"v1"` || resp.Header.Get("Cache-Control") != "max-age=60" {
+				t.Fatalf("metadata response changed: status=%d headers=%v body=%q err=%v", resp.StatusCode, resp.Header, body, err)
+			}
+			// net/http strips Content-Length from a 304 at the upstream server.
+			if tc.status != http.StatusNotModified && resp.Header.Get("Content-Length") != "12345" {
+				t.Fatalf("HEAD lost representation length: %v", resp.Header)
+			}
+		})
+	}
+}
+
+func TestE2ERejectsUnfinishedOversizedUploads(t *testing.T) {
+	for _, tc := range []struct{ name, headers, body string }{
+		{"declared", "Content-Length: 1000\r\n", ""},
+		{"chunked", "Transfer-Encoding: chunked\r\n", "41\r\n" + strings.Repeat("x", 65) + "\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.maxRequestBytes = 64
+			cfg.maxRequestDur = 5 * time.Second
+			proxy := httptest.NewServer(http.HandlerFunc(handle))
+			defer proxy.Close()
+			conn, err := net.Dial("tcp", strings.TrimPrefix(proxy.URL, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(time.Second))
+			io.WriteString(conn, "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n"+tc.headers+"\r\n"+tc.body)
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("oversize response waited for body completion: %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusRequestEntityTooLarge || !resp.Close || hits.Load() != 0 || !strings.Contains(string(body), "request body exceeds limit") {
+				t.Fatalf("invalid early rejection: status=%d close=%v hits=%d body=%q err=%v", resp.StatusCode, resp.Close, hits.Load(), body, err)
+			}
+		})
+	}
+}
+
+func TestE2ERequestLimitBoundariesPreserveBody(t *testing.T) {
+	const body = `{"model":"test","stream":false}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.Copy(w, r.Body) }))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	for _, limit := range []int64{int64(len(body)), math.MaxInt64} {
+		cfg.maxRequestBytes = limit
+		rec := httptest.NewRecorder()
+		handle(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+		if rec.Code != http.StatusOK || rec.Body.String() != body {
+			t.Fatalf("limit %d changed accepted body: status=%d body=%q", limit, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestE2EAcceptedUploadsReuseHTTP1Connection(t *testing.T) {
+	const body = `{"model":"test","stream":false}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.Copy(w, r.Body) }))
+	defer up.Close()
+	setupForTest(up.URL)
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.maxRequestBytes = int64(len(body))
+	var connections atomic.Int32
+	proxy := httptest.NewUnstartedServer(http.HandlerFunc(handle))
+	proxy.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	proxy.Start()
+	defer proxy.Close()
+	for range 2 {
+		resp, err := proxy.Client().Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK || string(got) != body || resp.Close {
+			t.Fatalf("accepted upload: status=%d body=%q close=%v err=%v", resp.StatusCode, got, resp.Close, err)
+		}
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("accepted uploads used %d connections, want one", got)
+	}
+}
+
+func TestE2EOversizedHTTP2UploadPreservesConnection(t *testing.T) {
+	for _, length := range []int64{-1, 1000} {
+		t.Run(itoa(int(length)), func(t *testing.T) {
+			var hits, connections atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				io.Copy(w, r.Body)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.maxRequestBytes = 64
+			proxy := httptest.NewUnstartedServer(http.HandlerFunc(handle))
+			proxy.EnableHTTP2 = true
+			proxy.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			proxy.StartTLS()
+			defer proxy.Close()
+			pc := proxy.Client()
+			pc.Timeout = time.Second
+			body, writer := io.Pipe()
+			defer writer.Close()
+			req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages", body)
+			req.ContentLength = length
+			if length < 0 {
+				go func() { io.WriteString(writer, strings.Repeat("x", 65)) }()
+			}
+			resp, err := pc.Do(req)
+			if err != nil {
+				t.Fatalf("unfinished HTTP/2 upload was not rejected promptly: %v", err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusRequestEntityTooLarge || hits.Load() != 0 {
+				t.Fatalf("oversize response: proto=%s status=%d hits=%d", resp.Proto, resp.StatusCode, hits.Load())
+			}
+			resp, err = pc.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil || resp.StatusCode != http.StatusOK || string(got) != `{}` || hits.Load() != 1 || connections.Load() != 1 {
+				t.Fatalf("follow-up response: status=%d body=%q hits=%d connections=%d err=%v", resp.StatusCode, got, hits.Load(), connections.Load(), err)
+			}
+		})
 	}
 }

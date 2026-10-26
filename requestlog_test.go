@@ -551,3 +551,40 @@ func TestRequestLogOutcomeStatsResetForFinalAttempt(t *testing.T) {
 		t.Fatalf("outcome stats should not reuse abandoned attempt stats: %+v", ar.Outcome.Stats)
 	}
 }
+
+func TestRequestLogRedactsUpstreamCredentialsWithEncodedPath(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, password, ok := r.BasicAuth()
+		if !ok || user != "audit-user" || password != "audit-password" {
+			t.Error("upstream authentication changed")
+		}
+		if r.RequestURI != "/literal%25?key=query-secret" {
+			t.Errorf("upstream target changed: %q", r.RequestURI)
+		}
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer up.Close()
+	setupForTest(strings.Replace(up.URL, "http://", "http://audit-user:audit-password@", 1))
+	t.Cleanup(func() { cfg = testConfig() })
+	cfg.requestLogDir = t.TempDir()
+	rec := httptest.NewRecorder()
+	handle(rec, httptest.NewRequest(http.MethodGet, "/literal%25?key=query-secret", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("encoded target failed: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	files := archiveFiles(t, cfg.requestLogDir)
+	if len(files) != 1 {
+		t.Fatalf("want one archive, got %v", files)
+	}
+	ar, _ := readArchive(t, files[0])
+	for _, rendered := range []string{ar.UpstreamURL, redactedUpstreamURL("", "")} {
+		for _, secret := range []string{"audit-user", "audit-password", "query-secret"} {
+			if strings.Contains(rendered, secret) {
+				t.Errorf("rendered URL leaked %q: %s", secret, rendered)
+			}
+		}
+	}
+	if !strings.Contains(ar.UpstreamURL, "/literal%25?key=REDACTED") {
+		t.Errorf("archive lost sanitized target: %s", ar.UpstreamURL)
+	}
+}

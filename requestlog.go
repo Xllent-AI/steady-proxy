@@ -1021,17 +1021,21 @@ func redactQueryWithNames(raw string) (string, []string) {
 }
 
 func redactedUpstreamURL(path, rawQuery string) string {
-	target := strings.TrimRight(cfg.upstream, "/") + path
+	// Parse the trusted base independently: request-path escapes must never
+	// bypass credential redaction.
+	u, err := url.Parse(cfg.upstream)
+	if err != nil {
+		return "[redacted: invalid upstream URL]"
+	}
+	if u.User != nil {
+		u.User = url.User("***redacted***")
+	}
+	target := strings.TrimRight(u.String(), "/") + (&url.URL{Path: path}).EscapedPath()
 	if rawQuery != "" {
 		query, _ := redactQueryWithNames(rawQuery)
 		target += "?" + query
 	}
-	u, err := url.Parse(target)
-	if err != nil || u.User == nil {
-		return target
-	}
-	u.User = url.User("***redacted***")
-	return u.String()
+	return target
 }
 
 func redactedRequestURI(rawURI, path, rawQuery string) string {
