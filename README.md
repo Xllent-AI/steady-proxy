@@ -19,9 +19,9 @@ Agents / SDKs / applications → steady-proxy (127.0.0.1:8789) → your gateway
 
 | API | Route | Default behavior |
 | --- | --- | --- |
-| **Anthropic Messages** | `POST /v1/messages` (`stream: true`) | Buffers up to 10 minutes (`600000` ms) until `message_stop`, then replays. Workflow agents switch to live streaming after 10 seconds once content is ready. |
-| **OpenAI Responses** | `POST /v1/responses` (`stream: true`) | Catches start-of-stream failures before commit, then streams live on first output. Set `PROXY_RESPONSES_EARLY_COMMIT=0` for 10-minute full buffering. |
-| **Gemini GenerateContent** | `POST /{version}/models/{model}:streamGenerateContent?alt=sse` (including Vertex AI publisher and express paths) | Buffers up to 10 minutes through clean EOF after all requested candidates finish. |
+| **Anthropic Messages** | `POST /v1/messages` (`stream: true`) | Buffers up to 4 minutes (`240000` ms) until `message_stop`, then replays. Workflow agents switch to live streaming after 10 seconds once content is ready. |
+| **OpenAI Responses** | `POST /v1/responses` (`stream: true`) | Catches start-of-stream failures before commit, then streams live on first output. Set `PROXY_RESPONSES_EARLY_COMMIT=0` for 4-minute full buffering. |
+| **Gemini GenerateContent** | `POST /{version}/models/{model}:streamGenerateContent?alt=sse` (including Vertex AI publisher and express paths) | Buffers up to 4 minutes through clean EOF after all requested candidates finish. |
 | **Other routes** | `/v1/chat/completions`, `generateContent`, `countTokens`, `embedContent`, non-SSE `streamGenerateContent`, `/v1/models`, non-streaming calls | Forwarded single-shot; recoverable HTTP and connection errors still normalize for client retry. |
 
 See [Architecture](docs/ARCHITECTURE.md#client-compatibility) for client compatibility details.
@@ -81,7 +81,7 @@ Merge this `env` block into `~/.claude/settings.json` alongside your existing se
 }
 ```
 
-Because the proxy sends no HTTP headers while buffering, client timeouts must exceed the 600,000 ms buffering window and the idle watchdog must be disabled. If you change `PROXY_KEEPALIVE_MS`, update these client timeouts to match; see [Timeouts](docs/CONFIGURATION.md#timeouts).
+Because the proxy sends no HTTP headers while buffering, client timeouts must exceed the 240,000 ms default buffering window and the idle watchdog must be disabled. The conservative client settings above also accommodate an explicit 600,000 ms window. If you change `PROXY_KEEPALIVE_MS`, keep these client timeouts above it; see [Timeouts](docs/CONFIGURATION.md#timeouts).
 
 ### Codex
 
@@ -96,7 +96,7 @@ request_max_retries = 10
 stream_max_retries = 10
 ```
 
-To enable full 10-minute buffering for Responses and up to 3 in-proxy retries per client attempt, add to `.env` and run `docker compose up -d`:
+To enable full 4-minute buffering for Responses and up to 3 in-proxy retries per client attempt, add to `.env` and run `docker compose up -d`:
 
 ```dotenv
 PROXY_RESPONSES_EARLY_COMMIT=0
@@ -119,7 +119,7 @@ curl -N --max-time 720 \
   -d '{"contents":[{"parts":[{"text":"Say hello."}]}]}'
 ```
 
-Set client timeouts above `PROXY_GEMINI_BUFFER_MS` (default 600,000 ms) and configure bounded retries on HTTP `503` honoring `Retry-After`. Failed upstream attempts and local-retry waits count toward that silent window; for a client whose first-byte timeout is shorter, lower `PROXY_GEMINI_BUFFER_MS` below it (see [Match the client to the window](docs/CONFIGURATION.md#match-the-client-to-the-window)). If a Gemini stream fails after committing to live output, the proxy aborts the HTTP transport so the client does not mistake a truncated stream for clean EOF.
+Set client timeouts above `PROXY_GEMINI_BUFFER_MS` (default 240,000 ms) with margin and configure bounded retries on HTTP `503` honoring `Retry-After`. Failed upstream attempts and local-retry waits count toward that silent window; for a client whose first-byte timeout is shorter, lower `PROXY_GEMINI_BUFFER_MS` below it (see [Match the client to the window](docs/CONFIGURATION.md#match-the-client-to-the-window)). If a Gemini stream fails after committing to live output, the proxy aborts the HTTP transport so the client does not mistake a truncated stream for clean EOF.
 
 ### Other API clients
 

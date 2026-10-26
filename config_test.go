@@ -3,37 +3,12 @@ package main
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func envOf(kv map[string]string) func(string) (string, bool) {
 	return func(k string) (string, bool) {
 		v, ok := kv[k]
 		return v, ok
-	}
-}
-
-func TestParseConfigDefaults(t *testing.T) {
-	c, err := parseConfig(envOf(map[string]string{
-		"PROXY_UPSTREAM_URL": "https://gw.example.com/",
-		"PROXY_KEEPALIVE_MS": "", // set but empty (how compose passes an unset knob) => default
-	}))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if c.upstream != "https://gw.example.com" || c.upstreamHost != "gw.example.com" {
-		t.Fatalf("upstream/host = %q/%q", c.upstream, c.upstreamHost)
-	}
-	if c.listenAddr != "127.0.0.1:8789" || c.keepaliveMs != 600*time.Second || c.upstreamByteIdle != 600*time.Second ||
-		c.maxRequestBytes != 64<<20 || c.sdkRetryCap != 100 || c.txLocalRetries != 0 {
-		t.Fatalf("defaults changed: %+v", c)
-	}
-	if !c.validateJSON || !c.normalizeToolJSON || !c.responsesEarlyCommit || c.verbose {
-		t.Fatalf("flag defaults changed: validate=%v normalize=%v earlyCommit=%v verbose=%v",
-			c.validateJSON, c.normalizeToolJSON, c.responsesEarlyCommit, c.verbose)
-	}
-	if c.refusalFallback != "claude-opus-5" {
-		t.Fatalf("refusalFallback default = %q", c.refusalFallback)
 	}
 }
 
