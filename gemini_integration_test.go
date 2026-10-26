@@ -62,6 +62,103 @@ func TestGeminiHiddenRetryDiscardsFailedOutput(t *testing.T) {
 	}
 }
 
+func TestGeminiStaleFinishRetriesWithoutLeakingOutput(t *testing.T) {
+	var calls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"discard me\"}]},\"finish_reason\":1}]}\n\n")
+			io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"unfinished\"}]}}]}\n\n")
+			return
+		}
+		io.WriteString(w, goodGeminiStream)
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	cfg.txLocalRetries = 1
+	cfg.localBackoffCap = time.Millisecond
+	rec := httptest.NewRecorder()
+	handle(rec, httptest.NewRequest(http.MethodPost, geminiStreamPath, strings.NewReader(`{}`)))
+	if rec.Code != 200 || calls.Load() != 2 || rec.Body.String() != goodGeminiStream {
+		t.Fatalf("stale finish was accepted or leaked: status=%d calls=%d body=%q", rec.Code, calls.Load(), rec.Body.String())
+	}
+}
+
+func TestGeminiCommittedContentAfterFinishAbortsHTTP(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	first := string(geminiTestEvent(`{"candidates":[{"content":{"parts":[{"text":"committed"}]},"finishReason":"STOP"}]}`).raw)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+			io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"unfinished\"}]}}]}\n\n")
+		case <-r.Context().Done():
+		}
+	}))
+	defer up.Close()
+	setupForTest(up.URL)
+	// The window also bounds connection/header setup; leave race-enabled runs
+	// time to reach SSE before testing the post-commit continuation.
+	cfg.geminiBufferMs = time.Second
+	cfg.txLocalRetries = 3
+	proxy := httptest.NewServer(http.HandlerFunc(handle))
+	defer proxy.Close()
+	pc := &http.Client{Timeout: 5 * time.Second}
+	resp, err := pc.Post(proxy.URL+geminiStreamPath, "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	prefix, err := reader.ReadString('\n')
+	close(release)
+	if err != nil || !strings.Contains(prefix, "committed") {
+		t.Fatalf("first event was not committed: prefix=%q err=%v", prefix, err)
+	}
+	tail, err := io.ReadAll(reader)
+	if err == nil || strings.Contains(string(tail), "unfinished") || calls.Load() != 1 {
+		t.Fatalf("stale finish ended cleanly or retried after commit: calls=%d tail=%q err=%v", calls.Load(), tail, err)
+	}
+}
+
+func TestGeminiVertexNumericStopsPreserveAmbiguousCodes(t *testing.T) {
+	for _, tc := range []struct{ payload, stop string }{
+		{`{"candidates":[{"finishReason":6}]}`, "6"},
+		{`{"promptFeedback":{"blockReason":5}}`, "5"},
+	} {
+		t.Run(tc.stop, func(t *testing.T) {
+			stream := "data: " + tc.payload + "\n\n"
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, stream)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			t.Cleanup(func() { cfg = testConfig() })
+			cfg.requestLogDir = t.TempDir()
+			rec := httptest.NewRecorder()
+			path := "/v1/projects/p/locations/global/publishers/google/models/gemini-test:streamGenerateContent?alt=sse"
+			handle(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
+			if rec.Code != http.StatusOK || rec.Body.String() != stream {
+				t.Fatalf("numeric Vertex stop changed delivery: status=%d body=%q", rec.Code, rec.Body.String())
+			}
+			files := archiveFiles(t, cfg.requestLogDir)
+			if len(files) != 1 {
+				t.Fatalf("want one request archive, got %d", len(files))
+			}
+			archive, _ := readArchive(t, files[0])
+			if len(archive.Attempts) != 1 || archive.Attempts[0].Stats == nil || archive.Attempts[0].Stats.StopReason != tc.stop {
+				t.Fatalf("numeric stop was assigned the wrong service's name: %+v", archive.Attempts)
+			}
+		})
+	}
+}
+
 func TestGeminiInvalidArgumentDoesNotRetry(t *testing.T) {
 	for _, path := range []string{
 		geminiStreamPath,
@@ -288,12 +385,16 @@ func TestGeminiTruncatedUnaryErrorHonorsRetryHints(t *testing.T) {
 
 func TestGeminiRetryInfoPreventsPrematureLocalRetry(t *testing.T) {
 	for _, sse := range []bool{false, true} {
-		for _, delay := range []string{"23", "315576000000"} {
-			t.Run(strconv.FormatBool(sse)+"/"+delay, func(t *testing.T) {
+		for _, tc := range []struct{ field, delay string }{
+			{"retryDelay", "23"}, {"retry_delay", "23"},
+			{"retryDelay", "315576000000"}, {"retry_delay", "315576000000"},
+		} {
+			delay := tc.delay
+			t.Run(strconv.FormatBool(sse)+"/"+tc.field+"/"+delay, func(t *testing.T) {
 				var calls atomic.Int32
 				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					calls.Add(1)
-					body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"` + delay + `s"}]}}`
+					body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","` + tc.field + `":"` + delay + `s"}]}}`
 					if sse {
 						w.Header().Set("Content-Type", "text/event-stream")
 						io.WriteString(w, "data: "+body+"\n\n")

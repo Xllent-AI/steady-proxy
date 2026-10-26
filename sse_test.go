@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -970,9 +972,9 @@ func TestMaxTokensTruncatedToolInputKeepsRawFragmentsWhenNormalizationOff(t *tes
 	}
 }
 
-// Only a max_tokens stop excuses invalid tool input, and only when it is the very
-// next thing after the block closes.
-func TestInvalidToolInputRejectedUnlessMaxTokens(t *testing.T) {
+// Only provider-declared token/context limits excuse invalid tool input, and
+// only when that stop follows the block (apart from intervening pings).
+func TestInvalidToolInputRejectedUnlessTruncatedByLimit(t *testing.T) {
 	textBlockStart := sseJSON("content_block_start", map[string]any{
 		"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "text", "text": ""},
 	})
@@ -983,6 +985,8 @@ func TestInvalidToolInputRejectedUnlessMaxTokens(t *testing.T) {
 		{"tool_use stop", []string{messageDeltaFrame("tool_use"), messageStopFrame}},
 		{"end_turn stop", []string{messageDeltaFrame("end_turn"), messageStopFrame}},
 		{"stop_sequence stop", []string{messageDeltaFrame("stop_sequence"), messageStopFrame}},
+		{"refusal stop", []string{messageDeltaFrame("refusal"), messageStopFrame}},
+		{"pause_turn stop", []string{messageDeltaFrame("pause_turn"), messageStopFrame}},
 		{"empty stop_reason", []string{messageDeltaFrame(""), messageStopFrame}},
 		{"no stop_reason", []string{"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":7}}\n\n", messageStopFrame}},
 		{"no message_delta", []string{messageStopFrame}},
@@ -1476,25 +1480,21 @@ func TestToolInputRetentionBudget(t *testing.T) {
 			t.Fatalf("sequential tool inputs were not delivered completely: %q", output.String())
 		}
 	})
-	t.Run("normalization-disabled", func(t *testing.T) {
+	t.Run("normalization-disabled-still-bounds-validation", func(t *testing.T) {
 		useDefaultConfig(t)
 		cfg.maxResponseBytes = 512
 		cfg.normalizeToolJSON = false
 		largeInput := `{"value":"` + strings.Repeat("x", 8192) + `"}`
 		stream := toolStreamThenTail("tool_use", splitEvery(largeInput, 128), messageDeltaFrame("tool_use"), messageStopFrame)
-		var output strings.Builder
-		steps := feedLive(newAnthropicWire(false), stream)
-		for _, step := range steps {
+		for _, step := range feedLive(newAnthropicWire(false), stream) {
 			if step.fail != nil {
-				t.Fatalf("unbuffered tool fragments must not consume the retention budget: %+v", step.fail)
-			}
-			for _, raw := range step.out {
-				output.Write(raw)
+				if step.fail.code != "response_too_large" || step.fail.transient {
+					t.Fatalf("want bounded validation failure, got %+v", step.fail)
+				}
+				return
 			}
 		}
-		if !steps[len(steps)-1].done || strings.Join(inputJSONDeltas(t, output.String()), "") != largeInput {
-			t.Fatal("unbuffered tool fragments were not delivered completely")
-		}
+		t.Fatal("normalization off must not disable tool input validation's retention bound")
 	})
 	for _, tc := range []struct {
 		name     string
@@ -1524,5 +1524,366 @@ func TestToolInputRetentionBudget(t *testing.T) {
 				t.Fatalf("completed validation block did not release its budget: %+v", f)
 			}
 		})
+	}
+}
+
+// pacedSSEReader does not release another upstream chunk until the client has
+// observed the previous one. This makes cutover/progress tests independent of
+// scheduler sleeps and prevents a buffered completion from passing as live UX.
+type pacedSSEReader struct {
+	ctx     context.Context
+	chunks  []string
+	current *strings.Reader
+	next    int
+	ready   <-chan struct{}
+}
+
+func (r *pacedSSEReader) Read(p []byte) (int, error) {
+	if r.current == nil || r.current.Len() == 0 {
+		if r.next == len(r.chunks) {
+			return 0, io.EOF
+		}
+		if r.next > 0 {
+			select {
+			case <-r.ready:
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			}
+		}
+		r.current = strings.NewReader(r.chunks[r.next])
+		r.next++
+	}
+	return r.current.Read(p)
+}
+
+type progressRecorder struct {
+	*httptest.ResponseRecorder
+	ready        chan struct{}
+	progressOnly bool
+	parser       sseParser
+}
+
+func (w *progressRecorder) signal() {
+	select {
+	case w.ready <- struct{}{}:
+	default:
+	}
+}
+
+func (w *progressRecorder) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	if w.progressOnly {
+		for _, ev := range w.parser.feed(p[:n]) {
+			if ev.name == "content_block_delta" {
+				w.signal()
+			}
+		}
+	}
+	return n, err
+}
+
+func (w *progressRecorder) Flush() {
+	w.ResponseRecorder.Flush()
+	if !w.progressOnly {
+		w.signal()
+	}
+}
+
+func capturePacedSSE(t *testing.T, chunks []string, workflow bool, st *captureStats) (*httptest.ResponseRecorder, bool, *failure) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	w := &progressRecorder{ResponseRecorder: httptest.NewRecorder(), ready: make(chan struct{}, 1), progressOnly: workflow}
+	r := &pacedSSEReader{ctx: ctx, chunks: chunks, ready: w.ready}
+	window, deadline := time.Duration(0), time.Time{}
+	if workflow {
+		window, deadline = time.Hour, time.Now().Add(-time.Second)
+	}
+	wrote, f := captureSSECore(ctx, cancel, w, http.Header{}, r, st, window, workflow, !workflow, newAnthropicWire(false), deadline)
+	return w.ResponseRecorder, wrote, f
+}
+
+func TestProviderLimitTruncationBufferedAndLive(t *testing.T) {
+	for _, reason := range []string{"max_tokens", "model_context_window_exceeded"} {
+		for _, blockType := range []string{"tool_use", "server_tool_use"} {
+			for _, normalize := range []bool{false, true} {
+				for _, mode := range []string{"buffered", "main-live", "workflow-live"} {
+					for _, split := range []string{"partial-input", "closed-block"} {
+						name := reason + "/" + blockType + "/" + mode + "/" + split
+						if normalize {
+							name += "/normalized"
+						}
+						t.Run(name, func(t *testing.T) {
+							useDefaultConfig(t)
+							cfg.normalizeToolJSON = normalize
+							parts := inputJSONStreamParts(inputJSONStreamSpec{blockType: blockType, toolID: "toolu_1", name: "Tool", chunks: truncatedToolChunks, split: 1})
+							parts[1] = strings.Replace(parts[1], `"stop_reason":"tool_use"`, `"stop_reason":"`+reason+`"`, 1)
+							if split == "closed-block" {
+								parts = []string{toolHead(blockType, truncatedToolChunks) + contentBlockStopFrame(0), pingFrame + messageDeltaFrame(reason) + messageStopFrame}
+							}
+							var rec *httptest.ResponseRecorder
+							var f *failure
+							if mode == "buffered" {
+								rec, f = capture(t, strings.Join(parts, ""))
+							} else {
+								var wrote bool
+								rec, wrote, f = capturePacedSSE(t, parts, mode == "workflow-live", nil)
+								if !wrote || rec.Header().Get("X-Steady-Proxy-Mode") != "live" {
+									t.Fatalf("expected live cutover: wrote=%v mode=%q failure=%+v", wrote, rec.Header().Get("X-Steady-Proxy-Mode"), f)
+								}
+							}
+							if f != nil {
+								t.Fatalf("provider limit must be delivered: %+v", f)
+							}
+							deltas := inputJSONDeltas(t, rec.Body.String())
+							wantCount := len(truncatedToolChunks)
+							if normalize && mode != "workflow-live" {
+								wantCount = 1
+							}
+							if len(deltas) != wantCount || strings.Join(deltas, "") != strings.Join(truncatedToolChunks, "") {
+								t.Fatalf("tool input lost or replayed twice: %#v", deltas)
+							}
+							if !strings.Contains(rec.Body.String(), `"stop_reason":"`+reason+`"`) || strings.Count(rec.Body.String(), "event: message_stop") != 1 {
+								t.Fatalf("provider stop lost or duplicated: %s", rec.Body.String())
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestJSONValidationIndependentOfNormalization(t *testing.T) {
+	badText := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\n\n"
+	for _, mode := range []string{"buffered", "main-live", "workflow-live"} {
+		for _, normalize := range []bool{false, true} {
+			for _, validate := range []bool{false, true} {
+				name := mode
+				if normalize {
+					name += "/normalize"
+				}
+				if validate {
+					name += "/validate"
+				}
+				t.Run(name, func(t *testing.T) {
+					useDefaultConfig(t)
+					cfg.normalizeToolJSON, cfg.validateJSON = normalize, validate
+					tail := badText + contentBlockStopFrame(0) + messageDeltaFrame("end_turn") + messageStopFrame
+					var rec *httptest.ResponseRecorder
+					var f *failure
+					if mode == "buffered" {
+						rec, f = capture(t, textHead()+tail)
+					} else {
+						rec, _, f = capturePacedSSE(t, []string{textHead(), tail}, mode == "workflow-live", nil)
+					}
+					if !validate {
+						if f != nil || !strings.Contains(rec.Body.String(), badText) || !strings.Contains(rec.Body.String(), messageStopFrame) {
+							t.Fatalf("validation disabled must preserve raw events: failure=%+v body=%s", f, rec.Body.String())
+						}
+						return
+					}
+					if f == nil || f.code != "malformed_sse" || f.message != "invalid JSON in stream event" || f.delivered {
+						t.Fatalf("want syntax-class failure, got %+v", f)
+					}
+					if strings.Contains(rec.Body.String(), badText) || strings.Contains(rec.Body.String(), messageStopFrame) {
+						t.Fatalf("invalid event or successful terminal leaked: %s", rec.Body.String())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestLiveFailureMessagesDistinguishShapeSyntaxAndToolInput(t *testing.T) {
+	for _, normalize := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, tail, message string
+		}{
+			{"shape", "event: content_block_delta\n\n", "stream event missing JSON data"},
+			{"syntax", "event: content_block_delta\ndata: not JSON\n\n", "invalid JSON in stream event"},
+			{"typed payload", "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":3}\n\n", "invalid JSON in stream event"},
+			{"tool input", contentBlockStopFrame(0) + messageDeltaFrame("end_turn"), invalidToolInputMessage},
+			{"unclosed tool input", messageDeltaFrame("tool_use") + messageStopFrame, invalidToolInputMessage},
+			{"unclosed tool with untyped stop", "event: message_stop\ndata: {}\n\n", invalidToolInputMessage},
+			{"unclosed tool during truncation",
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"input\":{}}}\n\n" +
+					"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n" +
+					contentBlockStopFrame(1) + "event: message_stop\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n", invalidToolInputMessage},
+		} {
+			t.Run(tc.name+map[bool]string{false: "/raw", true: "/normalized"}[normalize], func(t *testing.T) {
+				useDefaultConfig(t)
+				cfg.normalizeToolJSON = normalize
+				rec, wrote, f := capturePacedSSE(t, []string{toolHead("tool_use", truncatedToolChunks), tc.tail}, false, nil)
+				if !wrote || f == nil || f.message != tc.message || f.code != "malformed_sse" || f.delivered {
+					t.Fatalf("failure class mismatch: wrote=%v failure=%+v", wrote, f)
+				}
+				if strings.Contains(rec.Body.String(), "event: message_stop") {
+					t.Fatal("malformed tool input forwarded a successful terminal")
+				}
+			})
+		}
+	}
+}
+
+func TestSSEStandardFramingCaptureAndReplay(t *testing.T) {
+	for _, ending := range []string{"\n", "\r", "\r\n"} {
+		for _, bom := range []string{"", "\xef\xbb\xbf"} {
+			for _, spilled := range []bool{false, true} {
+				name := strings.NewReplacer("\r", "CR", "\n", "LF").Replace(ending)
+				if bom != "" {
+					name += "/BOM"
+				}
+				if spilled {
+					name += "/disk"
+				}
+				t.Run(name, func(t *testing.T) {
+					useDefaultConfig(t)
+					if spilled {
+						cfg.maxBufferMem = 1
+					}
+					stream := bom + strings.ReplaceAll(goodStream, "\n", ending)
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					rec := httptest.NewRecorder()
+					if wrote, f := captureSSE(ctx, cancel, rec, http.Header{}, iotest1byte(stream), nil); !wrote || f != nil {
+						t.Fatalf("legal one-byte framing rejected: wrote=%v failure=%+v", wrote, f)
+					}
+					if rec.Body.String() != stream {
+						t.Fatalf("capture/replay changed raw framing:\n got %q\nwant %q", rec.Body.String(), stream)
+					}
+					var replay bytes.Buffer
+					if err := replayBuffered(iotest1byte(stream), &replay, nil); err != nil || replay.String() != stream {
+						t.Fatalf("one-byte replay changed raw framing: error=%v body=%q", err, replay.String())
+					}
+					live := httptest.NewRecorder()
+					wrote, f := captureSSECore(ctx, cancel, live, http.Header{}, iotest1byte(stream), nil, 0, false, true, newAnthropicWire(false), time.Time{})
+					if !wrote || f != nil || live.Header().Get("X-Steady-Proxy-Mode") != "live" || live.Body.String() != stream {
+						t.Fatalf("live prefix/remainder changed framing: wrote=%v failure=%+v body=%q", wrote, f, live.Body.String())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestSSEFramingSplitBoundariesAndLimits(t *testing.T) {
+	for _, ending := range []string{"\n", "\r", "\r\n"} {
+		frame := "\xef\xbb\xbfevent: ping" + ending + "data: {}" + ending + ending
+		for split := 0; split <= len(frame); split++ {
+			parser := &sseParser{maxEventBytes: int64(len(frame))}
+			events := parser.feed([]byte(frame[:split]))
+			events = append(events, parser.feedChunk([]byte(frame[split:]), true)...)
+			if parser.err != nil || len(events) != 1 || events[0].name != "ping" || events[0].data != "{}" || string(events[0].raw) != frame {
+				t.Fatalf("split=%d ending=%q: events=%+v error=%v", split, ending, events, parser.err)
+			}
+			parser = &sseParser{maxEventBytes: int64(len(frame) - 1)}
+			events = parser.feed([]byte(frame[:split]))
+			events = append(events, parser.feedChunk([]byte(frame[split:]), true)...)
+			if !errors.Is(parser.err, errTooLarge) || len(events) != 0 {
+				t.Fatalf("BOM/delimiter bytes bypassed limit: split=%d ending=%q events=%+v error=%v", split, ending, events, parser.err)
+			}
+		}
+	}
+	parser := &sseParser{}
+	stream := "\xef\xbb\xbfevent: ping\rdata:\rdata: {}\r\revent: ping\n\xef\xbb\xbfdata: ignored\ndata: {}\n\n"
+	events := parser.feedChunk([]byte(stream), true)
+	if len(events) != 2 || events[0].data != "\n{}" || events[1].data != "{}" {
+		t.Fatalf("only initial BOM is ignored; empty data lines must survive: %+v", events)
+	}
+}
+
+type readFaultReader struct {
+	data string
+	err  error
+}
+
+func (r *readFaultReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+func TestSSEReadFaultArchiveEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, stream string
+		err          error
+		wantFailure  bool
+	}{
+		{"read fault", textHead(), errors.New("upstream socket reset: evidence marker"), true},
+		{"unexpected EOF", textHead(), io.ErrUnexpectedEOF, true},
+		{"clean EOF without terminal", textHead(), io.EOF, true},
+		{"terminal plus EOF", goodStream, io.EOF, false},
+		{"terminal plus fault", goodStream, errors.New("terminal read fault evidence"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useDefaultConfig(t)
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			rec := newReqRecorder(time.Now(), req, nil)
+			rec.beginAttempt(nil, "test", 0)
+			defer rec.cleanup()
+			st := captureStats{respTee: rec.respWriter()}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			_, f := captureSSE(ctx, cancel, httptest.NewRecorder(), http.Header{}, &readFaultReader{data: tc.stream, err: tc.err}, &st)
+			if (f != nil) != tc.wantFailure {
+				t.Fatalf("unexpected capture result: %+v", f)
+			}
+			rec.noteAttemptStats(&st)
+			rec.finishCurrentAttempt()
+			var encoded bytes.Buffer
+			if err := rec.writeArchive(&encoded); err != nil {
+				t.Fatal(err)
+			}
+			var archived requestArchive
+			if err := json.Unmarshal(encoded.Bytes(), &archived); err != nil {
+				t.Fatal(err)
+			}
+			if len(archived.Attempts) != 1 || archived.Attempts[0].Response == nil {
+				t.Fatalf("missing archived response: %s", encoded.String())
+			}
+			body := archived.Attempts[0].Response.Body
+			if string(body.Data) != tc.stream {
+				t.Fatalf("archive lost raw response evidence: %q", body.Data)
+			}
+			want := ""
+			if tc.err != io.EOF {
+				want = tc.err.Error()
+			}
+			if got := body.CaptureError; got != want {
+				t.Fatalf("capture_error=%q, want actual read cause %q", got, want)
+			}
+		})
+	}
+}
+
+func TestLiveMalformedToolInputIsNotExcusedByOtherStops(t *testing.T) {
+	for _, reason := range []string{"end_turn", "tool_use", "refusal", "pause_turn"} {
+		for _, normalize := range []bool{false, true} {
+			for _, workflow := range []bool{false, true} {
+				name := reason
+				if normalize {
+					name += "/normalize"
+				}
+				if workflow {
+					name += "/workflow"
+				}
+				t.Run(name, func(t *testing.T) {
+					useDefaultConfig(t)
+					cfg.normalizeToolJSON = normalize
+					tail := contentBlockStopFrame(0) + messageDeltaFrame(reason) + messageStopFrame
+					rec, wrote, f := capturePacedSSE(t, []string{toolHead("tool_use", truncatedToolChunks), tail}, workflow, nil)
+					if !wrote || f == nil || f.code != "malformed_sse" || f.message != invalidToolInputMessage || f.delivered {
+						t.Fatalf("ordinary malformed input must abort: wrote=%v failure=%+v", wrote, f)
+					}
+					if strings.Contains(rec.Body.String(), messageStopFrame) {
+						t.Fatalf("invalid input ended successfully: %s", rec.Body.String())
+					}
+				})
+			}
+		}
 	}
 }

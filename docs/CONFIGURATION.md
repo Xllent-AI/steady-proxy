@@ -79,8 +79,8 @@ See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#mode
 | --- | --- | --- |
 | `PROXY_RESPONSES_EARLY_COMMIT` | `1` | Commit and stream `/v1/responses` as soon as the first output event arrives. Set `0` for full buffering under `PROXY_RESPONSES_BUFFER_MS`. |
 | `PROXY_RESPONSES_REPLAY_DELTA_BYTES` | `65536` (64 KiB) | Max source JSON bytes when merging adjacent compatible `response.output_text.delta` events on replay. `0` replays raw frames. |
-| `PROXY_VALIDATE_JSON` | `1` | Validate Anthropic SSE event JSON and accumulated tool-input JSON. `0` disables Anthropic JSON validation and tool-JSON normalization (terminal/error detection on Responses, Gemini, and Anthropic refusals stays active). |
-| `PROXY_NORMALIZE_TOOL_JSON` | `1` | Coalesce fragmented Anthropic `input_json_delta` chunks on buffered replay and live output (requires `PROXY_VALIDATE_JSON=1`). `stop_reason: "max_tokens"` allows truncated input instead of rejecting it. |
+| `PROXY_VALIDATE_JSON` | `1` | Validate Anthropic SSE event JSON and accumulated tool-input JSON in buffered and live modes, independently of normalization. `0` disables Anthropic JSON validation and tool-JSON normalization (terminal/error detection on Responses, Gemini, and Anthropic refusals stays active). |
+| `PROXY_NORMALIZE_TOOL_JSON` | `1` | Coalesce fragmented Anthropic `input_json_delta` chunks on buffered replay and ordinary live output (requires `PROXY_VALIDATE_JSON=1`). Workflow live output preserves fragments for progress. `max_tokens` and `model_context_window_exceeded` allow provider-truncated tool input. |
 
 ## Storage and diagnostics
 

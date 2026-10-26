@@ -412,6 +412,7 @@ func (rec *reqRecorder) noteAttemptStats(st *captureStats) {
 	}
 	rec.cur.Stats = statsArchive(st)
 	rec.stats = st
+	rec.noteResponseReadError(st.readErr)
 }
 
 func (rec *reqRecorder) noteProxyRetries(n int) {

@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
-	"math"
 	"strconv"
 	"strings"
 )
@@ -43,11 +43,13 @@ type geminiRequestSettings struct {
 func geminiSettingsOf(body []byte) geminiRequestSettings {
 	settings := geminiRequestSettings{candidateCount: 1}
 	config := geminiRequestConfig{settings: &settings}
-	request := struct {
-		Config      geminiRequestConfig `json:"generationConfig"`
-		ProtoConfig geminiRequestConfig `json:"generation_config"`
-	}{config, config}
-	if json.Unmarshal(body, &request) != nil {
+	err := geminiObject(body, func(name string, value json.RawMessage) error {
+		if name == "generationConfig" || name == "generation_config" {
+			return config.UnmarshalJSON(value)
+		}
+		return nil
+	})
+	if err != nil {
 		return geminiRequestSettings{candidateCount: 1}
 	}
 	if settings.candidateCount < 1 {
@@ -62,27 +64,29 @@ type geminiRequestConfig struct{ settings *geminiRequestSettings }
 
 func (c geminiRequestConfig) UnmarshalJSON(data []byte) error {
 	*c.settings = geminiRequestSettings{candidateCount: 1}
-	count := geminiRequestCount{value: &c.settings.candidateCount}
-	thinking := geminiThinkingConfig{level: &c.settings.thinkingLevel}
-	fields := struct {
-		Count         geminiRequestCount   `json:"candidateCount"`
-		ProtoCount    geminiRequestCount   `json:"candidate_count"`
-		Thinking      geminiThinkingConfig `json:"thinkingConfig"`
-		ProtoThinking geminiThinkingConfig `json:"thinking_config"`
-	}{count, count, thinking, thinking}
-	return json.Unmarshal(data, &fields)
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		switch name {
+		case "candidateCount", "candidate_count":
+			count, err := geminiInt32(value)
+			c.settings.candidateCount = count
+			return err
+		case "thinkingConfig", "thinking_config":
+			return (geminiThinkingConfig{level: &c.settings.thinkingLevel}).UnmarshalJSON(value)
+		}
+		return nil
+	})
 }
 
 type geminiThinkingConfig struct{ level *string }
 
 func (c geminiThinkingConfig) UnmarshalJSON(data []byte) error {
 	*c.level = ""
-	level := geminiThinkingLevel{value: c.level}
-	fields := struct {
-		Level      geminiThinkingLevel `json:"thinkingLevel"`
-		ProtoLevel geminiThinkingLevel `json:"thinking_level"`
-	}{level, level}
-	return json.Unmarshal(data, &fields)
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		if name == "thinkingLevel" || name == "thinking_level" {
+			return (geminiThinkingLevel{value: c.level}).UnmarshalJSON(value)
+		}
+		return nil
+	})
 }
 
 type geminiThinkingLevel struct{ value *string }
@@ -101,27 +105,108 @@ func (l geminiThinkingLevel) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type geminiRequestCount struct{ value *int }
-
-func (c geminiRequestCount) UnmarshalJSON(data []byte) error {
-	*c.value = 0
-	text := string(data)
-	if text == "null" {
+// Walk only the semantic objects we interpret, in wire order. Alternate names
+// share a destination and replace it (including null), rather than merging
+// messages or choosing an alias according to Go struct field order.
+func geminiObject(data []byte, field func(string, json.RawMessage) error) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return nil
 	}
-	if len(data) > 0 && data[0] == '"' {
-		if err := json.Unmarshal(data, &text); err != nil {
+	d := json.NewDecoder(bytes.NewReader(data))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("Gemini field is not an object")
+	}
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return err
+		}
+		var value json.RawMessage
+		if err := d.Decode(&value); err != nil {
+			return err
+		}
+		if err := field(key.(string), value); err != nil {
 			return err
 		}
 	}
-	// ProtoJSON int32 fields accept quoted numbers, exponent notation, and
-	// zero fractional parts. int32's range is exactly representable in float64.
-	number, err := strconv.ParseFloat(text, 64)
-	if err != nil || math.IsNaN(number) || number < math.MinInt32 || number > math.MaxInt32 || number != math.Trunc(number) {
-		return errors.New("invalid Gemini candidate count")
+	if _, err := d.Token(); err != nil {
+		return err
 	}
-	*c.value = int(number)
+	if _, err := d.Token(); err != io.EOF {
+		return errors.New("trailing JSON in Gemini object")
+	}
 	return nil
+}
+
+// ProtoJSON int32 accepts null, quoted numbers, and integral decimal/exponent
+// forms. Work in decimal so tiny fractions and values just outside int32 do
+// not round to an accepted integer through float64.
+func geminiInt32(data []byte) (int, error) {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return 0, nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err != nil {
+		return 0, err
+	}
+	text := number.String()
+	negative := strings.HasPrefix(text, "-")
+	text = strings.TrimPrefix(text, "-")
+	mantissa, exponentText := text, "0"
+	if pos := strings.IndexAny(text, "eE"); pos >= 0 {
+		mantissa, exponentText = text[:pos], text[pos+1:]
+	}
+	first, last, digits, fraction := -1, -1, 0, 0
+	afterDot := false
+	for _, digit := range mantissa {
+		if digit == '.' {
+			afterDot = true
+			continue
+		}
+		if digit != '0' {
+			if first < 0 {
+				first = digits
+			}
+			last = digits
+		}
+		digits++
+		if afterDot {
+			fraction++
+		}
+	}
+	if first < 0 {
+		return 0, nil
+	}
+	exponent, err := strconv.ParseInt(exponentText, 10, 32)
+	if err != nil {
+		return 0, errors.New("invalid Gemini int32 exponent")
+	}
+	scale := exponent - int64(fraction) + int64(digits-last-1)
+	if scale < 0 || int64(last-first+1)+scale > 10 {
+		return 0, errors.New("non-integral or overflowing Gemini int32")
+	}
+	var value int64
+	position := 0
+	for _, digit := range mantissa {
+		if digit == '.' {
+			continue
+		}
+		if position >= first && position <= last {
+			value = value*10 + int64(digit-'0')
+		}
+		position++
+	}
+	for ; scale > 0; scale-- {
+		value *= 10
+	}
+	if negative {
+		value = -value
+	}
+	if value < -2147483648 || value > 2147483647 {
+		return 0, errors.New("overflowing Gemini int32")
+	}
+	return int(value), nil
 }
 
 // Logging is updated by accept's single decode, not by a second scrape decode.
@@ -172,43 +257,154 @@ func (g *geminiWire) keepalive() []byte { return []byte(": keepalive\n\n") }
 // tool arguments, thought signatures, and all unknown metadata stay opaque and
 // are always forwarded/replayed as the original SSE bytes.
 type geminiChunk struct {
-	Candidates     []*geminiCandidate `json:"candidates"`
-	PromptFeedback *struct {
-		BlockReason string `json:"blockReason"`
-	} `json:"promptFeedback"`
-	UsageMetadata *struct {
-		PromptTokenCount        int  `json:"promptTokenCount"`
-		CachedContentTokenCount int  `json:"cachedContentTokenCount"`
-		CandidatesTokenCount    *int `json:"candidatesTokenCount"`
-		ThoughtsTokenCount      *int `json:"thoughtsTokenCount"`
-	} `json:"usageMetadata"`
-	ModelVersion string          `json:"modelVersion"`
-	Error        json.RawMessage `json:"error"`
+	Candidates     []*geminiCandidate
+	PromptFeedback *geminiPromptFeedback
+	UsageMetadata  *geminiUsage
+	ModelVersion   string
+	Error          json.RawMessage
+}
+
+func (c *geminiChunk) UnmarshalJSON(data []byte) error {
+	*c = geminiChunk{}
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		switch name {
+		case "candidates":
+			c.Candidates = nil
+			return json.Unmarshal(value, &c.Candidates)
+		case "promptFeedback", "prompt_feedback":
+			c.PromptFeedback = nil
+			return json.Unmarshal(value, &c.PromptFeedback)
+		case "usageMetadata", "usage_metadata":
+			c.UsageMetadata = nil
+			return json.Unmarshal(value, &c.UsageMetadata)
+		case "modelVersion", "model_version":
+			c.ModelVersion = ""
+			return json.Unmarshal(value, &c.ModelVersion)
+		case "error":
+			c.Error = value
+		}
+		return nil
+	})
 }
 
 type geminiCandidate struct {
-	Index        geminiCandidateIndex `json:"index"`
-	FinishReason string               `json:"finishReason"`
-	Content      *struct {
-		Parts []geminiPart `json:"parts"`
-	} `json:"content"`
+	Index        int
+	FinishReason string
+	Content      *geminiContent
 }
 
-// Proto JSON may omit the default index 0. An explicit null, non-integer, or
-// overflowing index is malformed, not another spelling of that default.
-type geminiCandidateIndex int
-
-func (i *geminiCandidateIndex) UnmarshalJSON(data []byte) error {
-	n, err := strconv.Atoi(string(data))
-	if err != nil {
+func (c *geminiCandidate) UnmarshalJSON(data []byte) error {
+	*c = geminiCandidate{}
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		var err error
+		switch name {
+		case "index":
+			c.Index, err = geminiInt32(value)
+		case "finishReason", "finish_reason":
+			c.FinishReason, err = geminiEnum(value, geminiFinishReasons[:])
+		case "content":
+			c.Content = nil
+			err = json.Unmarshal(value, &c.Content)
+		}
 		return err
-	}
-	*i = geminiCandidateIndex(n)
-	return nil
+	})
 }
 
-// Validate a part's object shape without materializing/copying its text, inline
-// media, function arguments, or opaque thought signature. encoding/json already
+type geminiContent struct{ Parts []geminiPart }
+
+func (c *geminiContent) UnmarshalJSON(data []byte) error {
+	c.Parts = nil
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		if name == "parts" {
+			c.Parts = nil
+			return json.Unmarshal(value, &c.Parts)
+		}
+		return nil
+	})
+}
+
+type geminiPromptFeedback struct{ BlockReason string }
+
+func (p *geminiPromptFeedback) UnmarshalJSON(data []byte) error {
+	p.BlockReason = ""
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		if name == "blockReason" || name == "block_reason" {
+			var err error
+			p.BlockReason, err = geminiEnum(value, geminiBlockReasons[:])
+			return err
+		}
+		return nil
+	})
+}
+
+// Developer API and Vertex share only these numeric enum names. Keep other
+// numbers as numbers rather than assign a service-specific name incorrectly.
+var geminiFinishReasons = [...]string{
+	"FINISH_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "RECITATION",
+	"OTHER",
+}
+
+var geminiBlockReasons = [...]string{
+	"BLOCK_REASON_UNSPECIFIED", "SAFETY", "OTHER", "BLOCKLIST",
+	"PROHIBITED_CONTENT",
+}
+
+func geminiEnum(data []byte, names []string) (string, error) {
+	if len(data) > 0 && data[0] == '"' {
+		var name string
+		err := json.Unmarshal(data, &name)
+		return name, err
+	}
+	n, err := geminiInt32(data)
+	if err != nil {
+		return "", err
+	}
+	if n >= 0 && n < len(names) {
+		return names[n], nil
+	}
+	return strconv.Itoa(n), nil
+}
+
+type geminiUsage struct {
+	PromptTokenCount        int
+	CachedContentTokenCount int
+	CandidatesTokenCount    *int
+	ThoughtsTokenCount      *int
+}
+
+func (u *geminiUsage) UnmarshalJSON(data []byte) error {
+	*u = geminiUsage{}
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		switch name {
+		case "promptTokenCount", "prompt_token_count", "cachedContentTokenCount", "cached_content_token_count",
+			"candidatesTokenCount", "candidates_token_count", "thoughtsTokenCount", "thoughts_token_count":
+			n, err := geminiInt32(value)
+			if err != nil {
+				return err
+			}
+			switch name {
+			case "promptTokenCount", "prompt_token_count":
+				u.PromptTokenCount = n
+			case "cachedContentTokenCount", "cached_content_token_count":
+				u.CachedContentTokenCount = n
+			default:
+				var count *int
+				if !bytes.Equal(value, []byte("null")) {
+					count = &n
+				}
+				if name == "candidatesTokenCount" || name == "candidates_token_count" {
+					u.CandidatesTokenCount = count
+				} else {
+					u.ThoughtsTokenCount = count
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// Validate only a part's object shape. Its text, media, function arguments and
+// thought signatures are not interpreted or rewritten. encoding/json already
 // validates the complete JSON syntax before invoking this hook.
 type geminiPart struct{}
 
@@ -251,7 +447,7 @@ func (g *geminiWire) accept(ev event, st *captureStats) *failure {
 		if candidate == nil {
 			return malformedSSE("Gemini stream candidate is not an object")
 		}
-		index := int(candidate.Index)
+		index := candidate.Index
 		if index < 0 || index >= g.candidateCount {
 			return malformedSSE("Gemini stream candidate index is outside the requested range")
 		}
@@ -261,6 +457,9 @@ func (g *geminiWire) accept(ev event, st *captureStats) *failure {
 		}
 		state.chunk = g.chunk
 		if candidate.Content != nil && len(candidate.Content.Parts) > 0 {
+			if state.finished {
+				return malformedSSE("Gemini stream candidate content follows its finish reason")
+			}
 			g.sawContent = true
 		}
 		if reason := candidate.FinishReason; reason != "" && reason != "FINISH_REASON_UNSPECIFIED" {

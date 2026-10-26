@@ -86,7 +86,7 @@ PROXY_REQUEST_LOG_DIR=./logs
 
 The proxy writes one JSON archive per client request (e.g., `v1-messages-20260621t143005-a1b2c3d4.json`, matching `id=a1b2c3d4` in the access log). Local retries and model fallback attempts are recorded inside the same file's `attempts` array.
 
-Archives use schema `steady-proxy.payload.v2` and include the client request envelope, redacted upstream URL, build metadata, per-attempt headers/bodies, retry delays, stream stats, and final outcome. Payloads are stored lossless in `data_base64` with `encoding`, `size`, and `sha256` metadata (unchanged retry bodies reference `request_body_ref`). Interrupted reads record `capture_error`.
+Archives use schema `steady-proxy.payload.v2` and include the client request envelope, redacted upstream URL, build metadata, per-attempt headers/bodies, retry delays, stream stats, and final outcome. Payloads are stored lossless in `data_base64` with `encoding`, `size`, and `sha256` metadata (unchanged retry bodies reference `request_body_ref`). Actual interrupted reads, including SSE reads that return both data and an error, record `capture_error`; clean EOF does not. Event-syntax failures and invalid accumulated tool input have distinct diagnostic messages.
 
 Archiving is best-effort and never fails a proxied call; set `PROXY_VERBOSE=1` to see `[request-log]` write errors.
 

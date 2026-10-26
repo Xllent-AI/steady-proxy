@@ -11,14 +11,59 @@ import (
 // GenerateContent uses the Google error envelope, not the Interactions API's
 // string-valued error.code: code is an HTTP status and status is a canonical name.
 type geminiAPIError struct {
-	Code    int    `json:"code"`
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Details []struct {
-		Type       string          `json:"@type"`
-		RetryDelay json.RawMessage `json:"retryDelay"`
-		Violations json.RawMessage `json:"violations"`
-	} `json:"details,omitempty"`
+	Code         int                 `json:"code"`
+	Status       string              `json:"status"`
+	Message      string              `json:"message"`
+	Details      []geminiErrorDetail `json:"details,omitempty"`
+	fallbackType string              // gateway-only diagnostic; never serialized as a Google field
+}
+
+func (e *geminiAPIError) UnmarshalJSON(data []byte) error {
+	*e = geminiAPIError{}
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		switch name {
+		case "code":
+			var err error
+			e.Code, err = geminiInt32(value)
+			return err
+		case "status":
+			e.Status = ""
+			return json.Unmarshal(value, &e.Status)
+		case "message":
+			e.Message = ""
+			return json.Unmarshal(value, &e.Message)
+		case "type":
+			// Gateway metadata must not invalidate an otherwise native status.
+			e.fallbackType = ""
+			_ = json.Unmarshal(value, &e.fallbackType)
+		case "details":
+			e.Details = nil
+			return json.Unmarshal(value, &e.Details)
+		}
+		return nil
+	})
+}
+
+type geminiErrorDetail struct {
+	Type       string          `json:"@type"`
+	RetryDelay json.RawMessage `json:"retryDelay"`
+	Violations json.RawMessage `json:"violations"`
+}
+
+func (d *geminiErrorDetail) UnmarshalJSON(data []byte) error {
+	*d = geminiErrorDetail{}
+	return geminiObject(data, func(name string, value json.RawMessage) error {
+		switch name {
+		case "@type":
+			d.Type = ""
+			return json.Unmarshal(value, &d.Type)
+		case "retryDelay", "retry_delay":
+			d.RetryDelay = value
+		case "violations":
+			d.Violations = value
+		}
+		return nil
+	})
 }
 
 func classifyGeminiHTTPErrorBytes(resp *http.Response, b []byte) failure {
@@ -44,13 +89,11 @@ func classifyGeminiHTTPErrorBytes(resp *http.Response, b []byte) failure {
 
 func classifyGeminiErrorBytes(resp *http.Response, b []byte, e geminiAPIError) failure {
 	nativeStatus := strings.ToUpper(strings.TrimSpace(e.Status))
-	f := classifyHTTPErrorBytesShaped(resp, b, func(atype, code, msg, _ string) errorVerdict {
+	f := classifyHTTPErrorBytesShaped(resp, b, func(_, _, _, _ string) errorVerdict {
 		if nativeStatus == "" {
-			// Decodes as {"error":{...}} but carries no Google identity (e.g. a
-			// gateway's own {"error":{"type":"overloaded_error"}}): judge it the
-			// way every other route does. Request-shape phrases are matched in
-			// the message only, never in details metadata.
-			return anthropicErrorVerdict(atype, code, msg, strings.ToLower(e.Message))
+			// Use only the selected error object's diagnostics. The shared decoder
+			// may have merged fields from an earlier duplicate error object.
+			return anthropicErrorVerdict(e.fallbackType, "", e.Message, "")
 		}
 		return geminiErrorVerdict(nativeStatus, e)
 	})
@@ -115,14 +158,20 @@ func geminiDailyQuotaExhausted(e geminiAPIError) bool {
 		if detail.Type != "type.googleapis.com/google.rpc.QuotaFailure" {
 			continue
 		}
-		var violations []struct {
-			QuotaID string `json:"quotaId"`
-		}
+		var violations []json.RawMessage
 		if json.Unmarshal(detail.Violations, &violations) != nil {
 			continue
 		}
-		for _, v := range violations {
-			if strings.Contains(v.QuotaID, "PerDay") {
+		for _, value := range violations {
+			var quotaID string
+			err := geminiObject(value, func(name string, value json.RawMessage) error {
+				if name == "quotaId" || name == "quota_id" {
+					quotaID = ""
+					return json.Unmarshal(value, &quotaID)
+				}
+				return nil
+			})
+			if err == nil && strings.Contains(quotaID, "PerDay") {
 				return true
 			}
 		}
