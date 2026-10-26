@@ -173,83 +173,74 @@ func TestWindowCommitGatedOnProgress(t *testing.T) {
 	}
 }
 
-// TestWindowGateIgnoresWithheldToolDelta verifies the gate does not treat a tool
-// input_json_delta as forwarded progress. With normalization on (default), those
-// fragments are coalesced until content_block_stop, so committing on one would
-// deliver only start events + keepalive comments — no progress for the watchdog —
-// while dropping the clean retry path. So a gated stream whose only delta so far
-// is a withheld tool fragment must stay uncommitted and convert an error cleanly.
-func TestWindowGateIgnoresWithheldToolDelta(t *testing.T) {
-	useDefaultConfig(t) // tool-JSON normalization is on by default
-	cfg.upstreamByteIdle = 3 * time.Second
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	rec := httptest.NewRecorder()
-	// The 20ms window elapses while only a tool block's start + input_json_delta
-	// (withheld by the normalizer) are buffered; then an overloaded error.
-	r := &gapReader{ctx: ctx, chunks: []string{
-		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\"}}\n\n",
-		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n",
-		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
-	}, gap: 30 * time.Millisecond}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
-
-	if wrote {
-		t.Fatalf("withheld tool delta must not trip the gate (stay cleanly retryable), but committed; body=%q", rec.Body.String())
-	}
-	if f == nil || !f.transient || f.code != "sse_overloaded" {
-		t.Fatalf("want transient sse_overloaded pre-commit retry, got %+v", f)
-	}
-	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "" {
-		t.Fatalf("no bytes should be committed, but mode=%q", mode)
-	}
-}
-
-// TestWindowGateOpensOnToolBlockStop verifies the gate DOES open when a
-// tool/server-tool block's withheld input becomes forwardable: the normalizer
-// emits the coalesced content_block_delta at content_block_stop, so that stop is
-// real progress. A gated stream that completes a tool block after the window must
-// therefore commit live (feeding the watchdog) rather than stay buffered.
-func TestWindowGateOpensOnToolBlockStop(t *testing.T) {
-	useDefaultConfig(t) // tool-JSON normalization is on by default
-	cfg.upstreamByteIdle = 5 * time.Second
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	rec := httptest.NewRecorder()
-	// window=20ms; the tool block (start + complete input_json_delta) closes after
-	// grace, and message_stop arrives in a later chunk so the live commit at the
-	// tool stop is observable before terminal.
-	r := &gapReader{ctx: ctx, chunks: []string{
-		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\"}}\n\n",
-		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"hi\\\"}\"}}\n\n",
-		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
-			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-	}, gap: 40 * time.Millisecond}
-	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, r, nil, 20*time.Millisecond, true, false)
-
-	if f != nil {
-		t.Fatalf("expected success, got failure %+v", *f)
-	}
-	if !wrote {
-		t.Fatalf("expected a committed write")
+// After cutover a Workflow receives actual tool fragments, even if a later
+// upstream error aborts the committed attempt. The prefix must not be replayed.
+func TestWindowGateForwardsToolFragmentsBeforeFailure(t *testing.T) {
+	useDefaultConfig(t)
+	prefix := toolHead("tool_use", []string{`{"a":`})
+	errFrame := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+	rec, wrote, f := capturePacedSSE(t, []string{prefix, errFrame}, true, nil)
+	if !wrote || f == nil || !f.transient || f.code != "sse_overloaded" || f.delivered {
+		t.Fatalf("want committed upstream-error abort: wrote=%v failure=%+v", wrote, f)
 	}
 	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
-		t.Fatalf("a completed tool block after grace should commit live, got %q", mode)
+		t.Fatalf("tool delta must open the Workflow gate, mode=%q", mode)
 	}
-	if body := rec.Body.String(); !strings.Contains(body, "message_stop") {
-		t.Fatalf("streamed body missing message_stop: %q", body)
+	deltas := inputJSONDeltas(t, rec.Body.String())
+	if len(deltas) != 1 || deltas[0] != `{"a":` || strings.Count(rec.Body.String(), "event: message_start") != 1 {
+		t.Fatalf("partial prefix lost or replayed: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "overloaded_error") {
+		t.Fatalf("transient upstream error leaked after commit: %s", rec.Body.String())
 	}
 }
 
-// TestWindowGateTruncatedToolBlockDeliveredLive covers a max_tokens-truncated tool
-// input behind the gate: the block stop still counts as progress (the gate opens
-// and the stream commits live), but the invalid input's frames are held until the
-// next event proves max_tokens cut it. They must then reach the client in order.
+// Every next upstream fragment waits for a real downstream delta. Keepalive
+// comments alone cannot satisfy this test or a Workflow's progress watchdog.
+func TestWindowGateStreamsToolFragmentsBeforeBlockStop(t *testing.T) {
+	for _, blockType := range []string{"tool_use", "server_tool_use"} {
+		t.Run(blockType, func(t *testing.T) {
+			useDefaultConfig(t)
+			fragments := []string{`{"q":`, `"hello`, ` world"}`}
+			chunks := []string{toolHead(blockType, fragments[:1])}
+			for _, fragment := range fragments[1:] {
+				var b strings.Builder
+				writeInputJSONDelta(&b, fragment)
+				chunks = append(chunks, b.String())
+			}
+			chunks = append(chunks, contentBlockStopFrame(0)+messageDeltaFrame("tool_use")+messageStopFrame)
+			rec, wrote, f := capturePacedSSE(t, chunks, true, nil)
+			if !wrote || f != nil || rec.Header().Get("X-Steady-Proxy-Mode") != "live" {
+				t.Fatalf("tool-only Workflow stalled: wrote=%v failure=%+v body=%s", wrote, f, rec.Body.String())
+			}
+			deltas := inputJSONDeltas(t, rec.Body.String())
+			if len(deltas) != len(fragments) || strings.Join(deltas, "") != strings.Join(fragments, "") {
+				t.Fatalf("partial-prefix handoff lost or duplicated tool input: %#v", deltas)
+			}
+			if strings.Count(rec.Body.String(), "event: message_stop") != 1 {
+				t.Fatalf("terminal lost or replayed: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestWorkflowCompletedBufferStillNormalizesToolInput(t *testing.T) {
+	useDefaultConfig(t)
+	fragments := []string{`{"q":`, `"hello`, ` world"}`}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := httptest.NewRecorder()
+	wrote, f := captureSSEWindow(ctx, cancel, rec, http.Header{}, strings.NewReader(toolUseStream(fragments)), nil, 0, true, false)
+	if !wrote || f != nil || rec.Header().Get("X-Steady-Proxy-Mode") != "buffered" {
+		t.Fatalf("complete Workflow must stay transactional: wrote=%v failure=%+v", wrote, f)
+	}
+	if deltas := inputJSONDeltas(t, rec.Body.String()); len(deltas) != 1 || deltas[0] != strings.Join(fragments, "") {
+		t.Fatalf("complete Workflow replay must coalesce input: %#v", deltas)
+	}
+}
+
+// A provider-declared truncation still reaches a Workflow in order. Tool
+// fragments are progress before the block closes; the stop must not abort them.
 func TestWindowGateTruncatedToolBlockDeliveredLive(t *testing.T) {
 	useDefaultConfig(t)
 	cfg.upstreamByteIdle = 5 * time.Second
@@ -271,7 +262,7 @@ func TestWindowGateTruncatedToolBlockDeliveredLive(t *testing.T) {
 		t.Fatalf("a max_tokens-truncated tool input must be delivered, wrote=%v failure=%+v", wrote, f)
 	}
 	if mode := rec.Header().Get("X-Steady-Proxy-Mode"); mode != "live" {
-		t.Fatalf("the completed tool block after grace should commit live, got %q", mode)
+		t.Fatalf("tool progress after grace should commit live, got %q", mode)
 	}
 	body := rec.Body.String()
 	if deltas := inputJSONDeltas(t, body); len(deltas) != 1 || deltas[0] != `{"q":"cut o` {

@@ -75,7 +75,7 @@ func replayResponsesForTest(t *testing.T, input string, limit int) string {
 }
 
 func parsedResponsesEvents(s string) []event {
-	return (&sseParser{}).feed([]byte(s))
+	return (&sseParser{}).feedChunk([]byte(s), true)
 }
 
 type replayWriteAwareReader struct {
@@ -1726,5 +1726,190 @@ func TestE2EResponsesLiveIncompleteDelivered(t *testing.T) {
 	}
 	if strings.Contains(logs, "DROP") || !strings.Contains(firstLogLineContaining(logs, "OK "), "incomplete:max_output_tokens") {
 		t.Fatalf("incomplete must be logged as a success with its reason:\n%s", logs)
+	}
+}
+
+func TestResponsesMalformedEnvelopesPreserveTrailingOutput(t *testing.T) {
+	for name, data := range map[string]string{
+		"uppercase discriminator":         `{"TYPE":"response.completed","response":{"id":"ignored"}}`,
+		"duplicate discriminator":         `{"type":"response.output_text.delta","type":"response.completed","response":{"id":"ignored"}}`,
+		"escaped duplicate discriminator": `{"type":"response.completed","\u0074ype":"response.completed","response":{"id":"ignored"}}`,
+		"duplicate response":              `{"type":"response.completed","response":{},"response":{"id":"ignored"}}`,
+		"numeric completion delta":        `{"type":"response.completed","delta":42,"response":{"id":"ignored"}}`,
+		"numeric incomplete text":         `{"type":"response.incomplete","text":42}`,
+		"numeric failure item":            `{"type":"response.failed","item_id":42,"response":{"error":{"code":"invalid_prompt"}}}`,
+		"fractional summary index":        `{"type":"response.completed","summary_index":0.5,"response":{"id":"ignored"}}`,
+		"string content index":            `{"type":"error","content_index":"0","code":"server_error"}`,
+		"numeric ordinary delta":          `{"type":"response.output_text.delta","delta":42}`,
+	} {
+		for _, live := range []bool{false, true} {
+			mode := "buffered"
+			if live {
+				mode = "live"
+			}
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				bad := "event: response.completed\ndata: " + data + "\n\n"
+				stream := responsesCommitPrefix + bad + goodResponsesStream
+				rec, wrote, f := captureResp(t, iotest1byte(stream), nil, time.Hour, live)
+				if !wrote || f != nil {
+					t.Fatalf("skippable envelope lost valid completion: wrote=%v failure=%+v", wrote, f)
+				}
+				if rec.Header().Get("X-Steady-Proxy-Mode") != mode || rec.Body.String() != stream {
+					t.Fatalf("want %s byte-exact stream including trailing output, got mode=%q body=%q", mode, rec.Header().Get("X-Steady-Proxy-Mode"), rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesUnknownDuplicateFieldsPreserveTerminal(t *testing.T) {
+	for _, kind := range []string{"response.completed", "response.incomplete", "response.failed"} {
+		for _, live := range []bool{false, true} {
+			mode := "buffered"
+			if live {
+				mode = "live"
+			}
+			t.Run(kind+"/"+mode, func(t *testing.T) {
+				response := `{"id":"r"}`
+				if kind == "response.failed" {
+					response = `{"error":{"code":"context_length_exceeded","message":"compact context"}}`
+				}
+				terminal := `data: {"type":"` + kind + `","trace":{"x":1,"x":2},"trace":2,"response":` + response + "}\n\n"
+				stream := responsesCommitPrefix + terminal
+				rec, wrote, f := captureResp(t, iotest1byte(stream), nil, time.Hour, live)
+				if !wrote || f != nil && !(live && kind == "response.failed" && f.delivered && !f.transient) {
+					t.Fatalf("unknown envelope fields changed terminal delivery: wrote=%v failure=%+v", wrote, f)
+				}
+				if rec.Body.String() != stream || rec.Header().Get("X-Steady-Proxy-Mode") != mode {
+					t.Fatalf("terminal bytes/mode changed: mode=%q body=%q", rec.Header().Get("X-Steady-Proxy-Mode"), rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesCompletionSnapshotExactKeys(t *testing.T) {
+	for name, fields := range map[string]string{
+		"uppercase response":        `"RESPONSE":{"id":"r"}`,
+		"uppercase id":              `"response":{"ID":"r"}`,
+		"uppercase required usage":  `"response":{"id":"r","usage":{"INPUT_TOKENS":1,"output_tokens":1,"total_tokens":2}}`,
+		"uppercase required detail": `"response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"input_tokens_details":{"CACHED_TOKENS":0}}}`,
+		"duplicate snapshot id":     `"response":{"id":"first","id":"last"}`,
+		"duplicate nested usage":    `"response":{"id":"r","usage":{"input_tokens":1,"input_tokens":2,"output_tokens":1,"total_tokens":2}}`,
+	} {
+		for _, live := range []bool{false, true} {
+			mode := "buffered"
+			if live {
+				mode = "live"
+			}
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				bad := "data: {\"type\":\"response.completed\"," + fields + "}\n\n"
+				rec, wrote, f := captureResp(t, iotest1byte(responsesCommitPrefix+bad+goodResponsesStream), nil, time.Hour, live)
+				if f == nil || !f.transient || f.delivered || f.code != "responses_invalid_completed" || wrote != live {
+					t.Fatalf("invalid actual snapshot must fail immediately: wrote=%v failure=%+v", wrote, f)
+				}
+				if live && rec.Body.String() != responsesCommitPrefix+bad {
+					t.Fatalf("live snapshot failure must preserve only bytes through failing event: %q", rec.Body.String())
+				}
+				if !live && rec.Body.Len() != 0 {
+					t.Fatal("invalid buffered snapshot committed bytes")
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesImageInputErrorsPermanent(t *testing.T) {
+	for _, code := range []string{"invalid_image_mode", "empty_image_file", "server_error", "rate_limit_exceeded", "vector_store_timeout", "failed_to_download_image"} {
+		t.Run(code, func(t *testing.T) {
+			permanent := code == "invalid_image_mode" || code == "empty_image_file"
+			frame := responsesFailedFrame(`{"code":"` + code + `","message":"image processing failed"}`)
+			_, wrote, f := captureResp(t, strings.NewReader(frame), nil, time.Hour, false)
+			if wrote || f == nil || f.transient == permanent || f.delivered {
+				t.Fatalf("buffered image error: wrote=%v failure=%+v", wrote, f)
+			}
+			wantStatus := 503
+			if permanent {
+				wantStatus = 400
+			}
+			if status, _ := surfaceFor("/v1/responses", *f); status != wantStatus {
+				t.Fatalf("client status=%d, want %d", status, wantStatus)
+			}
+			rec, wrote, f := captureResp(t, iotest1byte(responsesCommitPrefix+frame), nil, time.Hour, true)
+			if !wrote || f == nil || f.transient == permanent || f.delivered != permanent {
+				t.Fatalf("live image error: wrote=%v failure=%+v", wrote, f)
+			}
+			wantBody := responsesCommitPrefix
+			if permanent {
+				wantBody += frame
+			}
+			if rec.Body.String() != wantBody {
+				t.Fatalf("native error delivery mismatch: got %q want %q", rec.Body.String(), wantBody)
+			}
+		})
+	}
+}
+
+func TestResponsesReplayStandardFraming(t *testing.T) {
+	for _, newline := range []string{"\n", "\r", "\r\n"} {
+		for _, oneByte := range []bool{false, true} {
+			for _, limit := range []int{0, 64 << 10} {
+				prefix := "\ufeffdata: {\"type\":\"response.created\"}" + newline + newline
+				deltas := responsesDeltaFrame("m", 0, 0, "a", 1, "", []any{}) + responsesDeltaFrame("m", 0, 0, "b", 2, "", []any{})
+				terminal := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}" + newline + newline
+				stream := prefix + strings.ReplaceAll(deltas, "\n", newline) + terminal
+				var reader io.Reader = strings.NewReader(stream)
+				if oneByte {
+					reader = iotest1byte(stream)
+				}
+				var out bytes.Buffer
+				if err := replayResponsesReader(reader, &out, limit); err != nil {
+					t.Fatalf("newline=%q oneByte=%v limit=%d: %v", newline, oneByte, limit, err)
+				}
+				if limit == 0 {
+					if out.String() != stream {
+						t.Fatal("raw replay changed framing")
+					}
+					continue
+				}
+				events := parsedResponsesEvents(out.String())
+				if len(events) != 3 || !strings.HasPrefix(out.String(), prefix) || !strings.HasSuffix(out.String(), terminal) {
+					t.Fatalf("coalesced framing/barriers changed: newline=%q oneByte=%v out=%q", newline, oneByte, out.String())
+				}
+				if delta := responsesString(responsesObject(json.RawMessage(events[1].data))["delta"]); delta != "ab" {
+					t.Fatalf("coalesced text=%q, want ab", delta)
+				}
+			}
+		}
+	}
+}
+
+func TestResponsesSnapshotUnknownCaseVariantsRemainOpaque(t *testing.T) {
+	for _, snapshot := range []string{
+		`{"id":"r","ID":123,"USAGE":{"not":"usage"}}`,
+		`{"id":"r","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3,"INPUT_TOKENS":"ignored"}}`,
+		`{"id":"r","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3,"INPUT_TOKENS_DETAILS":{}}}`,
+	} {
+		stream := "data: {\"type\":\"response.completed\",\"response\":" + snapshot + "}\n\n"
+		rec, wrote, f := captureResp(t, strings.NewReader(stream), nil, time.Hour, false)
+		if !wrote || f != nil || rec.Body.String() != stream {
+			t.Fatalf("unknown keys must not shadow exact protocol keys: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
+		}
+	}
+}
+
+func TestResponsesReplayOversizedCRFrameResumesCoalescing(t *testing.T) {
+	for _, newline := range []string{"\r", "\r\n"} {
+		large := "data: {\"type\":\"response.metadata\",\"blob\":\"" + strings.Repeat("x", 96<<10) + "\"}" + newline + newline
+		deltas := responsesDeltaFrame("m", 0, 0, "a", 1, "", []any{}) + responsesDeltaFrame("m", 0, 0, "b", 2, "", []any{})
+		stream := large + strings.ReplaceAll(deltas, "\n", newline)
+		out := replayResponsesForTest(t, stream, 1024)
+		if !strings.HasPrefix(out, large) {
+			t.Fatalf("oversized %q frame changed", newline)
+		}
+		events := parsedResponsesEvents(out[len(large):])
+		if len(events) != 1 || responsesString(responsesObject(json.RawMessage(events[0].data))["delta"]) != "ab" {
+			t.Fatalf("oversized passthrough failed to resume grouping: %q", out[len(large):])
+		}
 	}
 }

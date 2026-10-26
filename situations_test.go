@@ -309,3 +309,72 @@ func TestSilentGapAborts(t *testing.T) {
 		t.Fatalf("want transient upstream_idle, got %+v", f)
 	}
 }
+
+func TestAnthropicRetryIgnoresStructuredMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		permanent  bool
+	}{
+		{"baseline", `{"error":{"type":"rate_limit_error","message":"slow down"}}`, false},
+		{"request id", `{"error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req_tool_use_control"}`, false},
+		{"nested metadata", `{"error":{"type":"rate_limit_error","message":"slow down","metadata":{"context_length":"control"}}}`, false},
+		{"no diagnostic", `{"request_id":"req_tool_use_control"}`, false},
+		{"wrong diagnostic type", `{"error":{"type":"rate_limit_error","message":{"request_id":"req_tool_use_control"}}}`, false},
+		{"diagnostic message", `{"error":{"type":"rate_limit_error","message":"prompt is too long for this tier"}}`, true},
+		{"diagnostic code", `{"error":{"type":"rate_limit_error","code":"context_length_exceeded","message":"rejected"}}`, true},
+		{"plain text", `gateway: prompt is too long for this tier`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, hints := range []struct {
+				gateway, upstream string
+				force             int
+			}{
+				{"", "", 0}, {"", "true", 1}, {"", "false", -1},
+				{"true", "false", 1}, {"false", "true", -1},
+			} {
+				resp := mkResp(429, tc.body)
+				resp.Header.Set("X-Gateway-Retryable", hints.gateway)
+				resp.Header.Set("X-Should-Retry", hints.upstream)
+				f := classifyHTTPError(resp)
+				wantTransient := !tc.permanent
+				if hints.force != 0 {
+					wantTransient = hints.force > 0
+				}
+				if f.transient != wantTransient {
+					t.Fatalf("gateway=%q upstream=%q: want retry=%v, got %+v", hints.gateway, hints.upstream, wantTransient, f)
+				}
+				if status, _ := surface(f); wantTransient && status != 503 || !wantTransient && status != 429 {
+					t.Fatalf("unexpected downstream status=%d for %+v", status, f)
+				}
+			}
+		})
+	}
+}
+
+func TestRetryAfterAllHTTPDateFormats(t *testing.T) {
+	for _, layout := range []string{http.TimeFormat, time.RFC850, time.ANSIC} {
+		t.Run(layout, func(t *testing.T) {
+			now := time.Now().UTC()
+			deadline := now.Add(24 * time.Hour).Truncate(time.Second)
+			resp := mkResp(429, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+			resp.Header.Set("Retry-After", deadline.Format(layout))
+			f := classifyHTTPError(resp)
+			// Parsing must preserve the future cooldown and round up the remaining
+			// fractional second, rather than falling back to generic short backoff.
+			before := int((deadline.Sub(now) + time.Second - 1) / time.Second)
+			after := int((time.Until(deadline) + time.Second - 1) / time.Second)
+			if !f.transient || f.retryAfter < after || f.retryAfter > before {
+				t.Fatalf("HTTP date %q: want cooldown [%d,%d], got %+v", resp.Header.Get("Retry-After"), after, before, f)
+			}
+			expired := time.Date(1994, time.November, 6, 8, 49, 37, 0, time.UTC)
+			if got := retryAfterSeconds(expired.Format(layout)); got != 0 {
+				t.Fatalf("expired HTTP date returned %d seconds", got)
+			}
+		})
+	}
+	for value, want := range map[string]int{"15": 15, " 15 ": 15, "0": 0, "-1": 0, "not a date": 0} {
+		if got := retryAfterSeconds(value); got != want {
+			t.Fatalf("Retry-After %q=%d, want %d", value, got, want)
+		}
+	}
+}

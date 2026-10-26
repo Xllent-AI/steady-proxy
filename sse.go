@@ -111,75 +111,114 @@ type event struct {
 }
 
 type curEvent struct {
-	has        bool
-	name, data string
+	has, hasData bool
+	name, data   string
 }
 
 type sseParser struct {
 	maxEventBytes int64 // 0 for already bounded/trusted replay input
 	err           error
-	pending       []byte
 	curRaw        []byte
+	lineStart     int
+	cr            bool // final CR awaits an optional LF in the next chunk
+	started       bool
 	cur           curEvent
 }
 
-func (p *sseParser) feed(b []byte) []event {
+func (p *sseParser) feed(b []byte) []event { return p.feedChunk(b, false) }
+
+// feedChunk recognizes CR, LF and CRLF without changing the event's raw bytes.
+// Only a final CR needs lookahead; EOF completes that line but never invents a
+// blank line for an unterminated event. The first line alone may carry a BOM.
+func (p *sseParser) feedChunk(b []byte, eof bool) []event {
 	var out []event
-	for len(b) > 0 && p.err == nil {
-		// Consume only one line fragment at a time, checking before allocation.
-		// A transport chunk can contain many small events; its total size is not
-		// an event-size violation.
-		i := bytes.IndexByte(b, '\n')
+	for p.err == nil {
+		if p.cr {
+			if len(b) == 0 && !eof {
+				break
+			}
+			ending := 1
+			if len(b) > 0 && b[0] == '\n' {
+				if !p.appendRaw(b[:1]) {
+					break
+				}
+				b = b[1:]
+				ending = 2
+			}
+			p.cr = false
+			p.finishLine(ending, &out)
+		}
+		if len(b) == 0 {
+			break
+		}
+		i := bytes.IndexAny(b, "\r\n")
 		n := len(b)
 		if i >= 0 {
 			n = i + 1
 		}
-		if p.maxEventBytes > 0 && int64(len(p.curRaw))+int64(len(p.pending))+int64(n) > p.maxEventBytes {
-			p.err = errTooLarge
+		if !p.appendRaw(b[:n]) {
 			break
 		}
-		p.pending = append(p.pending, b[:n]...)
 		b = b[n:]
 		if i < 0 {
 			break
 		}
-		p.curRaw = append(p.curRaw, p.pending...)
-		line := p.pending[:len(p.pending)-1]
-		p.pending = p.pending[:0]
-		if n := len(line); n > 0 && line[n-1] == '\r' {
-			line = line[:n-1]
-		}
-		if len(line) == 0 {
-			if p.cur.has {
-				out = append(out, event{name: p.cur.name, data: p.cur.data, raw: append([]byte(nil), p.curRaw...)})
-				p.cur = curEvent{}
-			}
-			p.curRaw = p.curRaw[:0]
-			continue
-		}
-		if line[0] == ':' {
-			continue
-		}
-		field, value := line, []byte(nil)
-		if j := bytes.IndexByte(line, ':'); j >= 0 {
-			field = line[:j]
-			value = line[j+1:]
-			if len(value) > 0 && value[0] == ' ' {
-				value = value[1:]
-			}
-		}
-		p.cur.has = true
-		switch string(field) {
-		case "event":
-			p.cur.name = string(value)
-		case "data":
-			if p.cur.data != "" {
-				p.cur.data += "\n"
-			}
-			p.cur.data += string(value)
+		if p.curRaw[len(p.curRaw)-1] == '\r' {
+			p.cr = true
+		} else {
+			p.finishLine(1, &out)
 		}
 	}
 	return out
+}
+
+func (p *sseParser) appendRaw(b []byte) bool {
+	if p.maxEventBytes > 0 && int64(len(b)) > p.maxEventBytes-int64(len(p.curRaw)) {
+		p.err = errTooLarge
+		return false
+	}
+	p.curRaw = append(p.curRaw, b...)
+	return true
+}
+
+func (p *sseParser) finishLine(ending int, out *[]event) {
+	line := p.curRaw[p.lineStart : len(p.curRaw)-ending]
+	p.lineStart = len(p.curRaw)
+	if !p.started {
+		line = bytes.TrimPrefix(line, []byte("\xef\xbb\xbf"))
+		p.started = true
+	}
+	if len(line) == 0 {
+		if p.cur.has {
+			*out = append(*out, event{name: p.cur.name, data: p.cur.data, raw: append([]byte(nil), p.curRaw...)})
+			p.cur = curEvent{}
+		}
+		p.curRaw = p.curRaw[:0]
+		p.lineStart = 0
+		return
+	}
+	if line[0] == ':' {
+		return
+	}
+	field, value := line, []byte(nil)
+	if j := bytes.IndexByte(line, ':'); j >= 0 {
+		field = line[:j]
+		value = line[j+1:]
+		if len(value) > 0 && value[0] == ' ' {
+			value = value[1:]
+		}
+	}
+	p.cur.has = true
+	switch string(field) {
+	case "event":
+		p.cur.name = string(value)
+	case "data":
+		if p.cur.hasData {
+			p.cur.data += "\n"
+		}
+		p.cur.hasData = true
+		p.cur.data += string(value)
+	}
 }
 
 // ----------------------------------------------------- anthropic validator --
@@ -246,6 +285,7 @@ type captureStats struct {
 	stop                  string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
 	model                 string    // resolved model echoed back by the upstream
 	respTee               io.Writer // optional: when set, every raw response event is teed here (request-log)
+	readErr               error     // actual upstream read fault; clean EOF is not a capture error
 	heldRefusal           *spool    // complete buffered refusal handed to the caller on the refusal sentinel; the caller must discard it
 }
 
@@ -302,6 +342,9 @@ func captureSSEWindow(ctx context.Context, cancel context.CancelFunc, w http.Res
 // window, so streaming UX is preserved while a start-of-stream error is still
 // caught pre-commit and converted to a retry.
 func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, upstreamHdr http.Header, body io.Reader, st *captureStats, keepaliveMs time.Duration, progressGated, earlyCommit bool, model wireModel, commitBy time.Time) (bool, *failure) {
+	if a, ok := model.(*anthropicWire); ok {
+		a.streamToolDeltas = progressGated
+	}
 	sp := newSpool()
 	defer func() {
 		if st == nil || st.heldRefusal != sp {
@@ -382,21 +425,24 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 	for {
 		select {
 		case r := <-ch:
+			if st != nil && r.err != nil && r.err != io.EOF {
+				st.readErr = r.err
+			}
 			if len(r.data) > 0 {
 				idleTimer.Reset(cfg.upstreamByteIdle)
 				if st != nil && st.respTee != nil {
 					st.respTee.Write(r.data)
 				}
-				wrote, fail, ret := process(r.data, sp, parser, model, w, &committed, writeHead, flush, st)
-				if ret {
-					return wrote, fail
-				}
+			}
+			events := parser.feedChunk(r.data, r.err != nil)
+			if wrote, fail, ret := process(events, sp, parser, model, w, &committed, writeHead, flush, st); ret {
+				return wrote, fail
 			}
 			// Gemini has no terminal SSE event: accept clean EOF only after the
 			// wire reports completion and no partial frame remains. Read faults and
 			// cancellation must still fail even after a candidate's finishReason.
 			if r.err != nil {
-				if r.err == io.EOF && ctx.Err() == nil && !parser.cur.has && len(parser.pending) == 0 && model.completeOnEOF() {
+				if r.err == io.EOF && ctx.Err() == nil && !parser.cur.has && parser.lineStart == len(parser.curRaw) && model.completeOnEOF() {
 					if !committed {
 						return true, replayCaptured(sp, model, w, st, writeHead, flush)
 					}
@@ -422,7 +468,7 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 			graceElapsed = true
 			if !committed {
 				// Gated caller (Workflow stall watchdog): only commit once real
-				// forwarded content (a non-withheld content_block_delta) is buffered.
+				// forwarded content (a content_block_delta) is buffered.
 				// Committing a content-less prefix (message_start/ping) would send
 				// 200 + keepalive comments — which the watchdog ignores (no progress)
 				// — while forfeiting the clean pre-commit retry path. Stay buffered
@@ -469,13 +515,13 @@ func captureSSECore(ctx context.Context, cancel context.CancelFunc, w http.Respo
 	}
 }
 
-// process handles one chunk. ret=true means captureSSE should return (wrote,fail).
+// process handles parsed events. ret=true means captureSSE should return (wrote,fail).
 // The wire-specific decisions — is this an in-band error, is the stream complete,
 // what bytes to forward, what usage to scrape — are delegated to model; process
 // owns only the engine mechanics (ping tripwire, spool, commit boundary).
-func process(data []byte, sp *spool, parser *sseParser, model wireModel, w http.ResponseWriter,
+func process(events []event, sp *spool, parser *sseParser, model wireModel, w http.ResponseWriter,
 	committed *bool, writeHead func(string), flush func(), st *captureStats) (bool, *failure, bool) {
-	for _, ev := range parser.feed(data) {
+	for _, ev := range events {
 		if st != nil {
 			st.bytes += int64(len(ev.raw))
 			// Tripwire: track the longest run of consecutive upstream `ping` events.
@@ -604,11 +650,9 @@ func validateSSEEventShape(ev event) *failure {
 // that downstream as "JSON Parse error: Unexpected EOF"; in transactional mode
 // we can classify it before committing bytes.
 //
-// The one excused case is a max_tokens stop: the token cap cut the input
-// mid-JSON, and a retry regenerates the same truncation and bills it again, so
-// that stream is the upstream's final answer. stop_reason only arrives in the
-// message_delta after the block stop, so the verdict waits for the event that
-// follows an invalid block (see judgeTruncatedToolInput).
+// Provider-declared token/context limits can cut the input mid-JSON; retrying
+// cannot repair that answer. stop_reason arrives after the block stop, so the
+// verdict waits for the following event (see judgeTruncatedToolInput).
 type toolJSONValidator struct {
 	blocks     map[int]*toolJSONBlock
 	truncated  bool  // a tool block closed with invalid input; the next event decides
@@ -628,6 +672,13 @@ func (v *toolJSONValidator) accept(ev event) *failure {
 	var p streamPayload
 	if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
 		return malformedSSE("invalid JSON in stream event")
+	}
+	if ev.name == "message_stop" {
+		for _, b := range v.blocks {
+			if b.sawInputDelta {
+				return malformedSSE(invalidToolInputMessage)
+			}
+		}
 	}
 	if v.truncated {
 		switch judgeTruncatedToolInput(ev, &p) {
@@ -701,17 +752,17 @@ type truncVerdict int
 const (
 	truncReject  truncVerdict = iota // not excused: a malformed stream
 	truncWait                        // ping: says nothing, keep waiting
-	truncExcused                     // message_delta stop_reason=max_tokens: the cap cut the input
+	truncExcused                     // message_delta declares token/context exhaustion
 )
 
 // judgeTruncatedToolInput decides what an invalid tool input means from the
-// event right after its block closes. Only a max_tokens stop excuses it; a ping
-// may sit in between, as the API allows ping events anywhere in the stream.
+// event right after its block closes. Only declared token/context exhaustion
+// excuses it; a ping may sit in between, as the API permits pings anywhere.
 func judgeTruncatedToolInput(ev event, p *streamPayload) truncVerdict {
 	switch {
 	case ev.name == "ping":
 		return truncWait
-	case p.Type == "message_delta" && p.Delta.StopReason == "max_tokens":
+	case p.Type == "message_delta" && (p.Delta.StopReason == "max_tokens" || p.Delta.StopReason == "model_context_window_exceeded"):
 		return truncExcused
 	default:
 		return truncReject
@@ -838,8 +889,8 @@ func replayBufferedWithNormalizer(r io.Reader, w io.Writer, st *captureStats, to
 	startPatched := false
 	for {
 		n, err := r.Read(buf)
-		if n > 0 {
-			for _, ev := range parser.feed(buf[:n]) {
+		if n > 0 || err != nil {
+			for _, ev := range parser.feedChunk(buf[:n], err != nil) {
 				raw := ev.raw
 				switch {
 				case backfill && !startPatched && ev.name == "message_start":
@@ -880,7 +931,7 @@ type toolJSONReplayNormalizer struct {
 	retainedBytes int64 // pending input's wire bytes bound its decoded data too
 	// held is the coalesced delta and content_block_stop of a tool block whose
 	// input is not valid JSON, plus any pings since, kept until the next event
-	// says whether max_tokens cut the input (see judgeTruncatedToolInput). Live
+	// says whether a token/context limit cut the input (judgeTruncatedToolInput). Live
 	// streaming cannot look ahead, so the frames wait here instead of failing.
 	held      [][]byte
 	heldBytes int64
@@ -897,9 +948,6 @@ type toolReplayBlock struct {
 func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error) {
 	if !normalizeToolJSONEnabled() {
 		return [][]byte{raw}, nil
-	}
-	if f := validateSSEEventShape(ev); f != nil {
-		return nil, errInvalidSSEEventShape
 	}
 	var p streamPayload
 	if ev.data != "" {
@@ -975,8 +1023,8 @@ func (n *toolJSONReplayNormalizer) accept(ev event, raw []byte) ([][]byte, error
 			return append(b.rawDeltas, raw), nil
 		}
 		if !validJSONObject(b.input.Bytes()) {
-			// Cut off or garbled: the upstream's own max_tokens answer or a
-			// malformed stream, depending on the next event. Hold both frames.
+			// Cut off or garbled: a provider-declared limit or a malformed stream,
+			// depending on the next event. Hold both frames.
 			coalesced := toolInputDeltaEvent(p.Index, b.input.String())
 			heldBytes := int64(len(coalesced)) + int64(len(raw))
 			if heldBytes > cfg.maxResponseBytes-n.retainedBytes {
@@ -1002,70 +1050,10 @@ func (n *toolJSONReplayNormalizer) takeBlock(index int) *toolReplayBlock {
 	return b
 }
 
-// withholding reports tool input still withheld for a block that has not
-// closed: ending the stream now would hand the client a tool call without it.
-func (n *toolJSONReplayNormalizer) withholding() bool {
-	for _, b := range n.blocks {
-		if b.sawInputDelta {
-			return true
-		}
-	}
-	return false
-}
-
 var errInvalidToolJSON = errors.New("invalid tool input JSON")
-var errInvalidSSEEventShape = errors.New("invalid SSE event shape")
 
 func normalizeToolJSONEnabled() bool {
 	return cfg.validateJSON && cfg.normalizeToolJSON
-}
-
-// progressTracker mirrors, during buffering, whether the buffered prefix would
-// forward at least one incremental content_block_delta downstream when replayed —
-// the real progress a Workflow stall watchdog counts (keepalive comments and ping
-// do not). It accounts for tool-JSON normalization, which withholds
-// input_json_delta fragments until the content_block_stop that coalesces them
-// (see toolJSONReplayNormalizer): a text/thinking delta is progress immediately,
-// a tool block's input becomes progress at its stop, and with normalization off
-// every delta is forwarded as-is.
-type progressTracker struct {
-	sawForwardable   bool
-	toolInputPending map[int]bool
-}
-
-func (p *progressTracker) accept(ev event) {
-	if p.sawForwardable {
-		return
-	}
-	switch ev.name {
-	case "content_block_delta":
-		if !normalizeToolJSONEnabled() {
-			p.sawForwardable = true // nothing is withheld; forwarded as-is
-			return
-		}
-		var s streamPayload
-		if json.Unmarshal([]byte(ev.data), &s) != nil {
-			p.sawForwardable = true // unparseable here; forwarded as-is at replay
-			return
-		}
-		if s.Delta.Type != "input_json_delta" {
-			p.sawForwardable = true // text/thinking delta forwarded as-is
-			return
-		}
-		if p.toolInputPending == nil {
-			p.toolInputPending = map[int]bool{}
-		}
-		p.toolInputPending[s.Index] = true // withheld until this block's stop
-	case "content_block_stop":
-		var s streamPayload
-		if json.Unmarshal([]byte(ev.data), &s) != nil {
-			return
-		}
-		if p.toolInputPending[s.Index] {
-			p.sawForwardable = true // the coalesced tool delta is emitted at this stop
-			delete(p.toolInputPending, s.Index)
-		}
-	}
 }
 
 func blockUsesInputJSON(blockType string) bool {

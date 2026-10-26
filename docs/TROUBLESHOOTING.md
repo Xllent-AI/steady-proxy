@@ -24,14 +24,14 @@ Upstreams often fail mid-stream *after* sending HTTP `200`. Buffering catches th
 | --- | --- | --- |
 | Stream closes before terminal event (`JSON Parse error: Unexpected EOF`, `Connection closed mid-response` / `while thinking`) | `truncated_stream` | Discard buffer and retry. |
 | Socket reset, `Request was aborted.`, or HTTP/2 `INTERNAL_ERROR; received from peer` | Transport / stream-read error | Discard buffer and retry. |
-| Invalid JSON in an Anthropic event (`JSON Parse error: Unexpected identifier`) or incomplete/invalid accumulated `tool_use` / `server_tool_use` JSON (unless `stop_reason` is `max_tokens`, which cuts tool input legitimately) | `malformed_sse` | Discard buffer and retry. |
+| Invalid JSON in an Anthropic event (`JSON Parse error: Unexpected identifier`) or incomplete/invalid accumulated `tool_use` / `server_tool_use` JSON (unless `stop_reason` is `max_tokens` or `model_context_window_exceeded`, which can cut tool input legitimately) | `malformed_sse` | Discard buffer and retry. |
 | Non-SSE `2xx` body on a streaming call that breaks before its end | Transport / stream-read error | Discard buffer and retry. A complete non-SSE body is the upstream's answer and is relayed unchanged. |
 
 ### Protocol-specific validation
 
-- **Anthropic Messages:** Keep `PROXY_VALIDATE_JSON=1` and `PROXY_NORMALIZE_TOOL_JSON=1` enabled so malformed events are retried and fragmented `input_json_delta` chunks are combined before replay.
-- **OpenAI Responses:** Requires a valid `response.completed` event (non-empty string `id`, complete integer usage when present, no duplicate keys or invalid Unicode); a rejected one fails as `responses_invalid_completed`. `response.incomplete` is the upstream's answer (for example `max_output_tokens`) and is delivered unchanged; Codex 0.163+ treats it as terminal. Ordinary content events follow Codex's lenient parser.
-- **Gemini `streamGenerateContent?alt=sse`:** Requires clean transport EOF after all requested candidates report a `finishReason` (or a standalone prompt block). Trailing usage frames are preserved. Missing candidates, missing finish reasons, partial frames, or malformed JSON trigger a retry before commit, and abort the HTTP transport after commit so the client does not mistake a drop for clean EOF. Native `MAX_TOKENS` and safety stops are valid completions and pass through unchanged.
+- **Anthropic Messages:** Keep `PROXY_VALIDATE_JSON=1` to reject malformed event/tool JSON in buffered and live modes. `PROXY_NORMALIZE_TOOL_JSON` controls coalescing, not validation; Workflow live output preserves incremental tool fragments.
+- **OpenAI Responses:** Terminal envelopes use exact-case keys and typed fields; malformed envelopes are forwarded without ending the stream. A recognized `response.completed` requires a non-empty string `id`, complete integer usage when present, and no duplicate snapshot keys or invalid Unicode; a rejected snapshot fails as `responses_invalid_completed`. `response.incomplete` is delivered unchanged except that reason `interrupted` must pass the completion-snapshot check. Ordinary content events follow Codex's lenient parser.
+- **Gemini `streamGenerateContent?alt=sse`:** Requires clean transport EOF after all requested candidates report a `finishReason` (or a standalone prompt block). Trailing usage/metadata frames are preserved, but new content for a finished candidate fails. Missing candidates, missing finish reasons, partial frames, or malformed JSON trigger a retry before commit and abort the HTTP transport after commit. Native `MAX_TOKENS` and safety stops remain valid; interpreted fields accept supported ProtoJSON aliases/scalars without rewriting payloads.
 
 If you see frequent `DROP` logs on `/v1/responses`, enable full buffering with `PROXY_RESPONSES_EARLY_COMMIT=0` and ensure the client's `stream_idle_timeout_ms` exceeds `PROXY_RESPONSES_BUFFER_MS`.
 
@@ -53,6 +53,9 @@ Recoverable upstream errors are normalized into a generic HTTP `503` with `X-Sho
 ### Special error-classification rules
 
 - **Transient `4xx` bodies:** A `4xx` other than `408`/`409`/`429` is retried only when its error body explicitly names a transient fault (Anthropic `overloaded_error` / `rate_limit_error` / `timeout_error`, a Responses transient type or code, a Gemini transient canonical status). It is logged as `retryable_4xx_<status>`.
+- **Diagnostic fields only:** Structured Anthropic request-shape matching uses error type/code/message, not request IDs or arbitrary metadata. Unstructured text/HTML retains the existing bounded fallback.
+- **Cooldown formats:** `Retry-After` accepts delay seconds and all HTTP-date forms (IMF-fixdate, RFC 850, asctime). Gemini `RetryInfo` accepts `retryDelay` or `retry_delay` when no valid HTTP cooldown is present.
+- **Responses image input:** `invalid_image_mode` and `empty_image_file` are terminal input errors, not transient service failures.
 - **Responses transient codes:** If a `/v1/responses` error has `type: "invalid_request_error"` but carries a transient `code` (`request_timeout`, `rate_limit_exceeded`, `server_is_overloaded`, or `overloaded`), the transient code wins and the request is retried, waiting any delay the message names (`try again in 1m30s`, `20 seconds`). A `429` whose message says the tokens "must be reduced in order to run successfully" is permanent. Request-shape phrases are only matched on untyped errors, so a typed `server_error` stays retryable.
 - **Anthropic SSE disconnect signature:** An Anthropic in-stream `event: error` with `type: "invalid_request_error"` is normally terminal, except for the exact gateway disconnect message:
   ```text
@@ -109,6 +112,8 @@ While buffering, the proxy sends no HTTP headers to the client. If the client's 
 ## Workflow stalls
 
 Claude Code Workflow `agent()` requests (logged as `/wf`) use `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10s) so buffered content reaches the client before the Workflow runtime's 180s content-stall watchdog fires.
+
+After cutover, actual tool-input fragments are streamed as they arrive even with normalization enabled; the proxy does not wait for the entire tool block. Clients must accumulate partial JSON. Fully buffered responses still coalesce tool input.
 
 If a Workflow agent still stalls:
 1. Verify `PROXY_WORKFLOW_KEEPALIVE_MS` is well below the script's `stallMs`.

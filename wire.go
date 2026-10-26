@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -58,7 +57,7 @@ type wireModel interface {
 	replayBuffered(sp *spool, w io.Writer, st *captureStats) error
 
 	// replayPrefix writes the buffered prefix at a keepalive/early commit, before
-	// live() continues to stream (Anthropic shares its tool-coalescing state).
+	// live() continues to stream (main-session Anthropic shares coalescing state).
 	replayPrefix(sp *spool, w io.Writer) error
 
 	// forwardable reports whether the buffered prefix would forward real
@@ -160,13 +159,14 @@ func isGeminiPath(path string) bool {
 //
 // anthropicWire is a thin adapter over the Anthropic stream machinery
 // (streamValidator, toolJSONValidator, toolJSONReplayNormalizer,
-// progressTracker, scrapeUsage, classifySSEError, spool.replayWithUsage /
-// replayWithNormalizer). Its behavior is pinned by the sse/situations tests.
+// scrapeUsage, classifySSEError, spool.replayWithUsage / replayWithNormalizer).
+// Its behavior is pinned by the sse/situations tests.
 type anthropicWire struct {
 	val              *streamValidator
 	toolVal          *toolJSONValidator
 	toolNorm         *toolJSONReplayNormalizer
-	prog             *progressTracker
+	sawProgress      bool
+	streamToolDeltas bool // Workflow cutover forwards raw fragments instead of withholding them
 	interceptRefusal bool // return the refusal sentinel on a complete stop_reason=="refusal"
 }
 
@@ -175,7 +175,6 @@ func newAnthropicWire(interceptRefusal bool) *anthropicWire {
 		val:              &streamValidator{},
 		toolVal:          &toolJSONValidator{},
 		toolNorm:         &toolJSONReplayNormalizer{},
-		prog:             &progressTracker{},
 		interceptRefusal: interceptRefusal,
 	}
 }
@@ -193,9 +192,6 @@ func (a *anthropicWire) buffered(ev event, st *captureStats) (bool, *failure) {
 	if ev.name == "error" {
 		return false, classifySSEError(ev.data)
 	}
-	if cfg.validateJSON && ev.data != "" && !json.Valid([]byte(ev.data)) {
-		return false, &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: "invalid JSON in stream event"}
-	}
 	if cfg.validateJSON {
 		if f := a.toolVal.accept(ev); f != nil {
 			return false, f
@@ -205,7 +201,9 @@ func (a *anthropicWire) buffered(ev event, st *captureStats) (bool, *failure) {
 	if a.val.invalid {
 		return false, &failure{transient: true, status: 502, atype: "api_error", code: "malformed_sse", message: "out-of-order stream event"}
 	}
-	a.prog.accept(ev)
+	if ev.name == "content_block_delta" {
+		a.sawProgress = true
+	}
 	if a.val.terminal() {
 		if a.interceptRefusal && st != nil && st.stop == "refusal" {
 			// api_error/502 are defensive defaults: the handler keys on .code and
@@ -236,15 +234,24 @@ func (a *anthropicWire) live(ev event, raw []byte, st *captureStats) ([][]byte, 
 		}
 		return nil, false, fail
 	}
+	if cfg.validateJSON {
+		if f := a.toolVal.accept(ev); f != nil {
+			return nil, false, f
+		}
+	}
+	if a.streamToolDeltas {
+		a.val.accept(ev)
+		return [][]byte{raw}, ev.name == "message_stop", nil
+	}
 	out, err := a.toolNorm.accept(ev, raw)
 	if err != nil {
 		if err == errTooLarge {
 			return nil, false, classifyBufferError(err)
 		}
-		return nil, false, malformedSSE(invalidToolInputMessage)
-	}
-	if ev.name == "message_stop" && a.toolNorm.withholding() {
-		return nil, false, malformedSSE(invalidToolInputMessage)
+		if err == errInvalidToolJSON {
+			return nil, false, malformedSSE(invalidToolInputMessage)
+		}
+		return nil, false, malformedSSE("invalid JSON in stream event")
 	}
 	a.val.accept(ev)
 	// message_stop ends the stream even if the validator flagged an ordering
@@ -259,9 +266,12 @@ func (a *anthropicWire) replayBuffered(sp *spool, w io.Writer, st *captureStats)
 }
 
 func (a *anthropicWire) replayPrefix(sp *spool, w io.Writer) error {
+	if a.streamToolDeltas {
+		return sp.replayRaw(w)
+	}
 	return sp.replayWithNormalizer(w, a.toolNorm)
 }
 
-func (a *anthropicWire) forwardable() bool { return a.prog.sawForwardable }
+func (a *anthropicWire) forwardable() bool { return a.sawProgress }
 
 func (a *anthropicWire) keepalive() []byte { return []byte(": keepalive\n\n") }

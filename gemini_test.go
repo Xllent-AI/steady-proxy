@@ -176,6 +176,10 @@ func TestGeminiProtoJSONCandidateCounts(t *testing.T) {
 		`{"generationConfig":{"candidateCount":"2.0"}}`,
 		`{"generationConfig":{"candidateCount":1,"candidate_count":2}}`,
 		`{"generation_config":{"candidate_count":1},"generationConfig":{"candidateCount":2}}`,
+		`{"generationConfig":{"candidate_count":1,"candidateCount":2}}`,
+		`{"generationConfig":{"candidateCount":1},"generation_config":{"candidate_count":2}}`,
+		`{"generationConfig":{"candidateCount":null,"candidate_count":2}}`,
+		`{"generation_config":null,"generationConfig":{"candidateCount":2}}`,
 	} {
 		t.Run(body, func(t *testing.T) {
 			_, wrote, f := captureGemini(t, []byte(body), strings.NewReader(first+second), nil, false)
@@ -187,6 +191,195 @@ func TestGeminiProtoJSONCandidateCounts(t *testing.T) {
 				t.Fatalf("missing second candidate accepted: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestGeminiCandidateIndexInt32Boundaries(t *testing.T) {
+	for _, tc := range []struct {
+		index string
+		valid bool
+	}{
+		{"2147483646", true},
+		{`"2147483646.000"`, true},
+		{"21474836460e-1", true},
+		{"2147483647", false}, // int32, but outside the requested candidate range
+		{"2147483648", false},
+		{`"2147483647.00000000001"`, false},
+		{"-2147483648", false},
+		{"-2147483649", false},
+		{"1e2147483648", false},
+		{"1e-2147483649", false},
+	} {
+		t.Run(tc.index, func(t *testing.T) {
+			wire := newGeminiWire([]byte(`{"generation_config":{"candidate_count":"2147483647"}}`))
+			_, f := wire.buffered(geminiTestEvent(`{"candidates":[{"index":`+tc.index+`,"finish_reason":1}]}`), nil)
+			if (f == nil) != tc.valid || wire.completeOnEOF() {
+				t.Fatalf("candidate range validation: failure=%+v complete=%v", f, wire.completeOnEOF())
+			}
+		})
+	}
+}
+
+func TestGeminiNumericStopEnums(t *testing.T) {
+	for _, tc := range []struct {
+		number string
+		name   string
+	}{
+		{"1", "STOP"}, {"2", "MAX_TOKENS"}, {"3", "SAFETY"},
+		{"5", "OTHER"}, {"6", "6"},
+		{"2147483647", "2147483647"}, {"-2147483648", "-2147483648"},
+	} {
+		stream := string(geminiTestEvent(`{"candidates":[{"finish_reason":` + tc.number + `}]}`).raw)
+		var st captureStats
+		rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), &st, false)
+		if !wrote || f != nil || rec.Body.String() != stream || st.stop != tc.name {
+			t.Fatalf("numeric finish %s: wrote=%v failure=%+v stop=%q", tc.number, wrote, f, st.stop)
+		}
+	}
+	for _, tc := range []struct{ number, name string }{
+		{"1", "SAFETY"}, {"2", "OTHER"}, {"3", "BLOCKLIST"},
+		{"4", "PROHIBITED_CONTENT"}, {"5", "5"},
+		{"2147483647", "2147483647"},
+	} {
+		stream := string(geminiTestEvent(`{"prompt_feedback":{"block_reason":` + tc.number + `}}`).raw)
+		var st captureStats
+		rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), &st, false)
+		if !wrote || f != nil || rec.Body.String() != stream || st.stop != tc.name {
+			t.Fatalf("numeric block %s: wrote=%v failure=%+v stop=%q", tc.number, wrote, f, st.stop)
+		}
+	}
+}
+
+func TestGeminiProtoJSONResponseScalars(t *testing.T) {
+	useDefaultConfig(t)
+	for _, index := range []string{"0", `"0"`, "null", "0.0", "0e10", `"0e0"`, `"-0.000e-3"`} {
+		for _, field := range []string{"finishReason", "finish_reason"} {
+			for _, reason := range []string{`"STOP"`, "1", "1.0", "1e0"} {
+				t.Run(index+"/"+field+"/"+reason, func(t *testing.T) {
+					stream := string(geminiTestEvent(`{"candidates":[{"index":` + index + `,"` + field + `":` + reason + `}]}`).raw)
+					var st captureStats
+					rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), &st, false)
+					if !wrote || f != nil || rec.Body.String() != stream || st.stop != "STOP" {
+						t.Fatalf("valid encoding changed completion: wrote=%v failure=%+v stop=%q body=%q", wrote, f, st.stop, rec.Body.String())
+					}
+				})
+			}
+		}
+	}
+	for _, index := range []string{"1", `"1"`, "10e-1", `"0.01e2"`, "1.000"} {
+		stream := string(geminiTestEvent(`{"candidates":[{"index":0,"finish_reason":1},{"index":` + index + `,"finishReason":2}]}`).raw)
+		var st captureStats
+		rec, wrote, f := captureGemini(t, []byte(`{"generation_config":{"candidate_count":"2e0"}}`), strings.NewReader(stream), &st, false)
+		if !wrote || f != nil || rec.Body.String() != stream || st.stop != "MAX_TOKENS" {
+			t.Fatalf("nonzero index %s: wrote=%v failure=%+v stop=%q", index, wrote, f, st.stop)
+		}
+	}
+	for _, reason := range []string{"0", "null", "0.0", "0e10"} {
+		for _, data := range []string{
+			`{"candidates":[{"finish_reason":` + reason + `}]}`,
+			`{"prompt_feedback":{"block_reason":` + reason + `}}`,
+		} {
+			rec, wrote, f := captureGemini(t, nil, strings.NewReader(string(geminiTestEvent(data).raw)), nil, false)
+			if wrote || f == nil || !f.transient || rec.Body.Len() != 0 {
+				t.Fatalf("unset enum completed stream: %s wrote=%v failure=%+v", data, wrote, f)
+			}
+		}
+	}
+}
+
+func TestGeminiProtoJSONBlocksAndUsage(t *testing.T) {
+	for _, feedback := range []string{"promptFeedback", "prompt_feedback"} {
+		for _, block := range []string{"blockReason", "block_reason"} {
+			for _, reason := range []string{`"SAFETY"`, "1", "1e0"} {
+				stream := string(geminiTestEvent(`{"` + feedback + `":{"` + block + `":` + reason + `},"usage_metadata":{"prompt_token_count":"1.2e1","cached_content_token_count":2.0},"model_version":"resolved"}`).raw)
+				var st captureStats
+				rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), &st, false)
+				if !wrote || f != nil || rec.Body.String() != stream || st.stop != "SAFETY" || st.inTok != 12 || st.cacheReadTok != 2 || st.model != "resolved" {
+					t.Fatalf("native block/usage changed: wrote=%v failure=%+v stats=%+v body=%q", wrote, f, st, rec.Body.String())
+				}
+			}
+		}
+	}
+}
+
+func TestGeminiProtoJSONDuplicateFieldsReplaceInOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		data     string
+		complete bool
+	}{
+		{"finish original last", `{"candidates":[{"finishReason":0,"finish_reason":1}]}`, true},
+		{"finish camel last", `{"candidates":[{"finish_reason":0,"finishReason":1}]}`, true},
+		{"finish null last", `{"candidates":[{"finishReason":1,"finish_reason":null}]}`, false},
+		{"same finish last", `{"candidates":[{"finishReason":1,"finishReason":0}]}`, false},
+		{"index last", `{"candidates":[{"index":1,"index":null,"finish_reason":1}]}`, true},
+		{"feedback original last", `{"promptFeedback":{"blockReason":1},"prompt_feedback":{}}`, false},
+		{"feedback camel last", `{"prompt_feedback":{"block_reason":1},"promptFeedback":null}`, false},
+		{"feedback same last", `{"promptFeedback":{"blockReason":1},"promptFeedback":{}}`, false},
+		{"block last", `{"prompt_feedback":{"blockReason":1,"block_reason":0}}`, false},
+		{"block reverse", `{"prompt_feedback":{"block_reason":0,"blockReason":1}}`, true},
+		{"candidate list last", `{"candidates":[{"finishReason":1}],"candidates":[]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := string(geminiTestEvent(tc.data).raw)
+			rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), nil, false)
+			if tc.complete {
+				if !wrote || f != nil || rec.Body.String() != stream {
+					t.Fatalf("last value did not complete: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
+				}
+			} else if wrote || f == nil || !f.transient || rec.Body.Len() != 0 {
+				t.Fatalf("stale value completed stream: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
+			}
+		})
+	}
+	stream := string(geminiTestEvent(`{"candidates":[{"finish_reason":1}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":50},"usage_metadata":{"prompt_token_count":"12","candidatesTokenCount":99,"candidates_token_count":"8e0","thoughts_token_count":7,"thoughtsTokenCount":null},"modelVersion":"first","model_version":"last"}`).raw)
+	var st captureStats
+	rec, wrote, f := captureGemini(t, nil, strings.NewReader(stream), &st, false)
+	if !wrote || f != nil || rec.Body.String() != stream || st.inTok != 12 || st.cacheReadTok != 0 || st.outTok != 8 || st.model != "last" {
+		t.Fatalf("duplicate usage/model merged or reversed: wrote=%v failure=%+v stats=%+v", wrote, f, st)
+	}
+}
+
+func TestGeminiContentAfterFinishFailsBufferedAndLive(t *testing.T) {
+	useDefaultConfig(t)
+	first := string(geminiTestEvent(`{"candidates":[{"content":{"parts":[{"text":"first"}]},"finishReason":"STOP"}]}`).raw)
+	for _, early := range []bool{false, true} {
+		for _, finish := range []string{"", `,"finish_reason":1`} {
+			t.Run(strconv.FormatBool(early)+finish, func(t *testing.T) {
+				last := string(geminiTestEvent(`{"candidates":[{"content":{"parts":[{"text":"unfinished continuation"}]}` + finish + `}]}`).raw)
+				rec, wrote, f := captureGemini(t, nil, &geminiTestReader{chunks: []string{first, last}}, nil, early)
+				if wrote != early || f == nil || !f.transient || f.code != "malformed_sse" || strings.Contains(rec.Body.String(), "unfinished continuation") {
+					t.Fatalf("stale completion accepted: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
+				}
+				if !early && rec.Body.Len() != 0 {
+					t.Fatalf("failed buffered prefix leaked: %q", rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestGeminiMetadataAfterFinishRemainsDeliverable(t *testing.T) {
+	useDefaultConfig(t)
+	first := string(geminiTestEvent(`{"candidates":[{"content":{"parts":[{"text":"first"}]},"finish_reason":1}]}`).raw)
+	for _, early := range []bool{false, true} {
+		for _, tail := range []string{
+			`{"candidates":[{"safetyRatings":[{"category":"opaque"}]}],"usage_metadata":{"candidates_token_count":"8","thoughts_token_count":3e0}}`,
+			`{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":8,"thoughtsTokenCount":3}}`,
+			`{"candidates":[{"content":null}],"usage_metadata":{"candidates_token_count":8,"thoughts_token_count":3}}`,
+		} {
+			last := string(geminiTestEvent(tail).raw)
+			var st captureStats
+			rec, wrote, f := captureGemini(t, nil, &geminiTestReader{chunks: []string{first, last}}, &st, early)
+			if !wrote || f != nil || rec.Body.String() != first+last || st.outTok != 11 {
+				t.Fatalf("metadata tail rejected or changed: early=%v wrote=%v failure=%+v stats=%+v body=%q", early, wrote, f, st, rec.Body.String())
+			}
+		}
+	}
+	last := string(geminiTestEvent(`{"candidates":[{"index":"1e0","content":{"parts":[{"text":"second candidate"}]},"finish_reason":1}]}`).raw)
+	rec, wrote, f := captureGemini(t, []byte(`{"generationConfig":{"candidateCount":2}}`), strings.NewReader(first+last), nil, false)
+	if !wrote || f != nil || rec.Body.String() != first+last {
+		t.Fatalf("other candidate cannot finish after the first: wrote=%v failure=%+v body=%q", wrote, f, rec.Body.String())
 	}
 }
 
@@ -291,18 +484,28 @@ func TestGeminiMalformedEventsFailEvenWhenValidationDisabled(t *testing.T) {
 		"candidate null":          `{"candidates":[null]}`,
 		"candidate scalar":        `{"candidates":[12]}`,
 		"candidate array":         `{"candidates":[[]]}`,
-		"null index":              `{"candidates":[{"index":null,"finishReason":"STOP"}]}`,
 		"negative index":          `{"candidates":[{"index":-1,"finishReason":"STOP"}]}`,
 		"out of range index":      `{"candidates":[{"index":1,"finishReason":"STOP"}]}`,
 		"fractional index":        `{"candidates":[{"index":0.5,"finishReason":"STOP"}]}`,
-		"exponent index":          `{"candidates":[{"index":0e0,"finishReason":"STOP"}]}`,
-		"string index":            `{"candidates":[{"index":"0","finishReason":"STOP"}]}`,
 		"boolean index":           `{"candidates":[{"index":false,"finishReason":"STOP"}]}`,
 		"object index":            `{"candidates":[{"index":{},"finishReason":"STOP"}]}`,
 		"overflowing index":       `{"candidates":[{"index":999999999999999999999999,"finishReason":"STOP"}]}`,
+		"int32 overflow index":    `{"candidates":[{"index":2147483648,"finishReason":"STOP"}]}`,
+		"rounded fraction index":  `{"candidates":[{"index":0.00000000000000000001,"finishReason":"STOP"}]}`,
+		"quoted null index":       `{"candidates":[{"index":"null","finishReason":"STOP"}]}`,
+		"quoted NaN index":        `{"candidates":[{"index":"NaN","finishReason":"STOP"}]}`,
+		"quoted infinity index":   `{"candidates":[{"index":"Infinity","finishReason":"STOP"}]}`,
+		"hexadecimal index":       `{"candidates":[{"index":"0x0","finishReason":"STOP"}]}`,
+		"whitespace index":        `{"candidates":[{"index":" 0 ","finishReason":"STOP"}]}`,
+		"fractional finish":       `{"candidates":[{"finishReason":1.5}]}`,
+		"overflowing finish":      `{"candidates":[{"finishReason":2147483648}]}`,
+		"invalid block type":      `{"prompt_feedback":{"block_reason":true}}`,
+		"fractional usage":        `{"usage_metadata":{"candidates_token_count":1.0000000000000000001}}`,
+		"overflowing usage":       `{"usageMetadata":{"thoughtsTokenCount":2147483648}}`,
+		"quoted null usage":       `{"usage_metadata":{"prompt_token_count":"null"}}`,
 		"duplicate index":         `{"candidates":[{"index":0,"finishReason":"STOP"},{"index":0,"finishReason":"STOP"}]}`,
 		"duplicate omitted index": `{"candidates":[{"finishReason":"STOP"},{"finishReason":"STOP"}]}`,
-		"invalid finish type":     `{"candidates":[{"finishReason":12}]}`,
+		"invalid finish type":     `{"candidates":[{"finishReason":false}]}`,
 		"content array":           `{"candidates":[{"content":[]}]}`,
 		"parts object":            `{"candidates":[{"content":{"parts":{}}}]}`,
 		"part null":               `{"candidates":[{"content":{"parts":[null]}}]}`,

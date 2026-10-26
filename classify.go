@@ -139,15 +139,15 @@ const (
 	verdictPermanent                     // the body names a fault an identical retry cannot fix
 )
 
-// errorBodyRule reads the parsed error type/code/message plus the whole
-// lowercased body for one wire.
+// errorBodyRule reads parsed diagnostic fields and a bounded lowercased fallback
+// only when the response body is not structured JSON.
 type errorBodyRule func(atype, code, msg, bodyLower string) errorVerdict
 
 // anthropicErrorVerdict: a known request-shape phrase is permanent; the
 // documented transient Anthropic error types are transient. api_error is too
 // generic to override a 4xx status, so it is not listed here.
-func anthropicErrorVerdict(atype, _, _, bodyLower string) errorVerdict {
-	if anyContains(bodyLower, requestShapeSigs) {
+func anthropicErrorVerdict(atype, code, msg, bodyLower string) errorVerdict {
+	if anyContains(strings.ToLower(atype+" "+code+" "+msg)+bodyLower, requestShapeSigs) {
 		return verdictPermanent
 	}
 	switch atype {
@@ -192,7 +192,12 @@ func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, rule errorBodyR
 		return failure{status: http.StatusBadGateway, atype: "api_error", code: "upstream_redirect_" + itoa(st),
 			message: "upstream redirected to " + redirectTarget(resp.Header.Get("Location")) + "; fix PROXY_UPSTREAM_URL (redirects are not followed)"}
 	}
-	body := strings.ToLower(string(b))
+	var body string
+	if !json.Valid(b) {
+		// Plain-text and HTML gateways still need the legacy diagnostic fallback.
+		// The caller already bounds b; JSON metadata must not override error fields.
+		body = strings.ToLower(string(b))
+	}
 	ra := retryAfterSeconds(resp.Header.Get("Retry-After"))
 
 	var ae struct {
@@ -338,7 +343,7 @@ func retryAfterSeconds(v string) int {
 	if n := atoiSafe(v); n > 0 {
 		return n
 	}
-	t, err := time.Parse(http.TimeFormat, v)
+	t, err := http.ParseTime(v)
 	if err != nil {
 		return 0
 	}

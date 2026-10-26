@@ -237,6 +237,47 @@ func TestGeminiRetryInfoBackoff(t *testing.T) {
 	}
 }
 
+func TestGeminiRetryInfoProtoJSONAliases(t *testing.T) {
+	for _, tc := range []struct {
+		fields string
+		want   int
+	}{
+		{`"retryDelay":"23s"`, 23},
+		{`"retry_delay":"23s"`, 23},
+		{`"retryDelay":"99s","retry_delay":"23s"`, 23},
+		{`"retry_delay":"99s","retryDelay":"23s"`, 23},
+		{`"retryDelay":"99s","retryDelay":"23s"`, 23},
+		{`"retryDelay":"99s","retry_delay":null`, 0},
+		{`"retry_delay":"99s","retryDelay":null`, 0},
+		{`"retry_delay":"null"`, 0},
+		{`"retry_delay":23`, 0},
+		{`"retry_delay":{"seconds":23}`, 0},
+	} {
+		t.Run(tc.fields, func(t *testing.T) {
+			body := `{"error":{"code":"4.29e2","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo",` + tc.fields + `}]}}`
+			f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: 429}, []byte(body))
+			if !f.transient || f.retryAfter != tc.want {
+				t.Fatalf("HTTP alias cooldown=%d, want %d: %+v", f.retryAfter, tc.want, f)
+			}
+			sse := classifyGeminiSSEError(body)
+			if sse == nil || !sse.transient || sse.retryAfter != tc.want || origStatusOf(*sse) != 429 {
+				t.Fatalf("SSE alias cooldown/status changed: %+v, want %d", sse, tc.want)
+			}
+		})
+	}
+	for _, fields := range []string{
+		`"quota_id":"GenerateRequestsPerDay"`,
+		`"quotaId":"GenerateRequestsPerMinute","quota_id":"GenerateRequestsPerDay"`,
+		`"quota_id":"GenerateRequestsPerMinute","quotaId":"GenerateRequestsPerDay"`,
+	} {
+		body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{` + fields + `}]}]}}`
+		f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: 429}, []byte(body))
+		if f.transient {
+			t.Fatalf("daily quota alias lost permanent verdict: %s: %+v", body, f)
+		}
+	}
+}
+
 func TestClassifyGeminiSSEError(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -316,7 +357,7 @@ func TestClassifyGeminiSSEErrorLogsRealStatusOfRetried4xx(t *testing.T) {
 func TestGeminiMalformedErrors(t *testing.T) {
 	for _, body := range []string{
 		"", "not JSON", `{"error":`, `[]`, `null`, `{}`, `{"error":null}`,
-		`{"error":"broken"}`, `{"error":{"code":"400"}}`,
+		`{"error":"broken"}`, `{"error":{"code":"null"}}`, `{"error":{"code":2147483648}}`,
 		`{"error":{"status":400}}`, `{"error":{"message":false}}`,
 	} {
 		t.Run(body, func(t *testing.T) {
@@ -358,6 +399,27 @@ func TestGeminiNonEnvelopeBodyUsesSharedVerdict(t *testing.T) {
 			f := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: tc.http}, []byte(tc.body))
 			if f.transient != tc.transient || f.status != tc.status || f.code != tc.code {
 				t.Fatalf("want transient=%v status=%d code=%s, got %+v", tc.transient, tc.status, tc.code, f)
+			}
+		})
+	}
+}
+
+func TestGeminiDuplicateErrorReplacesFallbackDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		transient  bool
+	}{
+		{"discarded message", `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"prompt is too long"},"error":{"code":429}}`, 429, true},
+		{"discarded type", `{"error":{"code":400,"type":"overloaded_error"},"error":{"code":400}}`, 400, false},
+		{"selected type", `{"error":{"code":400,"message":"prompt is too long"},"error":{"code":400,"type":"overloaded_error","message":"busy"}}`, 400, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			httpFailure := classifyGeminiHTTPErrorBytes(&http.Response{StatusCode: tc.status}, []byte(tc.body))
+			for _, f := range []*failure{&httpFailure, classifyGeminiSSEError(tc.body)} {
+				if f == nil || f.transient != tc.transient || f.message == "prompt is too long" {
+					t.Fatalf("discarded error fields affected classification: %+v", f)
+				}
 			}
 		})
 	}

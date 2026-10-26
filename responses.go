@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"io"
@@ -233,73 +232,106 @@ func replayResponsesReader(r io.Reader, w io.Writer, maxGroupBytes int) error {
 		return err
 	}
 	c := responsesReplayCoalescer{w: w, maxGroupBytes: maxGroupBytes}
-	br := bufio.NewReaderSize(r, 32*1024)
-	initialFrameCap := maxGroupBytes
-	if initialFrameCap > 32*1024 {
-		initialFrameCap = 32 * 1024
-	}
-	frame := make([]byte, 0, initialFrameCap)
+	frame := make([]byte, 0, min(maxGroupBytes, 32*1024))
 	passthrough := false
-	for {
-		chunk, readErr := br.ReadSlice('\n')
-		if len(chunk) > 0 {
-			frameDone := readErr != bufio.ErrBufferFull && responsesBlankSSELine(chunk)
-			switch {
-			case passthrough:
-				if err := writeResponsesReplayBytes(w, chunk); err != nil {
-					return err
-				}
-			case len(frame)+len(chunk) > maxGroupBytes:
-				if err := c.flush(); err != nil {
-					return err
-				}
-				if err := writeResponsesReplayBytes(w, frame); err != nil {
-					return err
-				}
-				frame = frame[:0]
-				if err := writeResponsesReplayBytes(w, chunk); err != nil {
-					return err
-				}
-				passthrough = true
-			default:
-				frame = append(frame, chunk...)
+	appendBytes := func(chunk []byte) error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		if !passthrough && len(frame)+len(chunk) > maxGroupBytes {
+			if err := c.flush(); err != nil {
+				return err
 			}
-			if frameDone {
-				if !passthrough {
-					if err := c.acceptFrame(frame); err != nil {
-						return err
-					}
-				}
-				frame = frame[:0]
-				passthrough = false
+			if err := writeResponsesReplayBytes(w, frame); err != nil {
+				return err
+			}
+			frame = frame[:0]
+			passthrough = true
+		}
+		if passthrough {
+			return writeResponsesReplayBytes(w, chunk)
+		}
+		frame = append(frame, chunk...)
+		return nil
+	}
+	finishFrame := func() error {
+		if !passthrough {
+			if err := c.acceptFrame(frame); err != nil {
+				return err
 			}
 		}
-		if readErr != nil {
-			switch readErr {
-			case bufio.ErrBufferFull:
-				continue
-			case io.EOF:
-				// A spool normally ends on an SSE blank line because it contains only
-				// events emitted by sseParser. Preserve a defensive unterminated tail
-				// as an opaque barrier instead of dropping it.
-				if len(frame) > 0 {
-					if err := c.flush(); err != nil {
-						return err
-					}
-					if err := writeResponsesReplayBytes(w, frame); err != nil {
-						return err
-					}
+		frame = frame[:0]
+		passthrough = false
+		return nil
+	}
+	var buf [32 * 1024]byte
+	lineHasData, pendingCR, frameDone := false, false, false
+	for {
+		n, readErr := r.Read(buf[:])
+		start := 0
+		for i, b := range buf[:n] {
+			if pendingCR {
+				pendingCR = false
+				end := i
+				if b == '\n' {
+					end++
 				}
-				return c.flush()
+				if frameDone {
+					if err := appendBytes(buf[start:end]); err != nil {
+						return err
+					}
+					if err := finishFrame(); err != nil {
+						return err
+					}
+					start, frameDone = end, false
+				}
+				if b == '\n' {
+					continue
+				}
+			}
+			switch b {
+			case '\r':
+				// Keep a following LF in the same raw frame across reader chunks.
+				pendingCR, frameDone = true, !lineHasData
+				lineHasData = false
+			case '\n':
+				if !lineHasData {
+					if err := appendBytes(buf[start : i+1]); err != nil {
+						return err
+					}
+					if err := finishFrame(); err != nil {
+						return err
+					}
+					start = i + 1
+				}
+				lineHasData = false
 			default:
+				lineHasData = true
+			}
+		}
+		if err := appendBytes(buf[start:n]); err != nil {
+			return err
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
 				return readErr
 			}
+			if pendingCR && frameDone {
+				if err := finishFrame(); err != nil {
+					return err
+				}
+			}
+			// Preserve a defensive unterminated tail as an opaque barrier.
+			if err := c.flush(); err != nil {
+				return err
+			}
+			return writeResponsesReplayBytes(w, frame)
 		}
 	}
 }
 
 func (c *responsesReplayCoalescer) acceptFrame(raw []byte) error {
-	events := (&sseParser{}).feed(raw)
+	events := (&sseParser{}).feedChunk(raw, true)
 	if len(events) != 1 || len(events[0].raw) != len(raw) {
 		if err := c.flush(); err != nil {
 			return err
@@ -307,11 +339,6 @@ func (c *responsesReplayCoalescer) acceptFrame(raw []byte) error {
 		return writeResponsesReplayBytes(c.w, raw)
 	}
 	return c.accept(events[0])
-}
-
-func responsesBlankSSELine(line []byte) bool {
-	return len(line) == 1 && line[0] == '\n' ||
-		len(line) == 2 && line[0] == '\r' && line[1] == '\n'
 }
 
 func writeResponsesReplayBytes(w io.Writer, p []byte) error {
@@ -413,11 +440,11 @@ func (c *responsesReplayCoalescer) flush() error {
 }
 
 func parseResponsesTextDelta(ev event) (*responsesTextDeltaGroup, bool) {
-	if responsesEventType(ev) != "response.output_text.delta" || !simpleResponsesSSEFrame(ev) {
+	if !simpleResponsesSSEFrame(ev) {
 		return nil, false
 	}
 	fields, ok := decodeUniqueResponsesObject(ev.data)
-	if !ok {
+	if !ok || responsesString(fields["type"]) != "response.output_text.delta" {
 		return nil, false
 	}
 	for key := range fields {
@@ -485,6 +512,13 @@ func parseResponsesTextDelta(ev event) (*responsesTextDeltaGroup, bool) {
 // of their text. Treat a duplicate key at any depth as an opaque ordering
 // barrier instead.
 func decodeUniqueResponsesObject(data string) (map[string]json.RawMessage, bool) {
+	return decodeResponsesObject(data, true)
+}
+
+// Envelope duplicates are invalid only for fields recognized by Codex. Nested
+// response/error/item values are opaque until snapshot validation; coalescing
+// instead requires every key to be unique so it never rewrites ambiguous data.
+func decodeResponsesObject(data string, uniqueNested bool) (map[string]json.RawMessage, bool) {
 	if !validResponsesJSONUnicode(data) {
 		return nil, false
 	}
@@ -505,13 +539,20 @@ func decodeUniqueResponsesObject(data string) (map[string]json.RawMessage, bool)
 			return nil, false
 		}
 		if _, duplicate := fields[key]; duplicate {
-			return nil, false
+			if uniqueNested {
+				return nil, false
+			}
+			switch key {
+			case "type", "headers", "metadata", "response", "error", "item", "item_id",
+				"call_id", "delta", "text", "summary_index", "content_index", "safety_buffering":
+				return nil, false
+			}
 		}
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
 			return nil, false
 		}
-		if !uniqueResponsesJSONValue(string(value)) {
+		if uniqueNested && !uniqueResponsesJSONValue(string(value)) {
 			return nil, false
 		}
 		fields[key] = value
@@ -677,6 +718,7 @@ func (g *responsesTextDeltaGroup) merge(next *responsesTextDeltaGroup) {
 // Responses frames contain exactly one optional event field and one data field.
 func simpleResponsesSSEFrame(ev event) bool {
 	raw := strings.ReplaceAll(string(ev.raw), "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
 	eventLines, dataLines := 0, 0
 	for _, line := range strings.Split(raw, "\n") {
 		if line == "" {
@@ -741,48 +783,55 @@ func (o *openaiWire) keepalive() []byte {
 // it to a retry (which may fetch a clean terminal) avoids logging a hollow success and
 // cannot loop a legitimate stream, which never emits one.
 func responsesCompletedValid(ev event) bool {
-	var m struct {
-		Response *struct {
-			ID    string `json:"id"`
-			Usage *struct {
-				Input        *int64 `json:"input_tokens"`
-				Output       *int64 `json:"output_tokens"`
-				Total        *int64 `json:"total_tokens"`
-				InputDetails *struct {
-					Cached *int64 `json:"cached_tokens"`
-				} `json:"input_tokens_details"`
-				OutputDetails *struct {
-					Reasoning *int64 `json:"reasoning_tokens"`
-				} `json:"output_tokens_details"`
-			} `json:"usage"`
-		} `json:"response"`
-	}
-	// A non-string id or non-integer usage field fails the unmarshal outright, exactly
-	// as it fails Codex's typed parse.
-	if json.Unmarshal([]byte(ev.data), &m) != nil || m.Response == nil || m.Response.ID == "" {
+	fields, ok := decodeResponsesObject(ev.data, false)
+	if !ok || !uniqueResponsesJSONValue(string(fields["response"])) {
 		return false
 	}
-	// Unmarshal above enforces JSON's nesting bound before the recursive key
-	// check. Go otherwise accepts duplicate keys and replaces malformed Unicode;
-	// Codex's typed Serde parser rejects them.
-	if !validResponsesJSONUnicode(ev.data) || !uniqueResponsesJSONValue(ev.data) {
+	response := responsesObject(fields["response"])
+	if responsesString(response["id"]) == "" {
 		return false
 	}
-	if u := m.Response.Usage; u != nil {
-		if u.Input == nil || u.Output == nil || u.Total == nil {
+	usageRaw := response["usage"]
+	if len(usageRaw) == 0 || string(usageRaw) == "null" {
+		return true
+	}
+	usage := responsesObject(usageRaw)
+	for _, key := range [...]string{"input_tokens", "output_tokens", "total_tokens"} {
+		if !responsesRequiredInteger(usage[key]) {
 			return false
 		}
-		// The *_details objects are optional, but Codex's structs make their fields
-		// required when the object is present — so `input_tokens_details: {}` fails
-		// Codex's parse. Mirror that: reject a present detail object missing its field.
-		if u.InputDetails != nil && u.InputDetails.Cached == nil {
-			return false
-		}
-		if u.OutputDetails != nil && u.OutputDetails.Reasoning == nil {
+	}
+	for _, detail := range [...]struct{ object, field string }{
+		{"input_tokens_details", "cached_tokens"},
+		{"output_tokens_details", "reasoning_tokens"},
+	} {
+		raw := usage[detail.object]
+		if len(raw) != 0 && string(raw) != "null" && !responsesRequiredInteger(responsesObject(raw)[detail.field]) {
 			return false
 		}
 	}
 	return true
+}
+
+// Maps keep protocol field names case-sensitive, unlike Go's struct decoder.
+// Callers validate JSON syntax and duplicate keys before interpreting snapshots.
+func responsesObject(raw json.RawMessage) map[string]json.RawMessage {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	return fields
+}
+
+func responsesString(raw json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
+func responsesRequiredInteger(raw json.RawMessage) bool {
+	var value *int64
+	return json.Unmarshal(raw, &value) == nil && value != nil
 }
 
 // responsesTerminalValid applies Codex's terminal parse. Codex reads an
@@ -791,14 +840,10 @@ func responsesCompletedValid(ev event) bool {
 // ResponseIncomplete, built without that parse.
 func responsesTerminalValid(ev event, t string) bool {
 	if t == "response.incomplete" {
-		var m struct {
-			Response struct {
-				IncompleteDetails struct {
-					Reason string `json:"reason"`
-				} `json:"incomplete_details"`
-			} `json:"response"`
-		}
-		if json.Unmarshal([]byte(ev.data), &m) != nil || m.Response.IncompleteDetails.Reason != "interrupted" {
+		fields := responsesObject(json.RawMessage(ev.data))
+		response := responsesObject(fields["response"])
+		details := responsesObject(response["incomplete_details"])
+		if responsesString(details["reason"]) != "interrupted" {
 			return true
 		}
 	}
@@ -876,22 +921,19 @@ func classifyResponsesFrame(ev event, t string) (fail *failure, native bool) {
 // which may carry the fields at the top level (standard) or nested under `error`
 // (the variant some gateways emit).
 func parseResponsesError(ev event, t string) (typ, code, msg string) {
+	fields := responsesObject(json.RawMessage(ev.data))
 	if t == "response.failed" {
-		var e struct {
-			Response struct {
-				Error struct{ Type, Code, Message string } `json:"error"`
-			} `json:"response"`
-		}
-		_ = json.Unmarshal([]byte(ev.data), &e)
-		return e.Response.Error.Type, e.Response.Error.Code, e.Response.Error.Message
+		fields = responsesObject(fields["response"])
 	}
-	var e struct {
-		Code    string                               `json:"code"`    // standard: top-level
-		Message string                               `json:"message"` // standard: top-level
-		Error   struct{ Type, Code, Message string } `json:"error"`   // gateway: nested
+	errFields := responsesObject(fields["error"])
+	typ = responsesString(errFields["type"])
+	code = responsesString(errFields["code"])
+	msg = responsesString(errFields["message"])
+	if t != "response.failed" {
+		code = firstNonEmpty(code, responsesString(fields["code"]))
+		msg = firstNonEmpty(msg, responsesString(fields["message"]))
 	}
-	_ = json.Unmarshal([]byte(ev.data), &e)
-	return e.Error.Type, firstNonEmpty(e.Error.Code, e.Code), firstNonEmpty(e.Error.Message, e.Message)
+	return typ, code, msg
 }
 
 // isCodexRecoverableError reports whether a terminal error is one Codex handles
@@ -928,13 +970,31 @@ func firstNonEmpty(a, b string) string {
 // mis-reading a generic `event: message` frame (whose real kind is in JSON) or
 // crediting a type to a frame Codex cannot classify.
 func responsesEventType(ev event) string {
-	var t struct {
-		Type string `json:"type"`
+	fields, ok := decodeResponsesObject(ev.data, false)
+	if !ok {
+		return ""
 	}
-	if json.Unmarshal([]byte(ev.data), &t) == nil {
-		return t.Type
+	typ := responsesString(fields["type"])
+	if typ == "" {
+		return ""
 	}
-	return ""
+	// These are the typed optional fields in Codex's ResponsesStreamEvent.
+	// A wrong type invalidates the whole envelope, including terminal/error
+	// events. Unknown keys and arbitrary JSON response/item/error values remain
+	// opaque here; an actual completion snapshot is checked separately.
+	for _, key := range [...]string{"item_id", "call_id", "delta", "text"} {
+		var value *string
+		if raw, present := fields[key]; present && json.Unmarshal(raw, &value) != nil {
+			return ""
+		}
+	}
+	for _, key := range [...]string{"summary_index", "content_index"} {
+		var value *int64
+		if raw, present := fields[key]; present && json.Unmarshal(raw, &value) != nil {
+			return ""
+		}
+	}
+	return typ
 }
 
 // responsesFault is the retry-relevant identity of an OpenAI error, read once by
@@ -1135,6 +1195,7 @@ func isResponsesRequestShapeCode(code string) bool {
 	case "context_length_exceeded", "string_above_max_length", "invalid_prompt",
 		"invalid_image", "invalid_image_format", "invalid_image_url",
 		"invalid_base64_image", "image_parse_error", "image_too_large",
+		"invalid_image_mode", "empty_image_file",
 		"unknown_parameter", "unsupported_parameter", "missing_required_parameter",
 		"model_not_found", "unsupported_value", "invalid_type",
 		// Deterministic policy blocks: Codex maps these to non-retryable

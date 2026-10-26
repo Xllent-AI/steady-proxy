@@ -46,7 +46,9 @@ Writing `200 OK` response headers is the **commit point**. Once headers are sent
 
 Because Gemini SSE has no dedicated terminal event, the proxy waits for clean EOF after all requested `candidateCount` candidates report a `finishReason`, preserving trailing usage-metadata frames (SSE control frames and empty data messages do not advance candidate completion). `generationConfig` / `generation_config` settings accept ProtoJSON camelCase or `snake_case` in JSON field order (later objects replace earlier ones), and candidate counts accept quoted integers, exponents, and `.0` fractions without mutating the request body.
 
-Missing candidates, truncated frames, contradictory prompt blocks (a block accompanied by candidates), and read errors fail the attempt. Native `MAX_TOKENS`, safety stops, and standalone prompt blocks are valid completions and are delivered as-is.
+Interpreted response/error fields also accept ProtoJSON camelCase and original `snake_case` names. Integer fields accept quoted, null, and integral decimal/exponent forms within the signed 32-bit range; finish/block enums accept names or numbers. Numeric reasons whose names differ between the Developer API and Vertex remain numeric in diagnostics rather than guessing the service. Duplicate recognized fields and aliases replace earlier values in wire order, including null resets. Payload bytes are not rewritten.
+
+Missing candidates, truncated frames, new content for an already finished candidate, contradictory prompt blocks (a block accompanied by candidates), and read errors fail the attempt. Metadata-only tails remain valid. Native `MAX_TOKENS`, safety stops, and standalone prompt blocks are valid completions and are delivered as-is.
 
 ### One window per client request
 
@@ -98,10 +100,15 @@ Claude Code's Workflow `agent()` runtime enforces a per-agent content-stall watc
 
 When the proxy detects the Workflow system-prompt marker (`workflow orchestration script` inside `system`), it labels the request `/wf` in the logs and uses `PROXY_WORKFLOW_KEEPALIVE_MS` (default 10s) instead of the 4-minute window. Once 10s have elapsed and forwardable content is buffered, the proxy commits and streams live. If the upstream model itself goes silent for longer than the script's `stallMs`, raise `stallMs` in the workflow script (e.g., `agent(prompt, {stallMs: 300000})`).
 
+At Workflow cutover, buffered and subsequent tool-input fragments are forwarded immediately rather than held until the tool block ends. Consumers must accumulate these fragments before parsing the tool arguments. A response that completes while still buffered retains tool-JSON coalescing; ordinary main-session normalization is unchanged.
+
 ## Stream validation and replay
 
-- **Anthropic Messages:** Validates event sequence, event JSON, and accumulated `tool_use` / `server_tool_use` input JSON before replaying a buffered stream. Fragmented `input_json_delta` chunks are coalesced into a single valid JSON delta per tool block; tool input cut off by `stop_reason: "max_tokens"` is delivered as the upstream sent it. Zero-placeholder `message_start` token counts are backfilled per field from non-zero `message_delta` usage.
+The shared parser accepts LF, CRLF, or CR line endings and one leading UTF-8 BOM, including split chunk boundaries. Event-size limits apply to the original wire bytes.
+
+- **Anthropic Messages:** Validates event sequence, event JSON, and accumulated `tool_use` / `server_tool_use` input JSON before replaying a buffered stream. JSON validation also runs on live output independently of normalization. Fragmented `input_json_delta` chunks are coalesced per tool block, except on Workflow live cutover; tool input cut off by `max_tokens` or `model_context_window_exceeded` is delivered rather than rejected. Zero-placeholder `message_start` token counts are backfilled per field from non-zero `message_delta` usage.
 - **OpenAI Responses:** Requires a valid `response.completed` event (with non-empty string `id` and complete integer usage fields when present) or a `response.incomplete` event, which is delivered as the upstream's answer (an `interrupted` one must pass the `response.completed` check, because Codex parses it as a completion). During buffered/prefix replay, adjacent compatible `response.output_text.delta` frames are merged up to `PROXY_RESPONSES_REPLAY_DELTA_BYTES` (64 KiB) to avoid flooding the client queue; a merged frame carries the last merged frame's `sequence_number`, so the numbers skip, and frames with logprobs or mismatched metadata stay untouched.
+  Terminal recognition uses exact JSON keys and typed envelope fields. Malformed envelopes are forwarded but cannot end the stream; a parseable completion envelope with an invalid snapshot fails instead of hiding later output.
 - **Gemini SSE:** Validates JSON framing, candidate `finishReason` completion, and absence of in-band error objects, then replays each event's original bytes unchanged. Standalone SSE comment frames from the upstream are not replayed on any route; the proxy sends its own keepalives in live mode.
 
 See [Stream processing](CONFIGURATION.md#stream-processing) to tune or disable these checks.
