@@ -82,31 +82,31 @@ import (
 )
 
 type config struct {
-	listenAddr           string
-	upstream             string // scheme://host[:port], no trailing slash
-	upstreamHost         string
-	maxBufferMem         int64
-	maxResponseBytes     int64
-	maxRequestBytes      int64
-	respHeaderTO         time.Duration
-	upstreamByteIdle     time.Duration
-	keepaliveMs          time.Duration
-	wfKeepaliveMs        time.Duration
-	responsesKeepaliveMs time.Duration
-	responsesBufferMs    time.Duration
-	geminiBufferMs       time.Duration
-	responsesEarlyCommit bool // Responses (Codex): commit on first output (default); false = buffer to terminal under responsesBufferMs, like /v1/messages
-	responsesReplayBytes int  // Responses buffered/prefix replay: coalesce adjacent output_text.delta events up to this many source JSON bytes; 0 = raw replay
-	maxRequestDur        time.Duration
-	sdkRetryCap          int
-	txLocalRetries       int
-	localBackoffCap      time.Duration
-	spoolDir             string
-	requestLogDir        string // when non-empty, save each request/response to a file here
-	validateJSON         bool
-	normalizeToolJSON    bool
-	refusalFallback      string // model to re-issue with when a model refusal/safeguard is detected; "" = feature off
-	verbose              bool
+	listenAddr             string
+	upstream               string // scheme://host[:port], no trailing slash
+	upstreamHost           string
+	maxBufferMem           int64
+	maxResponseBytes       int64
+	maxRequestBytes        int64
+	respHeaderTO           time.Duration
+	upstreamByteIdle       time.Duration
+	keepaliveMs            time.Duration
+	wfKeepaliveMs          time.Duration
+	responsesKeepaliveMs   time.Duration
+	responsesBufferMs      time.Duration
+	geminiBufferMs         time.Duration
+	responsesEarlyCommit   bool // Responses (Codex): commit on first output (default); false = buffer to terminal under responsesBufferMs, like /v1/messages
+	responsesReplayBytes   int  // Responses buffered/prefix replay: coalesce adjacent output_text.delta events up to this many source JSON bytes; 0 = raw replay
+	maxRequestDur          time.Duration
+	sdkRetryCap            int
+	txLocalRetries         int
+	localBackoffCap        time.Duration
+	spoolDir               string
+	requestLogDir          string // when non-empty, save each request/response to a file here
+	validateJSON           bool
+	normalizeToolJSON      bool
+	claudeRefusalFallbacks []string // ordered Claude-only alternatives; nil disables fallback
+	verbose                bool
 }
 
 // loadConfig reads every PROXY_* variable from the process environment. It
@@ -122,32 +122,36 @@ func parseConfig(lookup func(string) (string, bool)) (config, error) {
 	if err != nil {
 		e.errs = append(e.errs, err.Error())
 	}
+	fallbacks, err := loadClaudeRefusalFallbacks(lookup)
+	if err != nil {
+		e.errs = append(e.errs, err.Error())
+	}
 	c := config{
-		upstream:             up,
-		upstreamHost:         host,
-		listenAddr:           e.str("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
-		maxBufferMem:         e.int64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20, 0),               // 1 MiB in RAM, then temp file
-		maxResponseBytes:     e.int64("PROXY_MAX_RESPONSE_BYTES", 128<<20, 1),               // 128 MiB hard cap
-		maxRequestBytes:      e.int64("PROXY_MAX_REQUEST_BYTES", 64<<20, 1),                 // 64 MiB request cap
-		respHeaderTO:         e.ms("PROXY_RESP_HEADER_TIMEOUT_MS", 60000, 0),                // wait for upstream status line
-		upstreamByteIdle:     e.ms("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000, 1),                // abort+retry a wedged silent upstream
-		keepaliveMs:          e.ms("PROXY_KEEPALIVE_MS", 240000, 0),                         // transactional window before live streaming; client header/idle timeouts must exceed it. 0 disables the timed switch.
-		wfKeepaliveMs:        e.ms("PROXY_WORKFLOW_KEEPALIVE_MS", 10000, 0),                 // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
-		responsesKeepaliveMs: e.ms("PROXY_RESPONSES_KEEPALIVE_MS", 30000, 0),                // OpenAI Responses route (Codex), applies ONLY in early-commit mode: bounds a silent start (reasoning with no output) before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead (see config.keepaliveWindow). Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
-		responsesBufferMs:    e.ms("PROXY_RESPONSES_BUFFER_MS", 240000, 0),                  // Responses (Codex) hold used ONLY when early-commit is off: buffer to the terminal, committing live at this window as a safety valve (the /v1/messages policy applied to Responses). Responses-OWNED — independent of PROXY_KEEPALIVE_MS — so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it (nothing is forwarded while buffering).
-		geminiBufferMs:       e.ms("PROXY_GEMINI_BUFFER_MS", 240000, 0),                     // Gemini buffers through clean EOF; 0 disables the timed switch to live output.
-		responsesEarlyCommit: e.str("PROXY_RESPONSES_EARLY_COMMIT", "1") != "0",             // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
-		responsesReplayBytes: int(e.int64("PROXY_RESPONSES_REPLAY_DELTA_BYTES", 64<<10, 0)), // collapse tiny adjacent Codex text deltas during buffered/prefix replay so a completed turn cannot burst thousands of app-server notifications into the TUI; 0 preserves byte-for-byte replay. Live events remain untouched.
-		maxRequestDur:        e.ms("PROXY_MAX_REQUEST_DURATION_MS", 1500000, 1),             // whole-request ceiling, including local retries (25m)
-		sdkRetryCap:          int(e.int64("PROXY_SDK_RETRY_CAP", 100, 0)),                   // backstop only; Claude Code's own retry cap still applies
-		txLocalRetries:       int(e.int64("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0, 0)),
-		localBackoffCap:      e.ms("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000, 0),
-		spoolDir:             e.str("PROXY_SPOOL_DIR", os.TempDir()),
-		requestLogDir:        e.str("PROXY_REQUEST_LOG_DIR", ""),             // "" = disabled; set a dir to save each request/response archive
-		validateJSON:         e.str("PROXY_VALIDATE_JSON", "1") != "0",       // default on
-		normalizeToolJSON:    e.str("PROXY_NORMALIZE_TOOL_JSON", "1") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
-		refusalFallback:      loadRefusalFallback(lookup),                    // default claude-opus-5; off/none/empty disables
-		verbose:              e.str("PROXY_VERBOSE", "") == "1",
+		upstream:               up,
+		upstreamHost:           host,
+		listenAddr:             e.str("PROXY_LISTEN_ADDR", "127.0.0.1:8789"),
+		maxBufferMem:           e.int64("PROXY_MAX_BUFFER_MEM_BYTES", 1<<20, 0),               // 1 MiB in RAM, then temp file
+		maxResponseBytes:       e.int64("PROXY_MAX_RESPONSE_BYTES", 128<<20, 1),               // 128 MiB hard cap
+		maxRequestBytes:        e.int64("PROXY_MAX_REQUEST_BYTES", 64<<20, 1),                 // 64 MiB request cap
+		respHeaderTO:           e.ms("PROXY_RESP_HEADER_TIMEOUT_MS", 60000, 0),                // wait for upstream status line
+		upstreamByteIdle:       e.ms("PROXY_UPSTREAM_BYTE_IDLE_MS", 600000, 1),                // abort+retry a wedged silent upstream
+		keepaliveMs:            e.ms("PROXY_KEEPALIVE_MS", 240000, 0),                         // transactional window before live streaming; client header/idle timeouts must exceed it. 0 disables the timed switch.
+		wfKeepaliveMs:          e.ms("PROXY_WORKFLOW_KEEPALIVE_MS", 10000, 0),                 // SMALL window applied ONLY to Workflow-tool agents (see isWorkflowAgent): commit early + stream live so forwarded deltas feed their per-agent stall watchdog (default 180s, no global env override). The watchdog kills on a forwarded-content-delta gap >= stallMs; while buffering the proxy forwards nothing, so the FIRST gap ~= window + upstream TTFB — keep the window small to hold that first gap under stallMs. A large window is not automatically fatal (a steady stream can survive it) but pushes the first gap toward stallMs and delays going live. It CANNOT fix a mid-turn content-silent pause >= stallMs; only a larger per-agent stallMs can. 0 = disable (falls back to full transactional; stall bug returns).
+		responsesKeepaliveMs:   e.ms("PROXY_RESPONSES_KEEPALIVE_MS", 30000, 0),                // OpenAI Responses route (Codex), applies ONLY in early-commit mode: bounds a silent start (reasoning with no output) before committing + streaming keepalives. With early-commit off the route buffers under PROXY_RESPONSES_BUFFER_MS instead (see config.keepaliveWindow). Keep it below the client's stream-idle timeout. Start-of-stream errors (overload/capacity) arrive before any output, so they are always caught pre-commit regardless of this value.
+		responsesBufferMs:      e.ms("PROXY_RESPONSES_BUFFER_MS", 240000, 0),                  // Responses (Codex) hold used ONLY when early-commit is off: buffer to the terminal, committing live at this window as a safety valve (the /v1/messages policy applied to Responses). Responses-OWNED — independent of PROXY_KEEPALIVE_MS — so a mixed Codex+Claude proxy tunes the two horizons separately. The Codex client's stream_idle_timeout_ms must strictly exceed it (nothing is forwarded while buffering).
+		geminiBufferMs:         e.ms("PROXY_GEMINI_BUFFER_MS", 240000, 0),                     // Gemini buffers through clean EOF; 0 disables the timed switch to live output.
+		responsesEarlyCommit:   e.str("PROXY_RESPONSES_EARLY_COMMIT", "1") != "0",             // default on: commit as soon as the first output event is buffered. 0 -> buffer the whole response to response.completed like /v1/messages, under the PROXY_RESPONSES_BUFFER_MS hold (extends hidden-retry protection to mid-stream errors), which needs the Codex client's stream_idle_timeout_ms to exceed that hold.
+		responsesReplayBytes:   int(e.int64("PROXY_RESPONSES_REPLAY_DELTA_BYTES", 64<<10, 0)), // collapse tiny adjacent Codex text deltas during buffered/prefix replay so a completed turn cannot burst thousands of app-server notifications into the TUI; 0 preserves byte-for-byte replay. Live events remain untouched.
+		maxRequestDur:          e.ms("PROXY_MAX_REQUEST_DURATION_MS", 1500000, 1),             // whole-request ceiling, including local retries (25m)
+		sdkRetryCap:            int(e.int64("PROXY_SDK_RETRY_CAP", 100, 0)),                   // backstop only; Claude Code's own retry cap still applies
+		txLocalRetries:         int(e.int64("PROXY_TRANSACTIONAL_LOCAL_RETRIES", 0, 0)),
+		localBackoffCap:        e.ms("PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS", 10000, 0),
+		spoolDir:               e.str("PROXY_SPOOL_DIR", os.TempDir()),
+		requestLogDir:          e.str("PROXY_REQUEST_LOG_DIR", ""),             // "" = disabled; set a dir to save each request/response archive
+		validateJSON:           e.str("PROXY_VALIDATE_JSON", "1") != "0",       // default on
+		normalizeToolJSON:      e.str("PROXY_NORMALIZE_TOOL_JSON", "1") != "0", // default on: coalesce tool_use input_json_delta chunks before downstream forwarding
+		claudeRefusalFallbacks: fallbacks,
+		verbose:                e.str("PROXY_VERBOSE", "") == "1",
 	}
 	if len(e.errs) > 0 {
 		return config{}, errors.New(strings.Join(e.errs, "\n  "))
@@ -217,8 +221,8 @@ func main() {
 		// Per-request read/write deadlines are installed by handle.
 		MaxHeaderBytes: 1 << 20,
 	}
-	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: Messages + Responses + Gemini SSE, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, gemini-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, refusalFallback=%s; one log line per request)",
-		currentVersion().token(), cfg.listenAddr, redactedUpstreamURL("", ""), cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.geminiBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.refusalFallback))
+	log.Printf(programName+" %s listening on http://%s -> %s  (transactional: Messages + Responses + Gemini SSE, keepalive=%s, wf-keepalive=%s, responses-keepalive=%s, responses-buffer=%s, gemini-buffer=%s, responses-early-commit=%v, responses-replay-delta=%dB, sdkRetryCap=%d, txLocalRetries=%d, claudeRefusalFallbacks=%s; one log line per request)",
+		currentVersion().token(), cfg.listenAddr, redactedUpstreamURL("", ""), cfg.keepaliveMs, cfg.wfKeepaliveMs, cfg.responsesKeepaliveMs, cfg.responsesBufferMs, cfg.geminiBufferMs, cfg.responsesEarlyCommit, cfg.responsesReplayBytes, cfg.sdkRetryCap, cfg.txLocalRetries, refusalFallbackDesc(cfg.claudeRefusalFallbacks))
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -325,12 +329,32 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	proxyRetries := 0
 	reqWho := who(r, body)
 	reqEffort := reasoningEffortOf(r.URL.Path, body)
-	// legacyFastUsed tracks whether the CURRENT request body has already spent its
-	// one free fast local retry (the txLocalRetries==0 legacy path). It replaces a
-	// bare localAttempt==0 check so a refusal→fallback model swap — which begins a
-	// new logical request — resets it and lets the fallback attempt earn its own
-	// free fast retry instead of surfacing a 503 that resends the refusing body.
+	// A single fast retry is shared across the request, including fallback models.
 	legacyFastUsed := false
+	firstWho := reqWho
+	firstModel := modelOf(body)
+	modelChain := firstModel
+	fallbackIndex := 0
+	nextFallback := func() string {
+		for fallbackIndex < len(cfg.claudeRefusalFallbacks) {
+			model := cfg.claudeRefusalFallbacks[fallbackIndex]
+			if model != firstModel {
+				return model
+			}
+			fallbackIndex++
+		}
+		return ""
+	}
+	interceptRefusal := isMessages && isClaudeModel(firstModel) && nextFallback() != ""
+	// Retain only the original answer. Candidate refusals never replace it.
+	var heldRefusal *bufferedStream
+	var heldSafeguard *failure
+	fallbackActive := func() bool { return heldRefusal != nil || heldSafeguard != nil }
+	defer func() {
+		if heldRefusal != nil {
+			heldRefusal.sp.discard()
+		}
+	}()
 
 	// Workflow-tool agents carry a per-agent "stall" watchdog (default 180s, no
 	// global env override) that aborts a turn streaming no assistant/tool delta for
@@ -358,7 +382,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return false
 	}
 	tryLocalRetry := func(f failure) bool {
-		if cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
+		if fallbackActive() || cfg.txLocalRetries <= 0 || proxyRetries >= cfg.txLocalRetries || !f.transient || !budgetLeft() {
 			return false
 		}
 		wait := localRetryDelay(f.retryAfter, proxyRetries)
@@ -375,60 +399,42 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	swapToFallback := func(reason string, st *captureStats) bool {
+		// All candidates share the original absolute deadlines. Do not issue an
+		// attempt after the buffering window or request lifetime is spent.
+		if ctx.Err() != nil || (!commitBy.IsZero() && !time.Now().Before(commitBy)) {
+			return false
+		}
+		target := nextFallback()
+		if target == "" {
+			return false
+		}
 		from := modelOf(body)
-		swapped, ok := swapModel(body, cfg.refusalFallback)
+		swapped, ok := swapModel(body, target)
 		if !ok {
 			return false
 		}
-		rec.noteModelSwap(reason, from, cfg.refusalFallback)
+		fallbackIndex++
+		rec.noteModelSwap(reason, from, target)
 		if st != nil {
 			log.Printf("WARN  %s%s  %s -> retry with %s  in=%s out=%s tok  %s%s%s",
-				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), reason, cfg.refusalFallback,
+				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), reason, target,
 				htok(st.inTok), htok(st.outTok), since(reqStart), att(retryCount), rec.idField())
 		} else {
 			log.Printf("WARN  %s%s  %s -> retry with %s  %s%s",
-				reqWho, effortField(reqEffort), reason, cfg.refusalFallback, since(reqStart), rec.idField())
+				reqWho, effortField(reqEffort), reason, target, since(reqStart), rec.idField())
 		}
 		body = swapped
-		reqWho = from + "~>" + who(r, body) // keep the requested model visible in every later line
-		// The fallback is a fresh logical request: grant it a full hidden local-retry
-		// budget rather than inheriting what the refusing model already spent. Both
-		// the explicit (proxyRetries) and the legacy (legacyFastUsed) budgets reset so
-		// a transient fallback fault is retried locally instead of surfacing a 503 that
-		// resends the original refusing body. Bounded: the swap happens at most once.
-		proxyRetries = 0
-		legacyFastUsed = false
+		reqWho = modelChain + "~>" + who(r, body)
+		modelChain += "~>" + target
 		return true
 	}
+	advanceFallback := func(f failure, st *captureStats) bool {
+		return fallbackActive() && claudeFallbackAction(f) == fallbackNext && swapToFallback(f.code, st)
+	}
 
-	// A refusal fallback is best-effort: the refusing model's own answer (a
-	// complete refusal stream or a safeguard error) is held while the fallback is
-	// tried, and delivered if the fallback cannot answer.
-	var heldRefusal *bufferedStream
-	var heldSafeguard *failure
-	defer func() {
-		if heldRefusal != nil {
-			heldRefusal.sp.discard()
-		}
-	}()
-	firstWho := reqWho
-
-	// With PROXY_TRANSACTIONAL_LOCAL_RETRIES=0, preserve the old behavior:
-	// initial attempt + at most one cheap local retry for fast pre-header faults.
-	// When enabled, use the explicit local retry budget for any transient
-	// uncommitted transactional failure.
+	// The original model retains its normal retry policy. Once fallback starts,
+	// candidates advance without general backoff or fresh per-model retry budgets.
 	for {
-		// Refusal fallback: if a Claude model returns a COMPLETE stream whose
-		// stop_reason is "refusal", re-issue once with the fallback model instead of
-		// handing the refusal back to the client. Arm interception only when a real
-		// substitution is possible — the body names a Claude model other than the
-		// fallback. A concrete model guarantees the later swapModel succeeds, and it
-		// bounds this to a single swap: the retried body targets the fallback model,
-		// so it is never armed again (no recursion). Other vendors' models are never
-		// silently re-routed to a different provider.
-		reqModel := modelOf(body)
-		interceptRefusal := isMessages && cfg.refusalFallback != "" && isClaudeModel(reqModel) && reqModel != cfg.refusalFallback
-
 		rec.beginAttempt(body, reqWho, proxyRetries)
 		resp, started, stopDeadline, rtErr := roundTripBefore(ctx, r, body, commitBy)
 		if rtErr != nil {
@@ -437,7 +443,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			if tryLocalRetry(last) {
 				continue
 			}
-			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second && canWait(250*time.Millisecond) {
+			if (fallbackActive() || cfg.txLocalRetries == 0) && !legacyFastUsed && last.fastRetry && budgetLeft() && time.Since(started) < 3*time.Second && canWait(250*time.Millisecond) {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
@@ -445,22 +451,34 @@ func handle(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				legacyFastUsed = true
+				proxyRetries++
+				continue
+			}
+			if advanceFallback(last, nil) {
 				continue
 			}
 			break
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			last = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec)
-			if interceptRefusal && isModelSafeguardRefusal(last) && swapToFallback("safeguard", nil) {
-				safeguard := last
-				heldSafeguard = &safeguard
+			last = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec, fallbackActive())
+			if interceptRefusal && isModelSafeguardRefusal(last) {
+				if !fallbackActive() {
+					safeguard := last
+					heldSafeguard = &safeguard
+				}
+				if swapToFallback("safeguard", nil) {
+					continue
+				}
+				break
+			}
+			if advanceFallback(last, nil) {
 				continue
 			}
 			if tryLocalRetry(last) {
 				continue
 			}
-			if cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second && canWait(250*time.Millisecond) {
+			if !fallbackActive() && cfg.txLocalRetries == 0 && !legacyFastUsed && last.fastRetry && last.retryAfter == 0 && budgetLeft() && time.Since(started) < 3*time.Second && canWait(250*time.Millisecond) {
 				wait := 250 * time.Millisecond
 				rec.noteAttemptRetry("legacy_fast_retry", wait)
 				logLocalRetry(reqWho, reqEffort, last, wait, 1, 1, retryCount, "legacy-fast")
@@ -468,6 +486,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				legacyFastUsed = true
+				proxyRetries++
 				continue
 			}
 			break
@@ -485,7 +504,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			if readFail != nil {
 				last = *readFail
 				rec.noteAttemptFailure(last, "non_sse_read_error")
-				if tryLocalRetry(last) {
+				if advanceFallback(last, nil) || tryLocalRetry(last) {
 					continue
 				}
 				break
@@ -536,26 +555,28 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 		rec.noteAttemptFailure(*fail, "sse_failure")
 		if st.heldRefusal != nil {
-			// A complete stream that ended in stop_reason="refusal". Nothing was
-			// committed downstream, so swap in the fallback model and re-issue on the
-			// next iteration. This is a substitution, not a transient retry: it does
-			// not consume the local-retry or SDK-retry budget, and it happens at most
-			// once per request (see above).
-			refusal := &bufferedStream{sp: st.heldRefusal, header: resp.Header, wire: wire, st: &st}
+			if !fallbackActive() {
+				heldRefusal = &bufferedStream{sp: st.heldRefusal, header: resp.Header, wire: wire, st: &st}
+			} else {
+				st.heldRefusal.discard()
+			}
 			st.heldRefusal = nil
+			last = *fail
 			if swapToFallback("refusal", &st) {
-				heldRefusal = refusal
 				continue
 			}
-			// The body could not be rewritten: the refusal is still the complete answer.
-			heldRefusal = refusal
-			deliverHeldRefusal(w, heldRefusal, firstWho, reqEffort, reqStart, retryCount, rec, "swap_failed")
-			return
+			break
 		}
-		if !wrote && interceptRefusal && isModelSafeguardRefusal(*fail) && swapToFallback("safeguard", &st) {
-			safeguard := *fail
-			heldSafeguard = &safeguard
-			continue
+		if !wrote && interceptRefusal && isModelSafeguardRefusal(*fail) {
+			if !fallbackActive() {
+				safeguard := *fail
+				heldSafeguard = &safeguard
+			}
+			if swapToFallback("safeguard", &st) {
+				continue
+			}
+			last = *fail
+			break
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
 			if fail.delivered {
@@ -579,25 +600,30 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			panic(http.ErrAbortHandler)
 		}
 		last = *fail
-		if tryLocalRetry(last) {
+		if advanceFallback(last, &st) || tryLocalRetry(last) {
 			continue
 		}
 		break
 	}
+	if ctx.Err() != nil {
+		last = classifyTransport(ctx.Err(), ctx)
+	}
 
-	// FAILED before committing. Retry only what can succeed on a re-send (or until
-	// the backstop); on retry, supply a Retry-After backoff so the client waits.
-	// A held fallback answer is delivered only to a client still waiting for it.
-	canRetry := last.transient && budgetLeft()
-	if !canRetry && r.Context().Err() == nil && (heldRefusal != nil || heldSafeguard != nil) {
-		log.Printf("WARN  %s%s  fallback %s failed: %s -> delivering the original answer  %s%s",
-			reqWho, effortField(reqEffort), cfg.refusalFallback, last.code, since(reqStart), rec.idField())
+	// Never invite the client to restart an exhausted fallback chain. Global
+	// request/account errors remain actionable; candidate failures return the
+	// original answer, and cancellation never replays to a client that has left.
+	canRetry := !fallbackActive() && last.transient && budgetLeft()
+	if fallbackActive() && r.Context().Err() == nil && claudeFallbackAction(last) != fallbackStop {
+		log.Printf("WARN  %s%s  fallback chain failed: %s -> delivering the original answer  %s%s",
+			reqWho, effortField(reqEffort), last.code, since(reqStart), rec.idField())
+		rec.noteProxyRetries(proxyRetries)
 		if heldRefusal != nil {
 			deliverHeldRefusal(w, heldRefusal, firstWho, reqEffort, reqStart, retryCount, rec, last.code)
 			return
 		}
 		last = *heldSafeguard
 		reqWho = firstWho
+		rec.noteDeliveredAnswer(firstWho, nil)
 	}
 	retryAfter := 0
 	if canRetry {
@@ -633,6 +659,7 @@ type bufferedStream struct {
 // deliverHeldRefusal replays the original model's complete refusal exactly as a
 // buffered commit would have, after the fallback model could not answer.
 func deliverHeldRefusal(w http.ResponseWriter, b *bufferedStream, reqWho, reqEffort string, reqStart time.Time, retryCount int, rec *reqRecorder, fallbackCode string) {
+	rec.noteDeliveredAnswer(reqWho, b.st)
 	writeStreamHead(w, b.header, "buffered", b.st)
 	err := b.wire.replayBuffered(b.sp, w, b.st)
 	if fl, ok := w.(http.Flusher); ok {
@@ -673,11 +700,16 @@ func writeFailure(w http.ResponseWriter, r *http.Request, f failure, canRetry bo
 }
 
 // classifyUpstreamHTTPError reads and classifies one non-2xx upstream response,
-// keeping the complete reply when it is the upstream's final answer.
-func classifyUpstreamHTTPError(ctx context.Context, path string, resp *http.Response, rec *reqRecorder) failure {
+// keeping the complete reply when it is the upstream's final answer. A terminal
+// Claude fallback error must remain actionable even if a retry hint says otherwise.
+func classifyUpstreamHTTPError(ctx context.Context, path string, resp *http.Response, rec *reqRecorder, inClaudeFallback bool) failure {
 	b, complete, readErr := readHTTPErrorBody(resp, rec)
 	f := classifyHTTPErrorForPath(ctx, path, resp, b, readErr)
 	f.origStatus = resp.StatusCode
+	if inClaudeFallback && readErr == nil && f.transient && claudeFallbackAction(f) == fallbackStop {
+		f.transient, f.fastRetry = false, false
+		f.status, f.atype = resp.StatusCode, origTypeOf(f)
+	}
 	if !f.transient && readErr == nil && complete && resp.StatusCode >= 400 {
 		f.upstream = &upstreamReply{status: resp.StatusCode, header: resp.Header.Clone(), body: b}
 	}
@@ -804,7 +836,7 @@ func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body
 	case resp.StatusCode == http.StatusNotModified && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		failed = false
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
-		f = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec)
+		f = classifyUpstreamHTTPError(ctx, r.URL.Path, resp, rec, false)
 	default:
 		failed = false
 	}
@@ -1004,7 +1036,7 @@ func whoWithResolvedModel(reqWho, resolvedModel string) string {
 	if reqModel == resolvedModel {
 		return reqWho
 	}
-	if _, fallback, swapped := strings.Cut(reqModel, "~>"); swapped && fallback == resolvedModel {
+	if i := strings.LastIndex(reqModel, "~>"); i >= 0 && reqModel[i+2:] == resolvedModel {
 		return reqWho
 	}
 	if reqModel == "" || reqModel == "?" {
@@ -1185,34 +1217,105 @@ func isClaudeModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "claude")
 }
 
-// isModelSafeguardRefusal catches Fable's pre-stream guardrail shape. Claude Code
-// records these as synthetic API errors, not as the normal SSE
-// message_delta.stop_reason="refusal" path, so the stream-only interception above
-// never sees them. Only a terminal failure qualifies: a transient error that
-// merely mentions the phrase is retried like any other.
+// isModelSafeguardRefusal recognizes terminal API safeguard errors. Structured
+// stream refusals are detected separately via message_delta.stop_reason.
 func isModelSafeguardRefusal(f failure) bool {
-	if f.transient {
+	if f.transient || isClaudeFallbackAccountError(f) {
 		return false
 	}
 	msg := strings.ToLower(f.message)
 	return strings.Contains(msg, "safeguards flagged this message") ||
+		strings.Contains(msg, "safeguards flagged this session") ||
 		strings.Contains(msg, "claude code can't respond to this request with fable")
 }
 
-// loadRefusalFallback resolves the model to re-issue with when a response
-// completes with stop_reason "refusal". Unset -> default claude-opus-5. Set to
-// empty / "off" / "none" / "disabled" -> the feature is off and a refusal is
-// delivered to the client unchanged (the historical behavior).
-func loadRefusalFallback(lookup func(string) (string, bool)) string {
-	v, ok := lookup("PROXY_REFUSAL_FALLBACK_MODEL")
+type claudeFallbackDisposition uint8
+
+const (
+	fallbackStop     claudeFallbackDisposition = iota // preserve an actionable request/account error
+	fallbackNext                                      // try the next candidate, or deliver the original
+	fallbackOriginal                                  // do not change models; deliver the original
+)
+
+func isClaudeFallbackAccountError(f failure) bool {
+	switch origStatusOf(f) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+		return true
+	}
+	switch origTypeOf(f) {
+	case "authentication_error", "billing_error", "permission_error":
+		return true
+	}
+	return false
+}
+
+// claudeFallbackAction applies only after a refusal has started a chain. A
+// changed model can fix availability, not bad credentials or malformed input.
+func claudeFallbackAction(f failure) claudeFallbackDisposition {
+	if isClaudeFallbackAccountError(f) {
+		return fallbackStop
+	}
+	if f.code == refusalFallbackCode || f.code == "sse_stream_disconnect" || isModelSafeguardRefusal(f) {
+		return fallbackNext
+	}
+	errorType := origTypeOf(f)
+	if errorType == "rate_limit_error" {
+		return fallbackOriginal
+	}
+	if origStatusOf(f) == http.StatusNotFound || errorType == "not_found_error" || f.origCode == "model_not_found" || strings.Contains(strings.ToLower(f.message), "model_not_found") {
+		return fallbackNext
+	}
+	if errorType == "invalid_request_error" || errorType == "request_too_large" || origStatusOf(f) == http.StatusRequestEntityTooLarge {
+		return fallbackStop
+	}
+	// Rate limits do not establish independent quota, even with a terminal hint.
+	// A model change cannot fix local storage either.
+	if origStatusOf(f) == http.StatusTooManyRequests || f.code == "spool_error" {
+		return fallbackOriginal
+	}
+	if f.transient {
+		// Attempt-only timeouts may advance; swapToFallback enforces the shared
+		// buffering and request deadlines before issuing another candidate.
+		return fallbackNext
+	}
+	return fallbackStop
+}
+
+// loadClaudeRefusalFallbacks validates and deduplicates the ordered model list
+// once at startup. The removed scalar setting fails loudly rather than silently
+// replacing an operator's choice with the new defaults.
+func loadClaudeRefusalFallbacks(lookup func(string) (string, bool)) ([]string, error) {
+	const key = "PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS"
+	if _, ok := lookup("PROXY_REFUSAL_FALLBACK_MODEL"); ok {
+		return nil, fmt.Errorf("PROXY_REFUSAL_FALLBACK_MODEL was replaced by %s", key)
+	}
+	v, ok := lookup(key)
 	if !ok {
-		return "claude-opus-5"
+		return []string{"claude-fable-latest", "claude-opus-latest", "claude-sonnet-latest"}, nil
 	}
 	v = strings.TrimSpace(v)
 	if v == "" || strings.EqualFold(v, "off") || strings.EqualFold(v, "none") || strings.EqualFold(v, "disabled") {
-		return ""
+		return nil, nil
 	}
-	return v
+	models := strings.Split(v, ",")
+	unique := models[:0]
+	for _, entry := range models {
+		model := strings.TrimSpace(entry)
+		if !isClaudeModel(model) {
+			return nil, fmt.Errorf("%s: expected a Claude model, got %q", key, model)
+		}
+		duplicate := false
+		for _, prior := range unique {
+			if prior == model {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			unique = append(unique, model)
+		}
+	}
+	return unique, nil
 }
 
 // swapModel returns a copy of the JSON request body with only its top-level
@@ -1244,13 +1347,12 @@ func swapModel(body []byte, model string) (out []byte, ok bool) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), true
 }
 
-// refusalFallbackDesc renders the configured fallback model for the startup log,
-// showing "off" when the feature is disabled.
-func refusalFallbackDesc(model string) string {
-	if model == "" {
+// refusalFallbackDesc renders the ordered models for the startup log.
+func refusalFallbackDesc(models []string) string {
+	if len(models) == 0 {
 		return "off"
 	}
-	return model
+	return strings.Join(models, ",")
 }
 
 // agentKind reports "sub" for any spawned/SDK-driven agent and "main" for the

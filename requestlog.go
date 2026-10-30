@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-const requestArchiveSchema = "steady-proxy.payload.v2"
+const requestArchiveSchema = "steady-proxy.payload.v3"
 
 func requestLogEnabled() bool { return cfg.requestLogDir != "" }
 
@@ -197,15 +197,15 @@ type archiveAttempt struct {
 }
 
 type archiveOutcome struct {
-	Result       string            `json:"result"`
-	Who          string            `json:"who,omitempty"`
-	OrigStatus   int               `json:"orig_status,omitempty"`
-	Status       int               `json:"status,omitempty"`
-	Code         string            `json:"code,omitempty"`
-	ProxyRetries int               `json:"proxy_retries"`
-	ModelSwap    *archiveModelSwap `json:"model_swap,omitempty"`
-	Stats        *archiveStats     `json:"stats,omitempty"`
-	DurationMS   int64             `json:"duration_ms"`
+	Result       string             `json:"result"`
+	Who          string             `json:"who,omitempty"`
+	OrigStatus   int                `json:"orig_status,omitempty"`
+	Status       int                `json:"status,omitempty"`
+	Code         string             `json:"code,omitempty"`
+	ProxyRetries int                `json:"proxy_retries"`
+	ModelSwaps   []archiveModelSwap `json:"model_swaps,omitempty"`
+	Stats        *archiveStats      `json:"stats,omitempty"`
+	DurationMS   int64              `json:"duration_ms"`
 }
 
 type archiveRedactions struct {
@@ -250,9 +250,6 @@ type reqRecorder struct {
 
 	stats        *captureStats
 	proxyRetries int
-	swapReason   string
-	swapFrom     string
-	swapTo       string
 
 	outcome    string
 	origStatus int
@@ -415,6 +412,15 @@ func (rec *reqRecorder) noteAttemptStats(st *captureStats) {
 	rec.noteResponseReadError(st.readErr)
 }
 
+// noteDeliveredAnswer restores the delivered answer without rewriting any attempt.
+func (rec *reqRecorder) noteDeliveredAnswer(reqWho string, st *captureStats) {
+	if rec == nil {
+		return
+	}
+	rec.outcomeWho = reqWho
+	rec.stats = st
+}
+
 func (rec *reqRecorder) noteProxyRetries(n int) {
 	if rec == nil {
 		return
@@ -423,16 +429,11 @@ func (rec *reqRecorder) noteProxyRetries(n int) {
 }
 
 func (rec *reqRecorder) noteModelSwap(reason, from, to string) {
-	if rec == nil {
+	if rec == nil || rec.cur == nil {
 		return
 	}
-	rec.swapReason = reason
-	rec.swapFrom = from
-	rec.swapTo = to
-	if rec.cur != nil {
-		rec.cur.ModelSwap = &archiveModelSwap{Reason: reason, From: from, To: to}
-		rec.cur.Result = "model_swap"
-	}
+	rec.cur.ModelSwap = &archiveModelSwap{Reason: reason, From: from, To: to}
+	rec.cur.Result = "model_swap"
 }
 
 // note records the final outcome (mirrors the one-line access log). orig is the
@@ -830,7 +831,7 @@ func (rec *reqRecorder) archive() requestArchive {
 			Status:       rec.status,
 			Code:         rec.code,
 			ProxyRetries: rec.proxyRetries,
-			ModelSwap:    rec.modelSwap(),
+			ModelSwaps:   rec.modelSwaps(),
 			Stats:        statsArchive(rec.stats),
 			DurationMS:   finished.Sub(rec.when).Milliseconds(),
 		},
@@ -853,11 +854,17 @@ func (rec *reqRecorder) displayWho() string {
 	return whoWithResolvedModel(w, rec.stats.model)
 }
 
-func (rec *reqRecorder) modelSwap() *archiveModelSwap {
-	if rec.swapTo == "" {
-		return nil
+func (rec *reqRecorder) modelSwaps() []archiveModelSwap {
+	var swaps []archiveModelSwap
+	for _, a := range rec.attempts {
+		if a.ModelSwap != nil {
+			if swaps == nil {
+				swaps = make([]archiveModelSwap, 0, len(rec.attempts))
+			}
+			swaps = append(swaps, *a.ModelSwap)
+		}
 	}
-	return &archiveModelSwap{Reason: defaultString(rec.swapReason, "unknown"), From: defaultString(rec.swapFrom, "?"), To: rec.swapTo}
+	return swaps
 }
 
 func (rec *reqRecorder) whenString(t time.Time) string {

@@ -17,12 +17,12 @@ func envOf(kv map[string]string) func(string) (string, bool) {
 
 func TestParseConfigFlagsAndOverrides(t *testing.T) {
 	c, err := parseConfig(envOf(map[string]string{
-		"PROXY_UPSTREAM_URL":                "http://user:pass@127.0.0.1:9000/api/",
-		"PROXY_VALIDATE_JSON":               "0",
-		"PROXY_VERBOSE":                     "1",
-		"PROXY_KEEPALIVE_MS":                "0",
-		"PROXY_TRANSACTIONAL_LOCAL_RETRIES": " 3 ",
-		"PROXY_REFUSAL_FALLBACK_MODEL":      "off",
+		"PROXY_UPSTREAM_URL":                   "http://user:pass@127.0.0.1:9000/api/",
+		"PROXY_VALIDATE_JSON":                  "0",
+		"PROXY_VERBOSE":                        "1",
+		"PROXY_KEEPALIVE_MS":                   "0",
+		"PROXY_TRANSACTIONAL_LOCAL_RETRIES":    " 3 ",
+		"PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS": "off",
 	}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -30,7 +30,7 @@ func TestParseConfigFlagsAndOverrides(t *testing.T) {
 	if c.upstream != "http://user:pass@127.0.0.1:9000/api" || c.upstreamHost != "127.0.0.1:9000" {
 		t.Fatalf("upstream/host = %q/%q: prefix must be kept, userinfo must not reach the Host header", c.upstream, c.upstreamHost)
 	}
-	if c.validateJSON || !c.verbose || c.keepaliveMs != 0 || c.txLocalRetries != 3 || c.refusalFallback != "" {
+	if c.validateJSON || !c.verbose || c.keepaliveMs != 0 || c.txLocalRetries != 3 || len(c.claudeRefusalFallbacks) != 0 {
 		t.Fatalf("overrides not applied: %+v", c)
 	}
 }
@@ -115,6 +115,45 @@ func TestInvalidUpstreamErrorsDoNotExposeCredentials(t *testing.T) {
 			if strings.Contains(err.Error(), secret) {
 				t.Fatalf("configuration error leaked credential: %v", err)
 			}
+		}
+	}
+}
+
+func TestClaudeRefusalFallbackConfiguration(t *testing.T) {
+	const key = "PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS"
+	for _, tc := range []struct {
+		value   string
+		want    string
+		invalid bool
+	}{
+		{"", "", false}, {"  ", "", false}, {"off", "", false},
+		{"None", "", false}, {" disabled ", "", false},
+		{" claude-a , claude-b,claude-a ", "claude-a,claude-b", false},
+		{"claude-a,", "", true}, {",claude-a", "", true},
+		{"claude-a, ,claude-b", "", true}, {"claude-a,qwen", "", true},
+		{"qwen", "", true}, {"claude-a,off", "", true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			c, err := parseConfig(envOf(map[string]string{"PROXY_UPSTREAM_URL": "http://example.com", key: tc.value}))
+			if tc.invalid {
+				if err == nil || !strings.Contains(err.Error(), key) {
+					t.Fatalf("invalid list must name %s: %v", key, err)
+				}
+				return
+			}
+			if err != nil || strings.Join(c.claudeRefusalFallbacks, ",") != tc.want {
+				t.Fatalf("fallbacks = %v, err = %v; want %q", c.claudeRefusalFallbacks, err, tc.want)
+			}
+		})
+	}
+	for _, old := range []string{"", "off", "claude-opus-5"} {
+		_, err := parseConfig(envOf(map[string]string{
+			"PROXY_UPSTREAM_URL":           "http://example.com",
+			"PROXY_REFUSAL_FALLBACK_MODEL": old,
+			key:                            "claude-a",
+		}))
+		if err == nil || !strings.Contains(err.Error(), "PROXY_REFUSAL_FALLBACK_MODEL") || !strings.Contains(err.Error(), key) {
+			t.Fatalf("legacy setting must explain migration even when empty or new key is present: %v", err)
 		}
 	}
 }

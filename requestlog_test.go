@@ -234,10 +234,10 @@ func TestRequestLogRecordsModelSwapWithAttemptDetails(t *testing.T) {
 	setupForTest(up.URL)
 	dir := t.TempDir()
 	cfg.requestLogDir = dir
-	cfg.refusalFallback = "claude-opus-4-8"
+	cfg.claudeRefusalFallbacks = []string{"claude-opus-4-8"}
 	t.Cleanup(func() {
 		cfg.requestLogDir = ""
-		cfg.refusalFallback = ""
+		cfg.claudeRefusalFallbacks = nil
 	})
 
 	original := []byte(`{"stream":true,"model":"claude-fable-5","max_tokens":256}`)
@@ -252,11 +252,11 @@ func TestRequestLogRecordsModelSwapWithAttemptDetails(t *testing.T) {
 	ar, _ := readArchive(t, files[0])
 
 	requireArchiveBody(t, ar.ClientRequest.Body, original)
-	if ar.Outcome.ModelSwap == nil {
+	if len(ar.Outcome.ModelSwaps) != 1 {
 		t.Fatalf("outcome missing model swap: %+v", ar.Outcome)
 	}
-	if *ar.Outcome.ModelSwap != (archiveModelSwap{Reason: "safeguard", From: "claude-fable-5", To: "claude-opus-4-8"}) {
-		t.Fatalf("unexpected outcome model swap: %+v", ar.Outcome.ModelSwap)
+	if ar.Outcome.ModelSwaps[0] != (archiveModelSwap{Reason: "safeguard", From: "claude-fable-5", To: "claude-opus-4-8"}) {
+		t.Fatalf("unexpected outcome model swaps: %+v", ar.Outcome.ModelSwaps)
 	}
 	if len(ar.Attempts) != 2 {
 		t.Fatalf("want 2 attempts, got %d", len(ar.Attempts))
@@ -280,6 +280,158 @@ func TestRequestLogRecordsModelSwapWithAttemptDetails(t *testing.T) {
 		t.Fatalf("swapped request body missing fallback model: %s", second.RequestBody.Data)
 	}
 	requireArchiveBody(t, second.Response.Body, []byte(goodStream))
+}
+
+func TestRequestLogResolvesFinalFallbackHop(t *testing.T) {
+	for _, tc := range []struct {
+		name, resolved, wantWho string
+	}{
+		{"matching", "claude-b", "claude-original~>claude-a~>claude-b/main"},
+		{"alias", "claude-b-resolved", "claude-original~>claude-a~>claude-b->claude-b-resolved/main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			answer := strings.Replace(goodStream, `"id":"msg_1"`, `"id":"msg_1","model":"`+tc.resolved+`"`, 1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if hits.Add(1) < 3 {
+					io.WriteString(w, refusalStream)
+					return
+				}
+				io.WriteString(w, answer)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			cfg.claudeRefusalFallbacks = []string{"claude-a", "claude-b"}
+			dir := t.TempDir()
+			cfg.requestLogDir = dir
+			t.Cleanup(func() { cfg.requestLogDir = "" })
+			rec := doStream(`{"stream":true,"model":"claude-original"}`)
+			if hits.Load() != 3 || rec.Code != 200 || rec.Body.String() != answer {
+				t.Fatalf("fallback chain did not finish: hits=%d status=%d body=%s", hits.Load(), rec.Code, rec.Body.String())
+			}
+			files := archiveFiles(t, dir)
+			if len(files) != 1 {
+				t.Fatalf("want one request archive, got %v", files)
+			}
+			ar, _ := readArchive(t, files[0])
+			if ar.Outcome.Who != tc.wantWho {
+				t.Fatalf("final model identity = %q, want %q", ar.Outcome.Who, tc.wantWho)
+			}
+		})
+	}
+}
+
+func TestRequestLogExhaustedChainPreservesDeliveredOriginal(t *testing.T) {
+	originalRefusal := strings.NewReplacer(
+		`"id":"msg_1"`, `"id":"msg_1","model":"claude-original-resolved","usage":{"input_tokens":100}`,
+		`"type":"message_delta"`, `"type":"message_delta","usage":{"output_tokens":2}`,
+	).Replace(refusalStream)
+	candidateRefusal := strings.NewReplacer(
+		`"id":"msg_1"`, `"id":"msg_1","model":"claude-candidate-resolved","usage":{"input_tokens":200}`,
+		`"type":"message_delta"`, `"type":"message_delta","usage":{"output_tokens":3}`,
+	).Replace(refusalStream)
+	safeguard := `{"error":{"type":"invalid_request_error","message":"Fable 5's safeguards flagged this message"}}`
+	unavailable := `{"error":{"type":"api_error","message":"upstream unavailable"}}`
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"refusal", http.StatusOK, originalRefusal},
+		{"safeguard", http.StatusBadRequest, safeguard},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch hits.Add(1) {
+				case 1:
+					if tc.status == http.StatusOK {
+						w.Header().Set("Content-Type", "text/event-stream")
+					}
+					w.WriteHeader(tc.status)
+					io.WriteString(w, tc.body)
+				case 2:
+					w.Header().Set("Content-Type", "text/event-stream")
+					io.WriteString(w, candidateRefusal)
+				default:
+					w.WriteHeader(http.StatusServiceUnavailable)
+					io.WriteString(w, unavailable)
+				}
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			dir := t.TempDir()
+			cfg.requestLogDir = dir
+			cfg.claudeRefusalFallbacks = []string{"claude-candidate", "claude-unavailable"}
+			t.Cleanup(func() { cfg = testConfig() })
+
+			original := []byte(`{"stream":true,"model":"claude-original"}`)
+			resp := doStream(string(original))
+			if resp.Code != tc.status || resp.Body.String() != tc.body || hits.Load() != 3 {
+				t.Fatalf("original delivery: status=%d attempts=%d body=%s", resp.Code, hits.Load(), resp.Body.String())
+			}
+			files := archiveFiles(t, dir)
+			if len(files) != 1 {
+				t.Fatalf("want one archive, got %v", files)
+			}
+			ar, raw := readArchive(t, files[0])
+			if len(ar.Attempts) != 3 || len(ar.Outcome.ModelSwaps) != 2 {
+				t.Fatalf("incomplete chain: attempts=%d swaps=%+v", len(ar.Attempts), ar.Outcome.ModelSwaps)
+			}
+			models := []string{"claude-original", "claude-candidate", "claude-unavailable"}
+			bodies := []string{tc.body, candidateRefusal, unavailable}
+			for i, attempt := range ar.Attempts {
+				if attempt.Model != models[i] || attempt.Failure == nil || attempt.Response == nil {
+					t.Fatalf("attempt %d lost identity/failure/response: %+v", i, attempt)
+				}
+				requireArchiveBody(t, attempt.Response.Body, []byte(bodies[i]))
+				if i < len(ar.Outcome.ModelSwaps) {
+					swap := ar.Outcome.ModelSwaps[i]
+					if swap.From != models[i] || swap.To != models[i+1] || swap.Reason == "" || attempt.ModelSwap == nil || *attempt.ModelSwap != swap {
+						t.Fatalf("hop %d lost ordered swap: outcome=%+v attempt=%+v", i, swap, attempt.ModelSwap)
+					}
+				} else if attempt.ModelSwap != nil {
+					t.Fatalf("final attempt invented a hop: %+v", attempt.ModelSwap)
+				}
+			}
+			if ar.Attempts[1].Stats == nil || ar.Attempts[1].Stats.Model != "claude-candidate-resolved" || ar.Attempts[1].Stats.TotalInputTokens != 200 || ar.Attempts[1].Stats.OutputTokens != 3 {
+				t.Fatalf("candidate failure stats lost: %+v", ar.Attempts[1].Stats)
+			}
+			if !ar.Attempts[2].Failure.Transient || ar.Attempts[2].Response.Status != http.StatusServiceUnavailable {
+				t.Fatalf("final failure lost: %+v", ar.Attempts[2])
+			}
+			wantWho := "claude-original/main"
+			if tc.name == "refusal" {
+				wantWho = "claude-original->claude-original-resolved/main"
+				st := ar.Outcome.Stats
+				if st == nil || st.Model != "claude-original-resolved" || st.TotalInputTokens != 100 || st.OutputTokens != 2 || st.StopReason != "refusal" || st.Bytes != int64(len(originalRefusal)) {
+					t.Fatalf("delivered original stats lost: %+v", st)
+				}
+			} else if ar.Outcome.Stats != nil {
+				t.Fatalf("safeguard delivery inherited candidate stats: %+v", ar.Outcome.Stats)
+			}
+			if ar.Outcome.Who != wantWho || ar.Outcome.Status != tc.status {
+				t.Fatalf("outcome describes failed candidate, not original: %+v", ar.Outcome)
+			}
+			requireArchiveBody(t, ar.ClientRequest.Body, original)
+			var encoded struct {
+				Outcome map[string]json.RawMessage `json:"outcome"`
+			}
+			if err := json.Unmarshal(raw, &encoded); err != nil {
+				t.Fatal(err)
+			}
+			if _, stale := encoded.Outcome["model_swap"]; stale {
+				t.Fatal("obsolete scalar outcome model_swap remains in archive")
+			}
+		})
+	}
+}
+
+func TestRequestLogDeliveredAnswerIsNilSafe(t *testing.T) {
+	var rec *reqRecorder
+	rec.noteDeliveredAnswer("claude-original/main", nil)
+	rec.noteModelSwap("refusal", "claude-original", "claude-candidate")
 }
 
 func TestRequestLogDisabledWritesNothing(t *testing.T) {

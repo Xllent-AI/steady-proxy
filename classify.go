@@ -29,6 +29,8 @@ type failure struct {
 	origStatus int    // raw upstream HTTP status; 0 when no HTTP response (transport/SSE fault)
 	atype      string // Anthropic error type
 	code       string // short internal code (for logs / episode keying)
+	origType   string // structured upstream identity before retry normalization
+	origCode   string
 	message    string
 	retryAfter int            // seconds; 0 = none
 	upstream   *upstreamReply // complete upstream HTTP error; a terminal failure is replayed from it verbatim
@@ -77,6 +79,13 @@ func origStatusOf(f failure) int {
 		return f.origStatus
 	}
 	return statusFor(f)
+}
+
+func origTypeOf(f failure) string {
+	if f.origType != "" {
+		return f.origType
+	}
+	return f.atype
 }
 
 // Substrings that mark an error as REQUEST-SHAPE: the request itself can never
@@ -183,7 +192,7 @@ func httpRetryHint(h http.Header) (source string, retry bool) {
 // every heuristic, and a wire's body verdict refines the status where it names an
 // explicit identity: a 4xx naming a transient fault is retried, and a 429 naming
 // a permanent one (exhausted quota, request too large) is not.
-func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, rule errorBodyRule) failure {
+func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, rule errorBodyRule) (f failure) {
 	st := resp.StatusCode
 	if st >= 300 && st < 400 {
 		// Redirects are deliberately not followed, so credentials never reach a
@@ -204,6 +213,10 @@ func classifyHTTPErrorBytesShaped(resp *http.Response, b []byte, rule errorBodyR
 		Error struct{ Type, Code, Message string } `json:"error"`
 	}
 	_ = json.Unmarshal(b, &ae)
+	// Model failover needs the upstream identity, not the SDK retry envelope.
+	defer func() {
+		f.origType, f.origCode = ae.Error.Type, ae.Error.Code
+	}()
 	atype := ae.Error.Type
 	if atype == "" {
 		atype = "api_error"
@@ -287,11 +300,14 @@ func anthropicPermanentStatus(atype string) int {
 // The type is the only status-like signal, so the same identities that are final
 // over HTTP (auth, billing, permission, not found, too large, invalid request)
 // are final here.
-func classifySSEError(data string) *failure {
+func classifySSEError(data string) (f *failure) {
 	var e struct {
-		Error struct{ Type, Message string } `json:"error"`
+		Error struct{ Type, Code, Message string } `json:"error"`
 	}
 	_ = json.Unmarshal([]byte(data), &e)
+	defer func() {
+		f.origType, f.origCode = e.Error.Type, e.Error.Code
+	}()
 	switch t := e.Error.Type; t {
 	case "overloaded_error":
 		return &failure{transient: true, status: 529, atype: "overloaded_error", code: "sse_overloaded", message: e.Error.Message}

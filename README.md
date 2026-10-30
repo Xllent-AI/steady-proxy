@@ -11,7 +11,7 @@ Agents / SDKs / applications → steady-proxy (127.0.0.1:8789) → your gateway
 - **Transactional buffering:** Holds SSE responses until completion (or a configurable time window) so broken streams can be discarded and retried cleanly.
 - **Retry normalization:** Converts recoverable HTTP and pre-commit stream failures into standard `503` responses with `Retry-After` (plus optional in-proxy retries). Final upstream answers (auth, billing, validation, and other `4xx`) are relayed unchanged.
 - **Stream validation and repair:** Validates Anthropic event order and tool JSON, coalesces fragmented `input_json_delta` chunks, and merges bursty Responses text deltas on replay.
-- **Refusal fallback:** Re-issues Claude refusals against a fallback model (default `claude-opus-5`, can be disabled) before committing the response, delivering the original refusal if the fallback cannot answer.
+- **Claude refusal fallback:** Tries an ordered model list before committing the response (default: `claude-fable-latest`, `claude-opus-latest`, `claude-sonnet-latest`; can be disabled). If the chain is exhausted, delivers the original refusal instead of restarting client retries.
 - **Workflow watchdog support:** Uses a short buffering window for Claude Code Workflow agents so their content-stall timer does not trip.
 - **Diagnostics:** Logs one-line request outcomes and optionally archives full request/response payloads for debugging.
 

@@ -69,9 +69,11 @@ Client response-header, stream-idle, and per-attempt timeouts must be strictly g
 | `PROXY_TRANSACTIONAL_LOCAL_RETRIES` | `0` | Extra in-proxy upstream attempts before commit on recoverable streaming failures. `0` keeps only a single fast retry (<3s failure, 250ms delay). |
 | `PROXY_LOCAL_RETRY_EXTRA_BACKOFF_CAP_MS` | `10000` (10s) | Max exponential delay added to upstream `Retry-After` between local retries. `0` adds no extra delay. |
 | `PROXY_SDK_RETRY_CAP` | `100` | Stops converting errors into `503` retries once `X-Stainless-Retry-Count` reaches this value. `0` disables retry conversion and local retries. |
-| `PROXY_REFUSAL_FALLBACK_MODEL` | `claude-opus-5` | Fallback model for pre-commit refusals and recognized Fable safeguard errors from Claude models (model name containing `claude`). If the fallback fails terminally, the original answer is delivered. Set to `off`, `none`, `disabled`, or `""` to disable. |
+| `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS` | `claude-fable-latest,claude-opus-latest,claude-sonnet-latest` | Ordered comma-separated Claude models for pre-commit refusals and terminal safeguard errors on streaming Messages requests. Entries are trimmed and deduplicated; empty entries and non-Claude targets are rejected. The original model is skipped. Exhaustion returns the original answer; actionable account/request errors remain visible. Set to `off`, `none`, `disabled`, or `""` to disable. |
 
 See [Retries](ARCHITECTURE.md#retries) and [Model fallback](ARCHITECTURE.md#model-fallback) for behavior details.
+
+**Migration:** Replace `PROXY_REFUSAL_FALLBACK_MODEL` with `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS` in your environment and copied Compose file. A single model is still a valid list. The binary rejects the removed setting if it is passed; there is no compatibility alias. Compose uses the three-model default only when the new variable is unset, so an explicitly empty value disables fallback.
 
 ## Stream processing
 
