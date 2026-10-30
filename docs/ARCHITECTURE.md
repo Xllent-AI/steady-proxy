@@ -55,13 +55,13 @@ Missing candidates, truncated frames, new content for an already finished candid
 The buffering timer starts when the client request arrives. Upstream header waits, local retry backoffs, and model fallback attempts all share that single window.
 
 When the window expires:
-- A pending header or error-body read is cancelled and returned for client retry.
+- A pending header or error-body read is cancelled and returned for client retry, or the held original answer is delivered if a Claude fallback chain is active.
 - An active SSE stream flushes its buffered prefix and switches to live streaming (Workflow requests wait until forwardable content is present).
 - In live mode, silent gaps emit `: keepalive` comments on Messages/Gemini and `response.proxy_keepalive` events on Responses. Keepalives prevent client idle disconnects, but client cancellation, `PROXY_UPSTREAM_BYTE_IDLE_MS`, and the configured `PROXY_MAX_REQUEST_DURATION_MS` still apply. The total request limit is not inferred from client timeout headers.
 
 ## Retries
 
-When an attempt fails before commit:
+Outside an active Claude fallback chain, a recoverable failure before commit follows this policy:
 
 1. **Local retry:** If `PROXY_TRANSACTIONAL_LOCAL_RETRIES` has remaining budget and enough time remains in the buffering window and request deadline, the proxy waits and re-issues the upstream request transparently.
 2. **Client retry:** Otherwise, the proxy returns HTTP `503` with `X-Should-Retry: true` and `Retry-After` (`api_error` envelope for Anthropic/Responses; `error.code: 503` / `UNAVAILABLE` for Gemini).
@@ -86,13 +86,19 @@ When `N = 0` (the default), general local retries are off, except for a single f
 
 ## Model fallback
 
-On streaming `POST /v1/messages` requests for a Claude model (model name containing `claude`), if a buffered response finishes with `stop_reason: "refusal"` or fails pre-commit with a recognized, terminal Fable safeguard error, the proxy rewrites the top-level `"model"` field to `PROXY_REFUSAL_FALLBACK_MODEL` (default `claude-opus-5`) and re-issues the request once. Other vendors' models are never re-routed to a Claude fallback.
+On streaming `POST /v1/messages` requests for a Claude model (model name containing `claude`), a complete buffered `stop_reason: "refusal"` or recognized terminal API safeguard error starts an ordered fallback chain. `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS` defaults to `claude-fable-latest,claude-opus-latest,claude-sonnet-latest`.
 
-- All other JSON fields (`max_tokens`, `thinking`, `tools`, etc.) preserve their JSON values.
-- The proxy logs `WARN` with the original and fallback models.
-- Model substitution happens at most once per client request, gets a fresh local retry counter within the remaining request window, and remains enabled even when `PROXY_SDK_RETRY_CAP=0` or when a recognized safeguard error carries `x-gateway-retryable: false` / `x-should-retry: false`.
-- The original answer is held while the fallback runs. If the fallback fails terminally (or the retry backstop is exhausted), the client receives the original refusal stream or safeguard error; a transient fallback failure is retried like any other.
-- Set `PROXY_REFUSAL_FALLBACK_MODEL` to `off`, `none`, `disabled`, or `""` to disable it. Refusal fallback does not apply to Responses, Gemini, or non-streaming calls.
+- Configuration is parsed once. Entries are trimmed and deduplicated in order; empty entries and non-Claude targets are rejected. The exact originally requested model name is skipped. The proxy does not resolve gateway aliases, so distinct aliases may still select the same underlying model.
+- Candidates are tried sequentially within the same client request. A candidate refusal, not-found/model-not-found error, or recoverable pre-commit upstream failure advances to the next model. There are no speculative requests or session-wide model changes.
+- Only the top-level `model` field changes. All other JSON values (`messages`, `max_tokens`, `thinking`, `tools`, etc.) are preserved; configure candidates that support the request's features and context size.
+- Fallback does not use general local-retry backoff or reset retry counters. Fast transport faults can spend the request's one shared 250 ms retry when they arrive within 3 seconds and the SDK/time budgets permit it. HTTP and stream failures advance without that delay. The original model's normal retry policy is unchanged.
+- All candidates share the original buffering window and request deadline. A candidate's header timeout can advance to the next model while those shared limits still allow it. No new candidate starts after either shared limit expires, and nothing is substituted after downstream headers are committed. Model changes remain enabled with `PROXY_SDK_RETRY_CAP=0`; that setting disables same-model retries, not substitution.
+- The first original refusal stream or safeguard error is retained. If candidates are exhausted, the client receives that original answer, not a retryable `503` that would restart the chain. Later candidate refusals are discarded. Client cancellation stops the chain without replaying the held answer.
+- Fallback classification uses the original HTTP/SSE error type and code, including structured `model_not_found`, rather than the normalized SDK retry envelope. Authentication, billing, permission, and general invalid-request errors stop the chain. Terminal fallback HTTP errors retain their upstream status, body, and headers even when a gateway marks them retryable; retry-hint precedence outside fallback is unchanged.
+- Rate limits stop with the held original answer: model aliases are not assumed to have independent quota. Local spool failures also stop rather than trying another model.
+- Each model change is logged as `WARN`; subsequent lines retain the attempted chain. Payload archives retain each attempt and the complete ordered list of model changes.
+
+Set `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS` to `off`, `none`, `disabled`, or `""` to disable it. This feature never applies to non-Claude requests, Responses, Gemini, or non-streaming calls. See [configuration migration](CONFIGURATION.md#retries-and-fallback) when replacing the old scalar setting.
 
 ## Workflow agents
 
@@ -117,4 +123,4 @@ See [Stream processing](CONFIGURATION.md#stream-processing) to tune or disable t
 
 Transactional buffering and local retries apply only to streaming `POST` requests on Messages, Responses, and Gemini SSE. Single-shot routes use one upstream attempt per client call; if a response body copy fails mid-transfer, the proxy aborts the connection and logs `DROP`.
 
-Because retries re-send the upstream request, any server-side or remote MCP tool invoked by the provider may run more than once. Client-local tools are safe because the client only executes them after receiving a complete response. For remote tools with side effects, enforce idempotency at the tool layer or set `PROXY_SDK_RETRY_CAP=0` and `PROXY_REFUSAL_FALLBACK_MODEL=off`.
+Because retries re-send the upstream request, any server-side or remote MCP tool invoked by the provider may run more than once. Client-local tools are safe because the client only executes them after receiving a complete response. For remote tools with side effects, enforce idempotency at the tool layer or set `PROXY_SDK_RETRY_CAP=0` and `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS=off`.

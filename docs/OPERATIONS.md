@@ -40,8 +40,9 @@ OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.4
 OK    gpt-5.6/main  high  in=1.1k out=223 tok  completed  live  2.37s
 RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
-WARN  claude-fable-5/main  refusal -> retry with claude-opus-5  in=258.8k out=2.8k tok  40.7s
-OK    claude-fable-5~>claude-opus-5/main  in=258.8k out=3.1k tok  end_turn  buffered  52.0s
+WARN  claude-opus-5-5/main  refusal -> retry with claude-fable-latest  in=258.8k out=2.8k tok  40.7s
+WARN  claude-opus-5-5~>claude-fable-latest/main  http_503 -> retry with claude-opus-latest  40.9s
+OK    claude-opus-5-5~>claude-fable-latest~>claude-opus-latest/main  in=258.8k out=3.1k tok  end_turn  buffered  52.0s
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
 FAIL  claude-sonnet-4-6/main  http_401 401  0.1s
 ```
@@ -52,7 +53,7 @@ FAIL  claude-sonnet-4-6/main  http_401 401  0.1s
 | --- | --- |
 | `OK` | Response delivered (`buffered`, `live`, or `non-sse` for a non-stream `2xx` relayed as-is). |
 | `RETRY` | Recoverable pre-commit failure; returned HTTP `503` with `Retry-After` so the client retries. |
-| `WARN` | Pre-commit Claude refusal or safeguard error triggered model fallback (a subsequent line logs the fallback outcome), or the fallback failed and the original answer was delivered. |
+| `WARN` | A Claude refusal/safeguard started fallback, a candidate failure advanced the chain, or the chain ended and the original answer was delivered. |
 | `FAIL` | Non-retryable error (the upstream's final answer, relayed unchanged, or an exhausted retry cap) returned to the client, or a terminal in-band error forwarded after commit (`delivered in-stream`). |
 | `DROP` | Stream or body transfer failed *after* `200 OK` headers were already sent; the proxy aborted the connection and the client must handle recovery. |
 
@@ -86,7 +87,9 @@ PROXY_REQUEST_LOG_DIR=./logs
 
 The proxy writes one JSON archive per client request (e.g., `v1-messages-20260621t143005-a1b2c3d4.json`, matching `id=a1b2c3d4` in the access log). Local retries and model fallback attempts are recorded inside the same file's `attempts` array.
 
-Archives use schema `steady-proxy.payload.v2` and include the client request envelope, redacted upstream URL, build metadata, per-attempt headers/bodies, retry delays, stream stats, and final outcome. Payloads are stored lossless in `data_base64` with `encoding`, `size`, and `sha256` metadata (unchanged retry bodies reference `request_body_ref`). Actual interrupted reads, including SSE reads that return both data and an error, record `capture_error`; clean EOF does not. Event-syntax failures and invalid accumulated tool input have distinct diagnostic messages.
+Archives use schema `steady-proxy.payload.v3` and include the client request envelope, redacted upstream URL, build metadata, per-attempt headers/bodies, retry delays, stream stats, and final outcome. Payloads are stored lossless in `data_base64` with `encoding`, `size`, and `sha256` metadata (unchanged retry bodies reference `request_body_ref`). Actual interrupted reads, including SSE reads that return both data and an error, record `capture_error`; clean EOF does not. Event-syntax failures and invalid accumulated tool input have distinct diagnostic messages.
+
+In v3, `outcome.model_swaps` replaces v2's singular `outcome.model_swap` with an ordered array of `{reason, from, to}` changes. Each attempt still has its own `model_swap`. When the original answer is delivered after fallback exhaustion, outcome identity and stream stats describe that answer; candidate failures and their stats remain in `attempts`.
 
 Archiving is best-effort and never fails a proxied call; set `PROXY_VERBOSE=1` to see `[request-log]` write errors.
 
@@ -95,7 +98,17 @@ Archiving is best-effort and never fails a proxied call; set `PROXY_VERBOSE=1` t
 - **Network exposure:** The proxy has no authentication. Keep `PROXY_LISTEN_ADDR` bound to loopback (`127.0.0.1`).
 - **Forwarded credentials & proxies:** Client auth headers (`Authorization`, `x-api-key`, `x-goog-api-key`, etc.) and query parameters (`key`) are forwarded to `PROXY_UPSTREAM_URL`. Upstream redirects are not followed or passed to the client (`502 upstream_redirect_<status>`); conditional GET/HEAD `304 Not Modified` responses are relayed with their cache metadata. Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables are honored. Upstream URL usernames/passwords are redacted in startup logs and archives.
 - **Spool files:** Request bodies stay in memory; buffered responses over `PROXY_MAX_BUFFER_MEM_BYTES` spill to temporary files in `PROXY_SPOOL_DIR` and are unlinked immediately after the attempt. Point `PROXY_SPOOL_DIR` at `tmpfs` if spill files must not touch disk.
-- **Archive sensitivity & retention:** Archives are **unencrypted**. Known credential headers and query params (`Authorization`, `x-api-key`, `x-goog-api-key`, `Proxy-Authorization`, `key`, `api_key`, `api_token`, `access_token`, `client_secret`) are redacted and listed under `redactions`, but **request and response bodies are stored raw** (base64-encoded). There is no automatic rotation or retention—disable `PROXY_REQUEST_LOG_DIR` once debugging is complete.
+- **Archive sensitivity & retention:** Archives are **unencrypted**. Known credential headers and query params (`Authorization`, `x-api-key`, `x-goog-api-key`, `Proxy-Authorization`, `key`, `api_key`, `api_token`, `access_token`, `client_secret`) are redacted and listed under `redactions`, but **request and response bodies are stored raw** (base64-encoded). There is no built-in rotation or retention—configure host cleanup below or disable `PROXY_REQUEST_LOG_DIR` once debugging is complete.
+
+### Daily archive cleanup
+
+For a deployment mounting `/var/log/steady-proxy:/logs`, set `PROXY_REQUEST_LOG_DIR=/logs` in `.env` and recreate the container. To remove archives older than 24 hours once per day, add this entry with `crontab -e` as the user who owns the archive directory:
+
+```cron
+0 3 * * * /usr/bin/find /var/log/steady-proxy -maxdepth 1 -type f -name '*.json' ! -newermt '24 hours ago' -delete
+```
+
+Keep the cron daemon running. This GNU `find` command runs at 03:00 in the host's local timezone and deletes only top-level JSON files, using their modification time. Adjust the host path to match the Compose bind mount (`./logs` in the example deployment; use its absolute path in cron). Daily cleanup means an archive can remain for up to roughly 48 hours. Docker's container output logs are separate and are not removed by this job.
 
 ## Run as a user service
 

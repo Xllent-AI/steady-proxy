@@ -121,9 +121,11 @@ If a Workflow agent still stalls:
 
 ## Model fallback
 
-A `WARN` log with `refusal -> retry with <model>` or `safeguard -> retry with <model>` means the proxy intercepted a pre-commit refusal from a Claude model and re-issued the request with `PROXY_REFUSAL_FALLBACK_MODEL`. The next log line shows the fallback attempt's result; its model reads `<requested>~><fallback>`. Models whose name does not contain `claude` are never re-routed.
+A `WARN` log with `refusal -> retry with <model>` or `safeguard -> retry with <model>` starts a Claude-only chain from `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS`. Later candidate failures can produce additional swaps; the model label retains `<requested>~><candidate>~><candidate>`. The exact originally requested name is skipped, so a list containing only that name cannot substitute a model.
 
-If the fallback fails terminally (for example your gateway does not serve that model), a second `WARN … fallback <model> failed: <code> -> delivering the original answer` line follows and the client receives the original refusal or safeguard error. Configure a model your gateway supports, or set `PROXY_REFUSAL_FALLBACK_MODEL=off` to pass refusals through unchanged. See [Model fallback](ARCHITECTURE.md#model-fallback).
+Claude Code's “safeguards flagged this session” screen can come from a successful HTTP `200` SSE response ending with `message_delta.delta.stop_reason: "refusal"` and `stop_details.category: "cyber"`. The proxy detects the structured stop reason, not the UI wording. It can intercept only before committing downstream; check the response's `buffered`/`live` mode when a refusal reaches the client.
+
+If candidates are exhausted, `WARN … fallback chain failed: <code> -> delivering the original answer` is logged and the client receives the first refusal or safeguard error without a proxy-requested client retry. Authentication, billing, permission, and invalid-request errors stop with their actionable error instead. A rate limit stops the chain without trying to escape shared quota. Configure compatible models your gateway supports, or set `PROXY_CLAUDE_REFUSAL_FALLBACK_MODELS=off` to pass refusals through unchanged. See [Model fallback](ARCHITECTURE.md#model-fallback).
 
 ## Storage and payload capture
 
