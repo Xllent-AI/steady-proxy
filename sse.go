@@ -283,6 +283,8 @@ type captureStats struct {
 	deltaInputUsage       bool      // message_delta carried authoritative input usage
 	outTok                int       // usage.output_tokens (from message_delta)
 	stop                  string    // delta.stop_reason (e.g. end_turn, max_tokens, tool_use)
+	refusalCategory       string    // delta.stop_details.category on a refusal
+	refusalReason         string    // delta.stop_details.explanation on a refusal
 	model                 string    // resolved model echoed back by the upstream
 	respTee               io.Writer // optional: when set, every raw response event is teed here (request-log)
 	readErr               error     // actual upstream read fault; clean EOF is not a capture error
@@ -806,7 +808,8 @@ func scrapeUsage(ev event, st *captureStats) {
 				Output        int `json:"output_tokens"`
 			} `json:"usage"`
 			Delta struct {
-				Stop string `json:"stop_reason"`
+				Stop        string          `json:"stop_reason"`
+				StopDetails json.RawMessage `json:"stop_details"`
 			} `json:"delta"`
 		}
 		if json.Unmarshal([]byte(ev.data), &d) == nil {
@@ -825,6 +828,18 @@ func scrapeUsage(ev event, st *captureStats) {
 			}
 			if d.Delta.Stop != "" {
 				st.stop = d.Delta.Stop
+				st.refusalCategory, st.refusalReason = "", ""
+				if st.stop == "refusal" {
+					// Decode diagnostics separately: malformed optional details must
+					// never suppress stop_reason, usage, or refusal interception.
+					var details struct {
+						Category    string `json:"category"`
+						Explanation string `json:"explanation"`
+					}
+					if json.Unmarshal(d.Delta.StopDetails, &details) == nil {
+						st.refusalCategory, st.refusalReason = details.Category, details.Explanation
+					}
+				}
 			}
 		}
 	}

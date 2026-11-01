@@ -40,7 +40,7 @@ OK    claude-sonnet-4-6/main  high  in=1.2k out=437 tok  end_turn  buffered  3.4
 OK    gpt-5.6/main  high  in=1.1k out=223 tok  completed  live  2.37s
 RETRY claude-sonnet-4-6/main  truncated_stream 502->503  retry-after=2s  0.9s
 OK    claude-sonnet-4-6/main  in=1.2k out=437 tok  end_turn  buffered  4.6s  proxy-retries=1
-WARN  claude-opus-5-5/main  refusal -> retry with claude-fable-latest  in=258.8k out=2.8k tok  40.7s
+WARN  claude-opus-5-5/main  refusal -> retry with claude-fable-latest  in=258.8k out=2.8k tok  40.7s  refusal-category="cyber"  refusal-reason="This request was blocked under the upstream usage policy."
 WARN  claude-opus-5-5~>claude-fable-latest/main  http_503 -> retry with claude-opus-latest  40.9s
 OK    claude-opus-5-5~>claude-fable-latest~>claude-opus-latest/main  in=258.8k out=3.1k tok  end_turn  buffered  52.0s
 FAIL  claude-sonnet-4-6/main  request_shape 400  0.3s
@@ -65,6 +65,7 @@ FAIL  claude-sonnet-4-6/main  http_401 401  0.1s
 | `high`, `medium`, etc. | Explicit effort level from Messages `output_config.effort`, Responses `reasoning.effort`, or Gemini `generationConfig.thinkingConfig.thinkingLevel` (`minimal`/`low`/`medium`/`high` in camelCase or `snake_case`, lowercased; never inferred from `thinkingBudget` or model defaults). |
 | `in=… out=… tok` | Input (including cache read/creation) and output token counts. |
 | `end_turn`, `completed`, `incomplete:max_output_tokens`, etc. | Upstream stop/finish reason. |
+| `refusal-category="…"`, `refusal-reason="…"` | Messages refusal category and explanation from `delta.stop_details`, when supplied. Safeguard errors use the upstream error message as the reason. Values are quoted and control characters escaped to keep one physical line per entry. |
 | `truncated_stream`, `http_401`, `request_shape`, etc. | Classified failure code before status normalization. `retryable_4xx_<status>` marks a `4xx` whose body named a transient fault; `upstream_redirect_<status>` an unfollowed redirect. |
 | `529->503` | Upstream HTTP status `->` status sent to the client (one number when unchanged). |
 | `retry-after=2s` | Backoff sent to the client in `Retry-After`. |
@@ -76,6 +77,8 @@ FAIL  claude-sonnet-4-6/main  http_401 401  0.1s
 Caller suffixes (`/main`, `/sub`, `/wf`) are derived from Claude Code headers and the Workflow system-prompt marker; other clients appear as `/main`.
 
 With `PROXY_VERBOSE=1`, `[local-retry]` lines log each internal retry cause, wait duration, and skips (such as `skip=not-enough-time`). Responses also carry `X-Steady-Proxy-Mode` on streamed deliveries and `X-Steady-Proxy-Reason` on error responses, including relayed upstream errors. A streaming request answered with a non-SSE `2xx` logs `non-sse <content-type>`; a terminal in-band error forwarded after commit logs `FAIL … delivered in-stream`.
+
+Refusal details appear on fallback warnings and on summaries of refusals delivered in buffered or live mode; a successful fallback's `OK` line does not inherit the earlier refusal's reason. On fallback exhaustion, the chain-failure warning describes the final candidate, while the delivered-original summary retains the original refusal's details. Missing or malformed optional details are omitted without changing response delivery or fallback behavior.
 
 ## Saving request and response data
 

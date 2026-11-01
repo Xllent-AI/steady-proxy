@@ -349,6 +349,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// Retain only the original answer. Candidate refusals never replace it.
 	var heldRefusal *bufferedStream
 	var heldSafeguard *failure
+	var lastRefusalDetails string
 	fallbackActive := func() bool { return heldRefusal != nil || heldSafeguard != nil }
 	defer func() {
 		if heldRefusal != nil {
@@ -398,7 +399,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		proxyRetries++
 		return true
 	}
-	swapToFallback := func(reason string, st *captureStats) bool {
+	swapToFallback := func(reason string, st *captureStats, details string) bool {
 		// All candidates share the original absolute deadlines. Do not issue an
 		// attempt after the buffering window or request lifetime is spent.
 		if ctx.Err() != nil || (!commitBy.IsZero() && !time.Now().Before(commitBy)) {
@@ -416,12 +417,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		fallbackIndex++
 		rec.noteModelSwap(reason, from, target)
 		if st != nil {
-			log.Printf("WARN  %s%s  %s -> retry with %s  in=%s out=%s tok  %s%s%s",
+			log.Printf("WARN  %s%s  %s -> retry with %s  in=%s out=%s tok  %s%s%s%s",
 				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), reason, target,
-				htok(st.inTok), htok(st.outTok), since(reqStart), att(retryCount), rec.idField())
+				htok(st.inTok), htok(st.outTok), since(reqStart), att(retryCount), details, rec.idField())
 		} else {
-			log.Printf("WARN  %s%s  %s -> retry with %s  %s%s",
-				reqWho, effortField(reqEffort), reason, target, since(reqStart), rec.idField())
+			log.Printf("WARN  %s%s  %s -> retry with %s  %s%s%s",
+				reqWho, effortField(reqEffort), reason, target, since(reqStart), details, rec.idField())
 		}
 		body = swapped
 		reqWho = modelChain + "~>" + who(r, body)
@@ -429,12 +430,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	advanceFallback := func(f failure, st *captureStats) bool {
-		return fallbackActive() && claudeFallbackAction(f) == fallbackNext && swapToFallback(f.code, st)
+		return fallbackActive() && claudeFallbackAction(f) == fallbackNext && swapToFallback(f.code, st, "")
 	}
 
 	// The original model retains its normal retry policy. Once fallback starts,
 	// candidates advance without general backoff or fresh per-model retry budgets.
 	for {
+		lastRefusalDetails = ""
 		rec.beginAttempt(body, reqWho, proxyRetries)
 		resp, started, stopDeadline, rtErr := roundTripBefore(ctx, r, body, commitBy)
 		if rtErr != nil {
@@ -467,7 +469,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 					safeguard := last
 					heldSafeguard = &safeguard
 				}
-				if swapToFallback("safeguard", nil) {
+				lastRefusalDetails = refusalFields("", last.message)
+				if swapToFallback("safeguard", nil, lastRefusalDetails) {
 					continue
 				}
 				break
@@ -546,8 +549,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		rec.noteAttemptStats(&st)
 		if fail == nil {
-			log.Printf("OK    %s%s  in=%s out=%s tok  %s  %s  %s%s%s%s%s",
-				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
+			log.Printf("OK    %s%s  in=%s out=%s tok  %s  %s  %s%s%s%s%s%s",
+				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), htok(st.inTok), htok(st.outTok), dash(st.stop), st.mode, since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), refusalFields(st.refusalCategory, st.refusalReason), rec.idField())
 			rec.noteAttemptResult("success")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("OK", http.StatusOK, http.StatusOK, "")
@@ -562,7 +565,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			}
 			st.heldRefusal = nil
 			last = *fail
-			if swapToFallback("refusal", &st) {
+			lastRefusalDetails = refusalFields(st.refusalCategory, st.refusalReason)
+			if swapToFallback("refusal", &st, lastRefusalDetails) {
 				continue
 			}
 			break
@@ -572,25 +576,30 @@ func handle(w http.ResponseWriter, r *http.Request) {
 				safeguard := *fail
 				heldSafeguard = &safeguard
 			}
-			if swapToFallback("safeguard", &st) {
+			lastRefusalDetails = refusalFields("", fail.message)
+			if swapToFallback("safeguard", &st, lastRefusalDetails) {
 				continue
 			}
 			last = *fail
 			break
 		}
 		if wrote { // failed AFTER committing — can't convert, response already streaming
+			details := refusalFields(st.refusalCategory, st.refusalReason)
+			if isModelSafeguardRefusal(*fail) {
+				details = refusalFields("", fail.message)
+			}
 			if fail.delivered {
 				// The upstream's own terminal error frame reached the client, so the
 				// stream ended the way the protocol defines; nothing to abort.
-				log.Printf("FAIL  %s%s  %s -> delivered in-stream  out=%s tok  %s%s%s%s",
-					whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
+				log.Printf("FAIL  %s%s  %s -> delivered in-stream  out=%s tok  %s%s%s%s%s",
+					whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), details, rec.idField())
 				rec.noteAttemptResult("fail")
 				rec.noteProxyRetries(proxyRetries)
 				rec.note("FAIL", http.StatusOK, http.StatusOK, fail.code)
 				return
 			}
-			log.Printf("DROP  %s%s  %s -> committed, client recovery required  out=%s tok  %s%s%s%s%s",
-				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), rec.idField())
+			log.Printf("DROP  %s%s  %s -> committed, client recovery required  out=%s tok  %s%s%s%s%s%s",
+				whoWithResolvedModel(reqWho, st.model), effortField(reqEffort), fail.code, htok(st.outTok), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), prunField(st.maxPingRun), details, rec.idField())
 			rec.noteAttemptResult("drop")
 			rec.noteProxyRetries(proxyRetries)
 			rec.note("DROP", http.StatusOK, http.StatusOK, fail.code)
@@ -614,8 +623,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// original answer, and cancellation never replays to a client that has left.
 	canRetry := !fallbackActive() && last.transient && budgetLeft()
 	if fallbackActive() && r.Context().Err() == nil && claudeFallbackAction(last) != fallbackStop {
-		log.Printf("WARN  %s%s  fallback chain failed: %s -> delivering the original answer  %s%s",
-			reqWho, effortField(reqEffort), last.code, since(reqStart), rec.idField())
+		log.Printf("WARN  %s%s  fallback chain failed: %s -> delivering the original answer  %s%s%s",
+			reqWho, effortField(reqEffort), last.code, since(reqStart), lastRefusalDetails, rec.idField())
 		rec.noteProxyRetries(proxyRetries)
 		if heldRefusal != nil {
 			deliverHeldRefusal(w, heldRefusal, firstWho, reqEffort, reqStart, retryCount, rec, last.code)
@@ -641,8 +650,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// its x-should-retry loop. The log shows the true upstream status arrowed to
 	// the surfaced one when masked (e.g. 529->503); last.code carries the cause.
 	sStatus, sType := retrySurfaceFor(r.URL.Path, last, canRetry)
-	log.Printf("%-5s %s%s  %s %s%s  %s%s%s%s",
-		tag, reqWho, effortField(reqEffort), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), rec.idField())
+	if isModelSafeguardRefusal(last) {
+		lastRefusalDetails = refusalFields("", last.message)
+	}
+	log.Printf("%-5s %s%s  %s %s%s  %s%s%s%s%s",
+		tag, reqWho, effortField(reqEffort), last.code, statusField(origStatusOf(last), sStatus), retryField(retryAfter), since(reqStart), att(retryCount), proxyRetryField(proxyRetries), lastRefusalDetails, rec.idField())
 	rec.noteProxyRetries(proxyRetries)
 	rec.note(tag, origStatusOf(last), sStatus, last.code)
 	writeFailure(w, r, last, canRetry, sStatus, sType, retryAfter)
@@ -670,8 +682,8 @@ func deliverHeldRefusal(w http.ResponseWriter, b *bufferedStream, reqWho, reqEff
 		rec.note("DROP", http.StatusOK, http.StatusOK, "refusal_replay_failed")
 		panic(http.ErrAbortHandler)
 	}
-	log.Printf("OK    %s%s  in=%s out=%s tok  %s  %s  %s%s  fallback-failed=%s%s",
-		whoWithResolvedModel(reqWho, b.st.model), effortField(reqEffort), htok(b.st.inTok), htok(b.st.outTok), dash(b.st.stop), b.st.mode, since(reqStart), att(retryCount), fallbackCode, rec.idField())
+	log.Printf("OK    %s%s  in=%s out=%s tok  %s  %s  %s%s  fallback-failed=%s%s%s",
+		whoWithResolvedModel(reqWho, b.st.model), effortField(reqEffort), htok(b.st.inTok), htok(b.st.outTok), dash(b.st.stop), b.st.mode, since(reqStart), att(retryCount), fallbackCode, refusalFields(b.st.refusalCategory, b.st.refusalReason), rec.idField())
 	rec.note("OK", http.StatusOK, http.StatusOK, "")
 }
 
@@ -1104,6 +1116,19 @@ func prunField(n int) string {
 		return ""
 	}
 	return fmt.Sprintf("  prun=%d", n)
+}
+
+// refusalFields quotes upstream diagnostics so control characters cannot split
+// a request log line or inject terminal escape sequences.
+func refusalFields(category, reason string) string {
+	fields := ""
+	if category != "" {
+		fields = fmt.Sprintf("  refusal-category=%q", category)
+	}
+	if reason != "" {
+		fields += fmt.Sprintf("  refusal-reason=%q", reason)
+	}
+	return fields
 }
 
 func localRetryDelay(upstreamRetryAfter int, retryIndex int) time.Duration {
