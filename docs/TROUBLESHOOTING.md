@@ -42,7 +42,7 @@ Recoverable upstream errors are normalized into a generic HTTP `503` with `X-Sho
 | Upstream error | Handling |
 | --- | --- |
 | `529`, `overloaded_error`, “API is at capacity”, “No available providers” | Retry (`503`); original overload code logged. |
-| `500`, `502`, `503`, `504`, `408`, `409` | Retry (`503`), preserving upstream `Retry-After`, unless overridden by [gateway headers](CONFIGURATION.md#optional-upstream-headers). |
+| `500`, `502`, `503`, `504`, `408`, `409` | Retry (`503`), preserving upstream cooldown, unless overridden by [gateway headers](CONFIGURATION.md#optional-upstream-headers). System One treats `409` as final. |
 | `429`, `rate_limit_error`, “Rate limited” | Retry (`503`), preserving upstream `Retry-After` or `RetryInfo`. |
 | Exhausted quota: OpenAI `insufficient_quota`, Codex `usage_limit_reached` / `usage_not_included`, a Gemini `QuotaFailure` naming a per-day quota, or a `429` naming a request-shape problem | Final answer, relayed (`http_429`). |
 | `401`, `402`, `403`, `404`, `413`, and every other `4xx` | Final answer, relayed with its original body and headers and `X-Should-Retry: false` after one upstream attempt (`http_<status>`). |
@@ -63,12 +63,13 @@ Recoverable upstream errors are normalized into a generic HTTP `503` with `X-Sho
   ```
   which is classified as `sse_stream_disconnect` and retried before commit.
 - **Policy errors:** Responses `bio_policy` and `cyber_policy` codes are terminal.
+- **TypeSafe System One:** Uses native `detail` errors and retries only HTTP `408`, `429`, and `500`–`599`, unless an authoritative header overrides the status. `409` is final; Anthropic error text/signatures do not affect classification. Valid `retry-after-ms` takes precedence over `Retry-After`, including when an error-body read is interrupted. No SSE buffering or local retry applies.
 
-A permanently invalid API key or empty balance fails on the first attempt with the upstream's own error. If your gateway returns such statuses for conditions that clear on their own, have it send `x-should-retry: true` or `x-gateway-retryable: true`; authoritative headers override the status rule. Clients that do not send `X-Stainless-Retry-Count` (Codex, Gemini SDKs) are not bounded by `PROXY_SDK_RETRY_CAP` and rely on their own retry limits.
+A permanently invalid API key or empty balance fails on the first attempt with the upstream's own error. If your gateway returns such statuses for conditions that clear on their own, have it send `x-should-retry: true` or `x-gateway-retryable: true`; authoritative headers override the status rule. Clients that do not send `X-Stainless-Retry-Count` (Codex, Gemini, and TypeSafe SDKs) are not bounded by `PROXY_SDK_RETRY_CAP` and rely on their own retry limits.
 
 ## Invalid requests
 
-Request errors cannot succeed on an identical retry. The proxy relays the upstream's error unchanged with `X-Should-Retry: false`, logged as `request_shape` (recognized signature) or `http_<status>`. Only the status changes where the client SDK would otherwise retry it: terminal Responses errors other than `400`/`429` become `400`, and terminal Gemini `408`/`429`/`5xx` become `400`.
+Request errors cannot succeed on an identical retry. The proxy relays the upstream's error unchanged with `X-Should-Retry: false`, logged as `request_shape` (recognized signature) or `http_<status>`. Only the status changes where the client SDK would otherwise retry it: terminal Responses errors other than `400`/`429` become `400`, and terminal Gemini/System One `408`/`429`/`5xx` become `400`.
 
 | Error condition | Fix |
 | --- | --- |

@@ -62,6 +62,7 @@ All production code lives in `package main`:
 | [`responses.go`](../responses.go) | OpenAI Responses stream completion, error handling, `response.proxy_keepalive`, and delta coalescing. |
 | [`gemini.go`](../gemini.go) | Native Gemini SSE candidate tracking, usage extraction, and replay. |
 | [`gemini_errors.go`](../gemini_errors.go) | Google numeric/canonical error classification, `RetryInfo` parsing, and error envelopes. |
+| [`systemone.go`](../systemone.go) | TypeSafe System One route matching, native HTTP errors/retry delays, and best-effort JSON model/usage metadata. |
 | [`sse.go`](../sse.go) | Shared SSE capture engine (`captureSSECore`), memory/disk spooling, JSON validation, tool-input normalization, and live cutover. |
 | [`classify.go`](../classify.go) | Error classification and `503` retry response rendering. |
 | [`transport.go`](../transport.go) | Upstream HTTP transport, header timeouts, and byte-idle reader. |

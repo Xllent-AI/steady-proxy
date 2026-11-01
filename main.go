@@ -703,6 +703,7 @@ func writeFailure(w http.ResponseWriter, r *http.Request, f failure, canRetry bo
 			// The status was changed only to stop a status-based SDK retry; its
 			// retry delay must not contradict that.
 			h.Del("Retry-After")
+			h.Del("Retry-After-Ms")
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write(f.upstream.body)
@@ -886,6 +887,17 @@ func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body
 		copyErr = control.Flush()
 		dst = flushingWriter{w: w, control: control}
 	}
+	// System One returns JSON, not SSE. Observe a bounded copy for diagnostics
+	// without holding the response or changing its bytes or delivery timing.
+	systemOne := isSystemOnePath(r.URL.Path)
+	var metadataCapture *prefixCapture
+	if systemOne && resp.Header.Get("Content-Encoding") == "" {
+		mediaType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
+		if strings.EqualFold(strings.TrimSpace(mediaType), "application/json") {
+			metadataCapture = &prefixCapture{max: systemOneMetadataBytes}
+			dst = io.MultiWriter(dst, metadataCapture)
+		}
+	}
 	if sink := rec.respWriter(); sink != nil {
 		dst = io.MultiWriter(dst, sink)
 	}
@@ -913,7 +925,29 @@ func proxyOnce(ctx context.Context, w http.ResponseWriter, r *http.Request, body
 		panic(http.ErrAbortHandler)
 	}
 	rec.noteAttemptResult("success")
-	log.Printf("OK    %s%s  %d  %s  %s%s", reqWho, effortField(reqEffort), resp.StatusCode, hbytes(n), since(start), rec.idField())
+	if systemOne {
+		var metadata systemOneMetadata
+		if metadataCapture != nil && n <= systemOneMetadataBytes {
+			metadata = systemOneResponseMetadata(metadataCapture.buf.Bytes())
+		}
+		input, output := "?", "?"
+		if metadata.InputTokens != nil {
+			input = htok(*metadata.InputTokens)
+		}
+		if metadata.OutputTokens != nil {
+			output = htok(*metadata.OutputTokens)
+		}
+		// The archive's integer fields cannot represent unknown counts.
+		if metadata.InputTokens != nil && metadata.OutputTokens != nil {
+			rec.noteAttemptStats(&captureStats{
+				mode: "single-shot", bytes: n, model: metadata.Model,
+				inputTok: *metadata.InputTokens, inTok: *metadata.InputTokens, outTok: *metadata.OutputTokens,
+			})
+		}
+		log.Printf("OK    %s  in=%s out=%s tok  %d  %s  %s%s", whoWithResolvedModel(reqWho, metadata.Model), input, output, resp.StatusCode, hbytes(n), since(start), rec.idField())
+	} else {
+		log.Printf("OK    %s%s  %d  %s  %s%s", reqWho, effortField(reqEffort), resp.StatusCode, hbytes(n), since(start), rec.idField())
+	}
 	rec.note("OK", resp.StatusCode, resp.StatusCode, "")
 }
 

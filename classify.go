@@ -433,11 +433,11 @@ func surfaceFor(path string, f failure) (status int, atype string) {
 // Clients that ignore X-Should-Retry need a terminal status when retry conversion
 // is disabled or exhausted. Keep the original failure intact for diagnostics.
 func retrySurfaceFor(path string, f failure, canRetry bool) (int, string) {
-	if (isResponsesPath(path) || isGeminiPath(path)) && !canRetry {
+	if (isResponsesPath(path) || isGeminiPath(path) || isSystemOnePath(path)) && !canRetry {
 		wasTransient := f.transient
 		f.transient = false
 		status := statusFor(f)
-		if isGeminiPath(path) && (wasTransient || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500) {
+		if (isGeminiPath(path) || isSystemOnePath(path)) && (wasTransient || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500) {
 			f.status = http.StatusBadRequest
 		}
 	}

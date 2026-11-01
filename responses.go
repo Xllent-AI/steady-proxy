@@ -1257,7 +1257,11 @@ func classifyHTTPErrorForPath(ctx context.Context, path string, resp *http.Respo
 		if source, _ := httpRetryHint(resp.Header); source == "" || ctx.Err() != nil {
 			f := classifyTransport(readErr, ctx)
 			if f.transient {
-				f.retryAfter = retryAfterSeconds(resp.Header.Get("Retry-After"))
+				if isSystemOnePath(path) {
+					f.retryAfter = systemOneRetryAfterSeconds(resp.Header)
+				} else {
+					f.retryAfter = retryAfterSeconds(resp.Header.Get("Retry-After"))
+				}
 			}
 			return f
 		}
@@ -1270,6 +1274,9 @@ func classifyHTTPErrorForPath(ctx context.Context, path string, resp *http.Respo
 	}
 	if isGeminiPath(path) {
 		return classifyGeminiHTTPErrorBytes(resp, b)
+	}
+	if isSystemOnePath(path) {
+		return classifySystemOneHTTPErrorBytes(resp, b)
 	}
 	return classifyHTTPErrorBytes(resp, b)
 }
@@ -1286,6 +1293,9 @@ func errorWriterFor(path string) errorWriter {
 	}
 	if isGeminiPath(path) {
 		return writeGeminiError
+	}
+	if isSystemOnePath(path) {
+		return writeSystemOneError
 	}
 	return writeAnthropicError
 }

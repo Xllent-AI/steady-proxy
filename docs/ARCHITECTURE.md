@@ -9,10 +9,13 @@ The proxy selects a protocol interpreter based on the HTTP method, path, and req
 - **Anthropic Messages:** `POST /v1/messages` with `"stream": true`
 - **OpenAI Responses:** `POST /v1/responses` with `"stream": true`
 - **Gemini GenerateContent:** `POST /{version}/models/{model}:streamGenerateContent?alt=sse` under `/v1`, `/v1beta`, `/v1alpha`, or `/v1beta1` (including Vertex AI `/projects/{project}/locations/{location}/publishers/google/models/{model}` paths)
+- **TypeSafe System One:** `POST /v1/systemone` (non-streaming JSON decisions)
 
-All three streaming routes share one buffering and retry engine (`wireModel` in `wire.go`) and do not require a specific `User-Agent`. Other routes (`/v1/chat/completions`, `generateContent`, `countTokens`, `embedContent`, non-SSE `streamGenerateContent`, `/v1/models`, and `stream: false` requests) are forwarded as single-shot requests. A terminal upstream error is relayed with its original body and headers on every route. Errors the proxy synthesizes (retryable `503`s, proxy-side faults) use the route's native envelope: Google's `error.code` / `error.status` on Gemini model methods (`models/{model}:{method}`, including Vertex AI and Vertex express `publishers/google/models` paths), OpenAI's error object on `/v1/responses`, and Anthropic's `type: "error"` envelope on `/v1/messages` and all other routes.
+The three streaming routes share one buffering and retry engine (`wireModel` in `wire.go`) and do not require a specific `User-Agent`. System One and other routes (`/v1/chat/completions`, `generateContent`, `countTokens`, `embedContent`, non-SSE `streamGenerateContent`, `/v1/models`, and `stream: false` requests) are forwarded as single-shot requests. A terminal upstream error is relayed with its original body and headers on every route. Proxy-synthesized errors use Google's `error.code` / `error.status` on Gemini model methods, OpenAI's error object on `/v1/responses`, TypeSafe's `detail` on `/v1/systemone`, and Anthropic's `type: "error"` envelope elsewhere.
 
 Single-shot SSE responses flush headers and data as they arrive; they do not gain transactional retries. Escaped request paths and queries are preserved. Conditional GET/HEAD `304 Not Modified` responses retain cache metadata, and HEAD responses retain the upstream representation length.
+
+System One preserves request/response JSON, all question types, assets, extension fields, compression, and multipart bodies without translation or schema validation. Its HTTP retry rules follow the [TypeSafe SDK](https://docs.typesafe.ai/sdk/python/api/retries): `408`, `429`, and `500`–`599` retry, while `409` and other `4xx` are final unless an authoritative header overrides them. Error text never invokes Anthropic heuristics. The proxy makes one upstream attempt per client call; no SSE buffering, local retries, or model fallback applies. Model discovery at the shared `/v1/models` path stays generic because the path alone does not identify the provider.
 
 | Requirement | Client expectation |
 | --- | --- |
@@ -22,7 +25,7 @@ Single-shot SSE responses flush headers and data as they arrive; they do not gai
 | **Post-commit recovery** | Handle interrupted streams after `200 OK` headers are sent. Once committed, the proxy cannot restart the stream on the client's behalf. |
 | **Responses events** | Ignore unknown SSE event types (`response.proxy_keepalive`), which the proxy emits because SSE comments do not reset Codex's idle timer. |
 | **Gemini events** | Accept standard SSE comment keepalives (`: keepalive`). Tool calls, thought signatures, and unknown JSON fields are preserved unchanged. |
-| **Retry counter** | `PROXY_SDK_RETRY_CAP` reads `X-Stainless-Retry-Count`. Clients that do not send that header (such as Codex and Gemini SDKs) must enforce their own retry limit. |
+| **Retry counter** | `PROXY_SDK_RETRY_CAP` reads `X-Stainless-Retry-Count`. Clients that do not send that header (such as Codex, Gemini, and TypeSafe SDKs) must enforce their own retry limit. |
 
 ## Buffering and the point of no return
 
@@ -64,11 +67,11 @@ When the window expires:
 Outside an active Claude fallback chain, a recoverable failure before commit follows this policy:
 
 1. **Local retry:** If `PROXY_TRANSACTIONAL_LOCAL_RETRIES` has remaining budget and enough time remains in the buffering window and request deadline, the proxy waits and re-issues the upstream request transparently.
-2. **Client retry:** Otherwise, the proxy returns HTTP `503` with `X-Should-Retry: true` and `Retry-After` (`api_error` envelope for Anthropic/Responses; `error.code: 503` / `UNAVAILABLE` for Gemini).
+2. **Client retry:** Otherwise, the proxy returns HTTP `503` with `X-Should-Retry: true` and `Retry-After` (`api_error` envelope for Anthropic/Responses; `error.code: 503` / `UNAVAILABLE` for Gemini; `detail` for System One).
 
 Masking all retryable failures—including `429` rate limits and `529` overloads—into a generic `503` prevents Claude Code from routing them into special-case handlers that ignore `X-Should-Retry` and abort after ~3 tries. The real failure code is preserved in the proxy logs.
 
-Retried: connection errors, stalled or truncated streams, `408`/`409`/`429`/`5xx`, transient in-band errors, authoritative retry hints (`x-should-retry`, `x-gateway-retryable`), and a `4xx` whose error body explicitly names a transient fault (overloaded, rate limit, timeout). This is the official SDKs' rule. Everything else (auth, billing, permission, not-found, validation, an exhausted quota, any other `4xx`) is the upstream's final answer: an identical re-send fails the same way, so it is relayed once with its original body and headers plus `X-Should-Retry: false`. Responses answers such errors with `400` (or `429`) and Gemini maps `408`/`429`/`5xx` to `400`, because their SDKs retry other statuses regardless of `X-Should-Retry`. Redirects are not followed (credentials must not leave the configured upstream): a `3xx`, except conditional GET/HEAD `304`, returns `502` with reason `upstream_redirect_<status>` naming the target. See [Troubleshooting](TROUBLESHOOTING.md#invalid-requests).
+Retried: connection errors, stalled or truncated streams, `408`/`409`/`429`/`5xx`, transient in-band errors, authoritative retry hints (`x-should-retry`, `x-gateway-retryable`), and a `4xx` whose error body explicitly names a transient fault. System One uses the narrower status-only policy above, excluding `409`. Everything else (auth, billing, permission, not-found, validation, exhausted quota, other `4xx`) is the upstream's final answer: it is relayed once with its original body and headers plus `X-Should-Retry: false`. Terminal Responses errors become `400` (or stay `429`); terminal Gemini and System One `408`/`429`/`5xx` become `400`, because those SDKs may retry by status regardless of `X-Should-Retry`. Redirects are not followed: a `3xx`, except conditional GET/HEAD `304`, returns `502` with reason `upstream_redirect_<status>` naming the target without its query. See [Troubleshooting](TROUBLESHOOTING.md#invalid-requests).
 
 ### Retry budgets
 
@@ -82,7 +85,7 @@ bounded by the buffering window, total request deadline, and `PROXY_SDK_RETRY_CA
 
 When `N = 0` (the default), general local retries are off, except for a single fast retry (250 ms wait) when a connection error or selected HTTP status (`408`, `409`, `502`, `503` without `Retry-After`) arrives within 3 seconds of the attempt start.
 
-`PROXY_SDK_RETRY_CAP` (default `100`) bounds retry conversion using the `X-Stainless-Retry-Count` header (it does not raise client limits; for example, Claude Code 2.1.191 defaults to 10 retries and clamps `CLAUDE_CODE_MAX_RETRIES` to 15). When the upstream provides no `Retry-After`, the synthesized client delay scales exponentially from 1s to 30s (+ up to 1s jitter) based on that header (or stays 1–2s when the header is absent). If retry conversion is disabled (`PROXY_SDK_RETRY_CAP=0`) or exhausted, Responses and transient Gemini failures return terminal HTTP `400` because their SDKs may retry `5xx`/`429` regardless of `X-Should-Retry: false`.
+`PROXY_SDK_RETRY_CAP` (default `100`) bounds retry conversion using the `X-Stainless-Retry-Count` header (it does not raise client limits; for example, Claude Code 2.1.191 defaults to 10 retries and clamps `CLAUDE_CODE_MAX_RETRIES` to 15). When the upstream provides no cooldown, the synthesized client delay scales exponentially from 1s to 30s (+ up to 1s jitter) based on that header (or stays 1–2s when absent). System One prefers valid `retry-after-ms` over `Retry-After`, rounding positive milliseconds up to whole seconds. If retry conversion is disabled (`PROXY_SDK_RETRY_CAP=0`) or exhausted, Responses and transient Gemini/System One failures return terminal HTTP `400` because their SDKs may retry `5xx`/`429` regardless of `X-Should-Retry: false`.
 
 ## Model fallback
 
