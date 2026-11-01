@@ -22,6 +22,7 @@ Agents / SDKs / applications → steady-proxy (127.0.0.1:8789) → your gateway
 | **Anthropic Messages** | `POST /v1/messages` (`stream: true`) | Buffers up to 4 minutes (`240000` ms) until `message_stop`, then replays. Workflow agents switch to live streaming after 10 seconds once content is ready. |
 | **OpenAI Responses** | `POST /v1/responses` (`stream: true`) | Catches start-of-stream failures before commit, then streams live on first output. Set `PROXY_RESPONSES_EARLY_COMMIT=0` for 4-minute full buffering. |
 | **Gemini GenerateContent** | `POST /{version}/models/{model}:streamGenerateContent?alt=sse` (including Vertex AI publisher and express paths) | Buffers up to 4 minutes through clean EOF after all requested candidates finish. |
+| **TypeSafe System One** | `POST /v1/systemone` | Single-shot JSON decisions with native errors, TypeSafe retry policy, and model/token logging. |
 | **Other routes** | `/v1/chat/completions`, `generateContent`, `countTokens`, `embedContent`, non-SSE `streamGenerateContent`, `/v1/models`, non-streaming calls | Forwarded single-shot; recoverable HTTP and connection errors still normalize for client retry. |
 
 See [Architecture](docs/ARCHITECTURE.md#client-compatibility) for client compatibility details.
@@ -120,6 +121,21 @@ curl -N --max-time 720 \
 ```
 
 Set client timeouts above `PROXY_GEMINI_BUFFER_MS` (default 240,000 ms) with margin and configure bounded retries on HTTP `503` honoring `Retry-After`. Failed upstream attempts and local-retry waits count toward that silent window; for a client whose first-byte timeout is shorter, lower `PROXY_GEMINI_BUFFER_MS` below it (see [Match the client to the window](docs/CONFIGURATION.md#match-the-client-to-the-window)). If a Gemini stream fails after committing to live output, the proxy aborts the HTTP transport so the client does not mistake a truncated stream for clean EOF.
+
+### TypeSafe System One
+
+Set your TypeSafe SDK's `TYPESAFE_BASE_URL` to `http://127.0.0.1:8789`, keeping `PROXY_UPSTREAM_URL` pointed at your gateway (or `https://api.typesafe.ai` for direct TypeSafe access). Use the model ID your upstream accepts, unchanged; this example uses the gateway alias `xllent/decider-latest`:
+
+```bash
+curl http://127.0.0.1:8789/v1/systemone \
+  -H "Authorization: Bearer ${TYPESAFE_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"xllent/decider-latest","state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}'
+```
+
+System One returns JSON, not SSE: do not add `stream: true`. Choice, Score, Noul, Box, assets, compressed bodies, multipart requests, and extension fields pass through unchanged. Each client call makes one upstream attempt; SSE buffering, local retries, and Claude model fallback do not apply. Configure bounded client retries on HTTP `503`; the proxy honors TypeSafe's `retry-after-ms` before `Retry-After` and uses native `detail` errors. `GET /v1/models` remains a shared single-shot route.
+
+See the [TypeSafe API contract](https://docs.typesafe.ai/api/system-one) and [retry behavior](docs/ARCHITECTURE.md#retries).
 
 ### Other API clients
 

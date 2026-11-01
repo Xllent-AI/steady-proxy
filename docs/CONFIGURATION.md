@@ -106,7 +106,8 @@ Your gateway can attach these headers to non-2xx HTTP responses to override the 
 | `x-gateway-retryable: true` / `false` | Force the error to be treated as retryable or terminal (highest precedence). |
 | `x-should-retry: true` / `false` | Same effect when `x-gateway-retryable` is not set. |
 | `Retry-After` | Delay in seconds or HTTP-date format for local and client retries. |
+| `retry-after-ms` | System One cooldown in milliseconds; takes precedence over `Retry-After` when valid and nonnegative. Positive values round up to whole seconds. |
 
-Terminal errors are relayed with the upstream's body and headers. Their status is kept, except that terminal Responses errors other than `400`/`429` become `400`, and terminal Gemini `408`, `429`, and `5xx` errors become `400`, so those SDKs do not auto-retry them by status code.
+Terminal errors are relayed with the upstream's body and headers. Their status is kept, except that terminal Responses errors other than `400`/`429` become `400`, and terminal Gemini/System One `408`, `429`, and `5xx` errors become `400`, so those SDKs do not auto-retry them by status code. When the status changes, both retry-delay headers are removed.
 
 The proxy strips `x-gateway-retryable`, `x-gateway-error-stage`, and `x-gateway-error-code` from incoming client requests so clients cannot spoof gateway hints.

@@ -63,7 +63,7 @@ FAIL  claude-sonnet-4-6/main  http_401 401  0.1s
 | --- | --- |
 | `model/main`, `model/sub`, `model/wf` | Requested model and caller type (`requested->resolved` if the upstream reports a different model ID). Gemini model names come from the URL path. |
 | `high`, `medium`, etc. | Explicit effort level from Messages `output_config.effort`, Responses `reasoning.effort`, or Gemini `generationConfig.thinkingConfig.thinkingLevel` (`minimal`/`low`/`medium`/`high` in camelCase or `snake_case`, lowercased; never inferred from `thinkingBudget` or model defaults). |
-| `in=… out=… tok` | Input (including cache read/creation) and output token counts. |
+| `in=… out=… tok` | Input (including cache read/creation) and output token counts. System One preserves known zero counts and shows `?` for unknown counts. |
 | `end_turn`, `completed`, `incomplete:max_output_tokens`, etc. | Upstream stop/finish reason. |
 | `refusal-category="…"`, `refusal-reason="…"` | Messages refusal category and explanation from `delta.stop_details`, when supplied. Safeguard errors use the upstream error message as the reason. Values are quoted and control characters escaped to keep one physical line per entry. |
 | `truncated_stream`, `http_401`, `request_shape`, etc. | Classified failure code before status normalization. `retryable_4xx_<status>` marks a `4xx` whose body named a transient fault; `upstream_redirect_<status>` an unfollowed redirect. |
@@ -79,6 +79,8 @@ Caller suffixes (`/main`, `/sub`, `/wf`) are derived from Claude Code headers an
 With `PROXY_VERBOSE=1`, `[local-retry]` lines log each internal retry cause, wait duration, and skips (such as `skip=not-enough-time`). Responses also carry `X-Steady-Proxy-Mode` on streamed deliveries and `X-Steady-Proxy-Reason` on error responses, including relayed upstream errors. A streaming request answered with a non-SSE `2xx` logs `non-sse <content-type>`; a terminal in-band error forwarded after commit logs `FAIL … delivered in-stream`.
 
 Refusal details appear on fallback warnings and on summaries of refusals delivered in buffered or live mode; a successful fallback's `OK` line does not inherit the earlier refusal's reason. On fallback exhaustion, the chain-failure warning describes the final candidate, while the delivered-original summary retains the original refusal's details. Missing or malformed optional details are omitted without changing response delivery or fallback behavior.
+
+System One logs the resolved response model and token usage from complete, unencoded JSON responses up to 1 MiB. Missing or malformed fields, larger responses, and encoded/non-JSON responses do not affect delivery; unavailable counts display as `?`. Compressed and multipart requests remain opaque, so their requested model may be unknown. Payload archives include usage stats only when both token counts are known.
 
 ## Saving request and response data
 
