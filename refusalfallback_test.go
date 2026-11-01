@@ -88,6 +88,55 @@ func TestCaptureRefusalDeliveredWhenDisarmed(t *testing.T) {
 	}
 }
 
+func TestE2ERefusalLogDetails(t *testing.T) {
+	const category = "cyber\nWARN forged"
+	const explanation = "Blocked \"request\"\r\npolicy\t\x1b[31m"
+	details, err := json.Marshal(map[string]string{"category": category, "explanation": explanation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, stop, details string
+		wantDetails         bool
+	}{
+		{"quoted-details", "refusal", string(details), true},
+		{"missing-details", "refusal", "null", false},
+		{"malformed-details", "refusal", `{"category":42,"explanation":false}`, false},
+		{"non-refusal", "end_turn", string(details), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := strings.Replace(goodStream, `"stop_reason":"end_turn"`, `"stop_reason":"`+tc.stop+`","stop_details":`+tc.details, 1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, stream)
+			}))
+			defer up.Close()
+			setupForTest(up.URL)
+			cfg.claudeRefusalFallbacks = nil
+			t.Cleanup(func() { cfg = testConfig() })
+			var rec *httptest.ResponseRecorder
+			logs := captureLogs(t, func() {
+				rec = doStream(`{"stream":true,"model":"claude-original"}`)
+			})
+			if rec.Code != 200 || rec.Body.String() != stream {
+				t.Fatalf("diagnostic details changed the response: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if strings.Count(logs, "\n") != 1 || !strings.Contains(logs, "  "+tc.stop+"  ") {
+				t.Fatalf("want one summary with the upstream stop reason, got:\n%s", logs)
+			}
+			if tc.wantDetails {
+				for _, want := range []string{"refusal-category=" + strconv.Quote(category), "refusal-reason=" + strconv.Quote(explanation)} {
+					if !strings.Contains(logs, want) {
+						t.Errorf("missing quoted refusal detail %q:\n%s", want, logs)
+					}
+				}
+			} else if strings.Contains(logs, "refusal-category=") || strings.Contains(logs, "refusal-reason=") {
+				t.Fatalf("unexpected refusal details:\n%s", logs)
+			}
+		})
+	}
+}
+
 // End to end: a refusal from the requested model transparently re-issues with the
 // configured fallback model, the client receives only the fallback's answer, and a
 // WARN line is logged. The fallback request must carry the swapped model while
